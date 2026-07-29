@@ -760,7 +760,12 @@ pub fn applySelectedModel(self: *App) !void {
         .openai_codex => config_mod.Provider.openai.label(),
         .openai_compatible => |conn| conn.auth_key_id,
     };
-    std.debug.assert(model.id.len > 0); // segfault guard for null/empty model_id
+    // A null/empty model_id flows into Client.init's non-optional `[]u8`
+    // (openai_compatible.zig:59) and segfaults on resume. selectedCodexModel
+    // guards storage validity but not an empty id, so check it explicitly.
+    // A real early return (not assert): `unreachable` is UB in ReleaseFast,
+    // which is the install target, so an assert would not protect that build.
+    if (model.id.len == 0) return error.EmptyModelId;
     switch (source) {
         .openai_codex => {
             const loaded = try codex.load(self.gpa, self.io, self.liveRuntime().?.home_dir);

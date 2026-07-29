@@ -35,7 +35,7 @@ User's can branch off at any point in their conversation to pursue different pat
 
 ## Session Persistence
 
-The session store (`sessions.sqlite`) records the active `model_provider` and `model_id` on every turn. On resume, Nova resolves the provider through two paths:
+The session store (`sessions.sqlite`) records the active `model_provider` and `model_id` on every turn, **and on every mid-session model switch**. The picker (`tui.applySelectedModel`) calls `session_writer.updateModel(provider_name, model_id)` after attaching the new client, mirroring what `runtime.applyFromConfig` writes at session start. Without the picker write, `initResume` restored the stale creation-time model on restart instead of the last-used one. The write is best-effort (logged, never rolls back the applied switch) and gated by `AgentRuntime.session_writer_started` so TUI test harnesses that build a partial runtime with `session_writer = undefined` can still exercise the picker. On resume, Nova resolves the provider through two paths:
 
 1. **Builtin providers**: resolved by enum label (`openai`, `openrouter`, etc.)
 2. **Custom providers**: resolved by name from the `providers[]` config map, with `baseURL` pulled from the same entry
@@ -59,6 +59,13 @@ Dynamic providers selected from models.dev store their API key in `auth.json` un
 - `dynamic_provider_id`: the auth.json key (e.g., `"stepfun-ai"`), used for session resume and API key lookup
 
 `updateCachedModelSelection` rebuilds `model_selection` as the `.custom` variant with `provider_name` set to `dynamic_provider_id` on selection, so `tryAttachOpenAiCompatibleFromConfig` looks up the correct auth.json entry on resume. `compatibleApiKey` also uses `dynamic_provider_id` directly for the lookup, avoiding the fragile stash fallback.
+
+### Restart catalog restore
+
+Because `api_key` is never serialized (it lives in `auth.json`), the runtime stash is null after every restart. Two gates were relaxed so the dynamic provider's disk cache restores on the next `/models` open:
+
+1. **`hasOpenAICompatibleCredentials`** treats a typed `model_selection` carrying a non-empty `baseUrl()` as a sufficient credential signal (the real key is resolved from `auth.json` at fetch time). The legacy `base_url`+`api_key` stash path stays as a fallback for catalogue providers that have no `model_selection` yet.
+2. **`shouldLoadConfiguredCompatibleCatalog`** resolves `base_url` from `model_selection.baseUrl()` when the legacy stash is null.
 
 ## Parallel
 
