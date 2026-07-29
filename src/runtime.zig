@@ -59,6 +59,11 @@ pub const AgentRuntime = struct {
     /// `compaction.contextWindowTokens` and the agent can use the
     /// compaction policy.
     context_settings: config_mod.ContextSettings = .{},
+    /// True once `initSession` has brought up `session_writer` (background
+    /// thread + sqlite handle). Some TUI test harnesses construct a partial
+    /// runtime with `session_writer = undefined`; gates session-DB writes so
+    /// those harnesses can still exercise the picker without touching sqlite.
+    session_writer_started: bool = false,
 
     pub const ClientState = union(enum) {
         disconnected,
@@ -208,6 +213,7 @@ pub const AgentRuntime = struct {
         } else {
             try target.session_writer.initDefault(gpa, io, home_dir, session_dir);
         }
+        target.session_writer_started = true;
         errdefer target.session_writer.deinit();
 
         target.agent = agent_mod.Agent.init(gpa, io, cwd, .none);

@@ -607,7 +607,9 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
         self.cached_config.dynamic_provider_id = try self.gpa.dupe(u8, provider.name);
     }
 
-    try startOpenAiCompatibleModelLoad(self, base_url, key, provider.name);
+    // For config providers, the auth.json key equals the config map key
+    // (provider.name) — thread it so models are stamped with the right id.
+    try startOpenAiCompatibleModelLoad(self, base_url, key, provider.name, provider.name);
 
     self.pickers.provider.stage = .list;
     self.pickers.provider.form_handle = null;
@@ -625,12 +627,29 @@ pub fn submitConfigProviderSetup(self: *App, provider: config_mod.ProviderConfig
 }
 
 pub fn startDynamicProviderModelLoad(self: *App, provider: modelsdev.Provider, key: []const u8) !void {
-    try startOpenAiCompatibleModelLoad(self, provider.base_url, key, provider.name);
+    // provider.id is the auth.json key (e.g. "stepfun-ai"). Threading it as
+    // auth_key_id keeps every fetched model associated with the right provider
+    // so the disk cache round-trips and applySelectedModel resolves the key.
+    try startOpenAiCompatibleModelLoad(self, provider.base_url, key, provider.name, provider.id);
 }
 
 /// Shared model-load path for any OpenAI-compatible endpoint (models.dev
 /// dynamic providers and user-defined config providers).
-pub fn startOpenAiCompatibleModelLoad(self: *App, base_url: []const u8, key: []const u8, display_name: []const u8) !void {
+///
+/// `auth_key_id` is the auth.json key identity (e.g. "stepfun-ai") that the
+/// fetched models are stamped with. It MUST be the real provider id, never
+/// null for dynamic/config providers — otherwise `compatibleSource` falls back
+/// to `provider.label()` ("openai_compatible"), every dynamic provider's models
+/// become indistinguishable, the disk cache can't match them on restart, and
+/// `applySelectedModel` resolves the wrong (empty) API key. Catalogue builtin
+/// callers may pass null to keep the `provider.label()` fallback.
+pub fn startOpenAiCompatibleModelLoad(
+    self: *App,
+    base_url: []const u8,
+    key: []const u8,
+    display_name: []const u8,
+    auth_key_id: ?[]const u8,
+) !void {
     cancelModelLoad(self);
     self.provider_state.conn_recompute = false;
     if (self.pickers.models.load == .failed) {
@@ -647,12 +666,15 @@ pub fn startOpenAiCompatibleModelLoad(self: *App, base_url: []const u8, key: []c
     errdefer self.gpa.free(k);
     const name = try self.gpa.dupe(u8, display_name);
     errdefer self.gpa.free(name);
+    const owned_auth_key_id: ?[]u8 = if (auth_key_id) |id| try self.gpa.dupe(u8, id) else null;
+    errdefer if (owned_auth_key_id) |id| self.gpa.free(id);
 
     configured[0] = .{
         .provider = .openai_compatible,
         .base_url = url,
         .api_key = k,
         .display_name = name,
+        .auth_key_id = owned_auth_key_id,
     };
 
     const job = try self.gpa.create(model_loader.Job);
@@ -729,6 +751,16 @@ pub fn applySelectedModel(self: *App) !void {
     const source = selectedModelSource(
         self,
     ) orelse return error.NoModels;
+    // Resolve the auth/config provider identity to persist into the session DB
+    // so initResume restores the last-used model on restart. This mirrors what
+    // runtime.applyFromConfig writes (selection.providerName()). Without it the
+    // picker only updated config.json and the session row kept its original
+    // model, so restart restored a stale selection.
+    const provider_name: []const u8 = switch (source) {
+        .openai_codex => config_mod.Provider.openai.label(),
+        .openai_compatible => |conn| conn.auth_key_id,
+    };
+    std.debug.assert(model.id.len > 0); // segfault guard for null/empty model_id
     switch (source) {
         .openai_codex => {
             const loaded = try codex.load(self.gpa, self.io, self.liveRuntime().?.home_dir);
@@ -752,6 +784,18 @@ pub fn applySelectedModel(self: *App) !void {
             try attachOpenAiCompatibleClient(self, conn.base_url, api_key, model.id, effort);
             try persistModelSelection(self, conn.provider, conn, model.id, effort, self.pickers.models.model_scope);
         },
+    }
+    // Persist the new selection into the session DB so resume restores the
+    // last-used model, not the one active at session creation. Best-effort: a
+    // DB error must not roll back the (already applied) client switch. Only
+    // run when the writer is started — some test harnesses build a partial
+    // runtime with an undefined session_writer.
+    if (self.liveRuntime()) |rt| {
+        if (rt.session_writer_started) {
+            rt.session_writer.updateModel(provider_name, model.id) catch |err| {
+                std.log.warn("session.updateModel.failed provider={s} model={s} err={s}", .{ provider_name, model.id, @errorName(err) });
+            };
+        }
     }
     self.mode = .normal;
     self.clearInput();
@@ -1161,7 +1205,15 @@ pub fn shouldLoadConfiguredCompatibleCatalog(self: *const App) bool {
     if (!hasOpenAICompatibleCredentials(
         self,
     )) return false;
-    const base_url = self.cached_config.base_url orelse return false;
+    // base_url may be null after restart when the legacy stash wasn't hydrated
+    // (it is normally repopulated by hydrateActiveModel from the providers[]
+    // map, but the typed model_selection.baseUrl() is the durable signal).
+    const base_url = self.cached_config.base_url orelse blk: {
+        if (self.cached_config.model_selection) |ms| {
+            if (ms.baseUrl()) |url| break :blk url;
+        }
+        return false;
+    };
     const provider = self.cached_config.provider orelse tui_provider.compatibleProviderFromBaseUrl(base_url);
     if (provider == .ollama) return false;
     if (provider == .llama_cpp) return false;
