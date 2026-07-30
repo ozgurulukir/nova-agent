@@ -147,7 +147,12 @@ pub const McpManager = struct {
         next_tool: for (self.clients.items) |c| {
             if (c.status() != .connected) continue;
             for (c.tools.items) |tool| {
-                // Collision check: skip if a tool with this full_name was already added
+                // Defensive only: server names are deduped at config parse time,
+                // so a `full_name` collision means one server advertised two
+                // tools with the same name — skip the malformed duplicate (first
+                // writer wins). Linear scan is intentional: this is a cold path
+                // (user action / rare `tools/list_changed` notification, not
+                // per-tick) and the slice stays cache-hot over ~10-200 tools.
                 for (schemas[0..idx]) |existing| {
                     if (std.mem.eql(u8, existing.name, tool.full_name)) {
                         std.log.warn("MCP tool name collision: '{s}' — skipping duplicate", .{tool.full_name});

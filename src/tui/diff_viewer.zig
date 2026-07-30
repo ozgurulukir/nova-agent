@@ -347,6 +347,10 @@ pub const State = struct {
             try buf.append(gpa, '\n');
             try buf.appendSlice(gpa, comment.label);
             try buf.append(gpa, '\n');
+            // Lazy and zero-allocating: splitScalar yields slices straight into
+            // the snippet string (no per-iteration copy), and composeMessage
+            // only runs on explicit user actions (close viewer / copy), never
+            // per-frame — so there is nothing to pre-split or cache here.
             var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, comment.snippet, "\n"), '\n');
             while (lines.next()) |snippet_line| {
                 try buf.appendSlice(gpa, "> ");
