@@ -477,25 +477,106 @@ fn errorDescription(err: anyerror) []const u8 {
     };
 }
 
-test "ExecutorService.runAll errdefer cleanup exists" {
-    // This test verifies the errdefer cleanup logic exists in runAll.
-    // The errdefer at executor.zig:138-141 deinitializes already-completed
-    // results if a later tool call fails, preventing memory leaks.
-    //
-    // Manual verification: create a mock observer that errors on the 2nd call,
-    // run runAll, and confirm zig test's leak checker reports no leaks.
-    //
-    // For now, just verify runAll works correctly with noopObserver.
+test "executor converts errorDescription accurately" {
+    try std.testing.expectEqualStrings("MCP server process terminated unexpectedly", errorDescription(error.McpServerCrashed));
+    try std.testing.expectEqualStrings("MCP server did not respond within the timeout period", errorDescription(error.Timeout));
+    try std.testing.expectEqualStrings("OutOfMemory", errorDescription(error.OutOfMemory));
+}
+
+test "ExecutorService shouldRejectUnsafeBash works" {
     const gpa = std.testing.allocator;
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
     var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+    // Give it a mock URL so shouldRejectUnsafeBash doesn't immediately exit.
+    executor.bash_classifier_url = "http://localhost:1234/classify";
+
+    const ApprovalContext = struct {
+        should_approve: bool = false,
+    };
+    const MockObserver = struct {
+        fn onStarted(_: *ApprovalContext, _: ai.ToolCall) anyerror!void {}
+        fn onFinished(_: *ApprovalContext, _: *const ToolResult) anyerror!void {}
+        fn approve(ctx: *ApprovalContext, _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return ctx.should_approve;
+        }
+    };
+
+    var ctx = ApprovalContext{};
+    const observer: ToolCallObserver(ApprovalContext) = .{
+        .ctx = &ctx,
+        .on_started = MockObserver.onStarted,
+        .on_finished = MockObserver.onFinished,
+        .approve_unsafe_bash = MockObserver.approve,
+    };
+
+    // 1. Not a bash tool call => doesn't reject.
+    const non_bash_call = ai.ToolCall{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
+        .name = try gpa.dupe(u8, "not_bash"),
+        .arguments = try gpa.dupe(u8, "{}"),
+    };
+    defer {
+        gpa.free(non_bash_call.call_id.value);
+        gpa.free(non_bash_call.name);
+        gpa.free(non_bash_call.arguments);
+    }
+    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(non_bash_call, observer)));
+
+    // 2. Dangerous bash call with disapproval => reject.
+    const unsafe_call = ai.ToolCall{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_2") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"command\":\"rm -rf /\",\"reason\":\"clean\"}"),
+    };
+    defer {
+        gpa.free(unsafe_call.call_id.value);
+        gpa.free(unsafe_call.name);
+        gpa.free(unsafe_call.arguments);
+    }
+    ctx.should_approve = false;
+    // When remote server is unreachable, local classifier kicks in, flags "rm -rf /" as unsafe
+    // Observer disapproves => reject (returns true).
+    try std.testing.expect(try executor.shouldRejectUnsafeBash(unsafe_call, observer));
+
+    // 3. Dangerous bash call with approval => allow.
+    ctx.should_approve = true;
+    try std.testing.expect(!(try executor.shouldRejectUnsafeBash(unsafe_call, observer)));
+}
+
+test "ExecutorService.runAll errdefer cleanup exists" {
+    // This test verifies the errdefer cleanup logic exists in runAll.
+    // The errdefer deinitializes already-completed
+    // results if a later tool call fails, preventing memory leaks.
+    const gpa = std.testing.allocator;
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    var executor = ExecutorService.init(.{ .gpa = gpa, .io = std.testing.io, .cwd = cwd });
+
+    const FailingObserverContext = struct {
+        call_count: usize = 0,
+    };
+    const FailingObserver = struct {
+        fn onStarted(ctx: *FailingObserverContext, _: ai.ToolCall) anyerror!void {
+            ctx.call_count += 1;
+            if (ctx.call_count == 2) return error.InjectedFailure;
+        }
+        fn onFinished(_: *FailingObserverContext, _: *const ToolResult) anyerror!void {}
+        fn approve(_: *FailingObserverContext, _: ai.ToolCall, _: []const u8) anyerror!bool {
+            return true;
+        }
+    };
 
     const calls = [_]ai.ToolCall{
         .{
             .call_id = .{ .value = try gpa.dupe(u8, "call_0") },
             .name = try gpa.dupe(u8, "bash"),
             .arguments = try gpa.dupe(u8, "{\"command\":\"printf test\",\"reason\":\"Test\"}"),
+        },
+        .{
+            .call_id = .{ .value = try gpa.dupe(u8, "call_1") },
+            .name = try gpa.dupe(u8, "bash"),
+            .arguments = try gpa.dupe(u8, "{\"command\":\"printf fail\",\"reason\":\"Fail\"}"),
         },
     };
     defer for (calls) |c| {
@@ -504,10 +585,14 @@ test "ExecutorService.runAll errdefer cleanup exists" {
         gpa.free(c.arguments);
     };
 
-    const results = try executor.runAll(&calls, noopObserver(void));
-    defer {
-        for (results) |*r| r.deinit(gpa);
-        gpa.free(results);
-    }
-    try std.testing.expectEqual(@as(usize, 1), results.len);
+    var ctx = FailingObserverContext{};
+    const observer: ToolCallObserver(FailingObserverContext) = .{
+        .ctx = &ctx,
+        .on_started = FailingObserver.onStarted,
+        .on_finished = FailingObserver.onFinished,
+        .approve_unsafe_bash = FailingObserver.approve,
+    };
+
+    try std.testing.expectError(error.InjectedFailure, executor.runAll(&calls, observer));
+    try std.testing.expectEqual(@as(usize, 2), ctx.call_count);
 }
