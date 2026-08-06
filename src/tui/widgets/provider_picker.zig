@@ -97,6 +97,7 @@ pub const State = struct {
     column: Column = .provider,
     form_handle: ?ProviderHandle = null,
     form_error: ?[]const u8 = null,
+    show_secret: bool = false,
     /// Merged provider list: builtins → models.dev → config (later overrides).
     entries: []const ProviderHandle = &.{},
 
@@ -290,8 +291,12 @@ pub const Content = struct {
         const key_col = start_col + @as(u16, @intCast(@min(ctx.stringWidth(label), @as(usize, std.math.maxInt(u16)))));
         // TUX02: never render the secret in plaintext — mask it for display.
         // The real value stays in the input buffer; submit reads the buffer.
-        const masked = maskSecret(ctx.arena, self.key_input);
-        const shown = try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{masked});
+        // A user toggle (Ctrl+H) skips masking so they can verify paste correctness.
+        const shown = if (self.state.show_secret)
+            try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{self.key_input})
+        else
+            try std.fmt.allocPrint(ctx.arena, "{s}\u{2588}", .{maskSecret(ctx.arena, self.key_input)});
+
         try panel.lineStyledAt(surface, key_row, shown, ctx, key_col, StylePalette.panel_header);
 
         const hint_row = key_row + 2;
@@ -300,6 +305,8 @@ pub const Content = struct {
         } else {
             const hint = if (requires_key and self.key_input.len == 0)
                 "Type or paste your API key, then press Enter to connect (Esc to cancel)"
+            else if (requires_key)
+                "Press Enter to submit and connect (Ctrl+H to reveal, Esc to cancel)"
             else
                 "Press Enter to submit and connect (Esc to cancel)";
             try panel.lineStyledAt(surface, hint_row, hint, ctx, start_col, StylePalette.thinking_body);

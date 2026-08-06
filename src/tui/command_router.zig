@@ -120,6 +120,10 @@ const ProviderPicker = struct {
                 app.popProviderKeyInput();
                 return true;
             }
+            if (key.codepoint == 'h' and key.mods.ctrl) {
+                app.getProviderPicker().show_secret = !app.getProviderPicker().show_secret;
+                return true;
+            }
             if (key.text) |text| {
                 const trimmed = std.mem.trim(u8, text, "\r\n");
                 if (trimmed.len > 0) {
