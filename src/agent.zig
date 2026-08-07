@@ -764,7 +764,6 @@ pub const Agent = struct {
         const F = struct {
             fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
                 const owned = try ctx.agent.gpa.dupe(u8, delta);
-                errdefer ctx.agent.gpa.free(owned);
                 try ctx.listener.emit(.{ .response_delta = owned });
             }
         };
@@ -775,7 +774,6 @@ pub const Agent = struct {
         const F = struct {
             fn call(ctx: *StreamContext(L), delta: []const u8) anyerror!void {
                 const owned = try ctx.agent.gpa.dupe(u8, delta);
-                errdefer ctx.agent.gpa.free(owned);
                 try ctx.listener.emit(.{ .thinking_delta = owned });
             }
         };
@@ -810,9 +808,7 @@ pub const Agent = struct {
         arguments: []const u8,
     ) !void {
         const owned_name = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned_name);
         const owned_arguments = try self.gpa.dupe(u8, arguments);
-        errdefer self.gpa.free(owned_arguments);
         try listener.emit(.{
             .tool_delta = .{
                 .index = tool_index,
@@ -837,23 +833,17 @@ pub const Agent = struct {
         failed: bool,
     ) !void {
         const owned_id = try self.gpa.dupe(u8, call_id);
-        errdefer self.gpa.free(owned_id);
         const owned_name = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned_name);
         const owned_label = try self.gpa.dupe(u8, display_label);
-        errdefer self.gpa.free(owned_label);
         const owned_expanded_label: ?[]u8 = if (display_expanded_label) |label|
             try self.gpa.dupe(u8, label)
         else
             null;
-        errdefer if (owned_expanded_label) |label| self.gpa.free(label);
         const owned_body = try self.gpa.dupe(u8, display_body);
-        errdefer self.gpa.free(owned_body);
         const owned_stderr: ?[]u8 = if (stderr) |s|
             try self.gpa.dupe(u8, s)
         else
             null;
-        errdefer if (owned_stderr) |s| self.gpa.free(s);
         try listener.emit(.{
             .tool_call_finished = .{
                 .index = tool_index,
@@ -1487,6 +1477,38 @@ test "streaming callbacks emit owned events" {
     try std.testing.expectEqual(.delta_end, seen.events.items[3]);
     try std.testing.expect(context.toolDeltaSeen(1));
     try std.testing.expect(!context.toolDeltaSeen(0));
+}
+
+test "stream callbacks do not double-free when the listener returns an error" {
+    const gpa = std.testing.allocator;
+    const openai_compatible = @import("ai/openai_compatible.zig");
+    var openai_compatible_client: openai_compatible.Client = undefined;
+    try openai_compatible_client.init(gpa, std.testing.io, .{ .base_url = "http://127.0.0.1", .api_key = "test", .model = "test" });
+    defer openai_compatible_client.deinit();
+    var agent = Agent.init(gpa, std.testing.io, ".", .{ .openai_compatible = &openai_compatible_client });
+    defer agent.deinit();
+
+    const FailingListener = struct {
+        fn onEvent(_: *@This(), _: Agent.Event) anyerror!void {
+            return error.TestFailure;
+        }
+    };
+    var failing: FailingListener = .{};
+    const Listener = Agent.Listener(FailingListener);
+    var context: Agent.StreamContext(Listener) = .{
+        .agent = &agent,
+        .listener = .{ .ctx = &failing, .on_event = FailingListener.onEvent },
+    };
+    defer context.deinit();
+
+    // Each callback must propagate the listener's error without double-freeing
+    // the owned slice it passed into `emit`. Before the fix, the `errdefer
+    // gpa.free(owned)` in the callback raced with `postAgentEvent`'s own
+    // `errdefer event.deinit`, crashing with SIGABRT.
+    try std.testing.expectError(error.TestFailure, Agent.onContentDeltaImpl(Listener)(&context, "delta"));
+    try std.testing.expectError(error.TestFailure, Agent.onReasoningDeltaImpl(Listener)(&context, "reasoning"));
+    try std.testing.expectError(error.TestFailure, Agent.emitToolDelta(Listener, &agent, context.listener, 0, "name", "args"));
+    try std.testing.expectError(error.TestFailure, Agent.emitToolCallFinished(Listener, &agent, context.listener, 0, "id", "name", "label", null, "body", .text, null, false));
 }
 
 test "run gates the request on the limiter and releases on the error path" {
