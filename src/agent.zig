@@ -1489,11 +1489,17 @@ test "stream callbacks do not double-free when the listener returns an error" {
     defer agent.deinit();
 
     const FailingListener = struct {
-        fn onEvent(_: *@This(), _: Agent.Event) anyerror!void {
+        gpa: std.mem.Allocator,
+        fn onEvent(self: *@This(), event: Agent.Event) anyerror!void {
+            // Mirror `postAgentEvent`'s error path: it frees the event's owned
+            // data before propagating the failure. The callbacks under test
+            // must NOT free it again (that was the double-free bug).
+            var ev = event;
+            ev.deinit(self.gpa);
             return error.TestFailure;
         }
     };
-    var failing: FailingListener = .{};
+    var failing: FailingListener = .{ .gpa = gpa };
     const Listener = Agent.Listener(FailingListener);
     var context: Agent.StreamContext(Listener) = .{
         .agent = &agent,
