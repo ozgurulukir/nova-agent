@@ -60,7 +60,10 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
         logger.init(.{
             .io = init.io,
             .log_path = log_path,
-            .stderr_level = stderr_level orelse .warn,
+            .stderr_level = stderr_level orelse switch (builtin.mode) {
+                .Debug => .err,
+                else => .warn,
+            },
             .stderr_explicit = stderr_level != null,
             .toast_sink = toastSink,
             .max_bytes = resolveMaxBytes(init.environ_map),

@@ -67,6 +67,11 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
       "historicalToolCapBytes": 1024
     }
   },
+  "toast": {
+    "enabled": true,
+    "durationMs": 4000,
+    "maxVisible": 3
+  },
   "providers": {
     "openai": {
       "baseURL": "https://api.openai.com/v1",
@@ -103,6 +108,7 @@ JSON keys are **camelCase**. Legacy snake_case keys from schema v1 are still acc
 | `strictOutputs`        | `boolean` | `true` to send OpenAI strict structured-outputs mode (`"strict":true`, `additionalProperties:false`, all properties in `required`) in tool definitions. **Only works against the OpenAI API** — gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break it, which disables function-calling (the model then emits tool calls as plain text). Defaults to `false` so tool-calling works everywhere. Enable only when talking directly to OpenAI. Legacy key `strict_outputs` is parsed for backward compatibility but is not schema-valid; new configs must use `strictOutputs`. |
 | `systemPrompt`         | `string`  | Base system prompt template (max 10 000 chars). Legacy key `system_prompt` is parsed for backward compatibility but is not schema-valid; new configs must use `systemPrompt`.                                                                                                                                                                                                                                                                                                                                                           |
 | `bashClassifierUrl`    | `string`  | ModernBERT classifier endpoint for shell command safety check. Legacy key `bash_classifier_url` is parsed for backward compatibility but is not schema-valid; new configs must use `bashClassifierUrl`.                                                                                                                                                                                                                                                                                                                                      |
+| `toast`                | `object`  | Transient toast notifications (top-right TUI notices). See [Toast settings](#toast-settings).                                                                                                                                                                                                                                                                                                                                                          |
 | `context`              | `object`  | Context window management and compaction policy. See [Context settings](#context-settings).                                                                                                                                                                                                                                                                                                                                                            |
 | `mcpServers`           | `object`  | MCP server configurations (Claude Desktop format compatible). Legacy keys `mcp_servers` and `mcp` are parsed for backward compatibility but are not schema-valid; new configs must use `mcpServers`.                                                                                                                                                                                                                                                                                                                                   |
 | `plugins`              | `object`  | Lua plugin configuration keyed by plugin name. Each entry controls whether the plugin is enabled and its custom settings (JSON string). Settings are passed to the plugin's Lua code via `plugin.get_config()`.                                                                                                                                                                                                                                        |
@@ -140,6 +146,20 @@ The `context` object controls context window management and automatic summarizat
   }
 }
 ```
+
+### Toast Settings
+
+The `toast` object controls transient notifications shown stacked in the top-right corner of the TUI. With the TUI running, `warn`+ log output routes to the toast bus **instead of stderr** — stderr writes land in the alternate screen and tear the rendered frame, so the toast overlay is the intended surface for operational warnings. The bus is generic: any subsystem (MCP, lanes, background jobs) can push a toast.
+
+| Field                | Type      | Default     | Description                                                                                                                                                                                                                  |
+| -------------------- | --------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `toast.enabled`      | `boolean` | `true`      | Master switch. When `false`, no toasts are shown — `warn`+ output is dropped from the TUI. Set `NOVA_LOG_STDERR_LEVEL` to route it back to stderr. Also toggled live from the `/settings` General tab.                       |
+| `toast.durationMs`   | `integer` | `4000`      | Auto-dismiss delay in milliseconds. Out-of-range values are **dropped** (left null) at parse time, not clamped — a typo can't produce a toast that never dismisses. Config-file only.                                         |
+| `toast.maxVisible`   | `integer` | `3`         | Maximum toasts stacked at once. Out-of-range values are dropped at parse time. Config-file only.                                                                                                                             |
+| `toast.position`     | `string`  | `top-right` | Corner position. **Reserved for future use** — only `top-right` is rendered today; other values are parsed and persisted but have no effect yet.                                                                            |
+
+> [!NOTE]
+> **Restoring the stderr channel.** When the TUI is up, `warn`+ logs go to the toast, not stderr. To keep full stderr output (e.g. for `nova 2> err.log` diagnostics), set `NOVA_LOG_STDERR_LEVEL` explicitly (`err`/`warn`/`info`/`debug`) — an explicit value sends output to **both** stderr and the toast, while leaving it unset sends `warn`+ to the toast only. Headless/test runs have no toast sink installed and keep stderr as before.
 
 ### Provider Configuration
 
@@ -278,6 +298,9 @@ When both camelCase and snake_case keys are present, **camelCase wins**.
 | `NOVA_USE_RESPONSES_ENDPOINT` | Sets Responses endpoint routing       | `true` or `1`                            |
 | `NOVA_STRICT_OUTPUTS`         | Sets OpenAI strict structured-outputs mode (gateway-incompatible) | `true` or `1`                            |
 | `NOVA_BASH_CLASSIFIER_URL`    | Sets ModernBERT safety classifier URL | `http://localhost:8000`                  |
+| `NOVA_LOG_FILE`               | Path to the log file (path max 1024 bytes); defaults to `~/.config/nova/nova.log` | `/tmp/nova.log` |
+| `NOVA_LOG_STDERR_LEVEL`       | Min level for the stderr sink (`err`\|`warn`\|`info`\|`debug`, case-insensitive). Default `warn` in release, `err` in debug. When the TUI is up, setting this **also** restores `warn`+ output to stderr (otherwise it goes to the toast). | `debug` |
+| `NOVA_LOG_MAX_BYTES`          | Max log file size before rotation (default 10 MB). On launch, if the existing log exceeds this, `nova.log` is renamed to `nova.log.1` and a fresh file starts. | `5242880` |
 | `XDG_CONFIG_HOME`             | Custom XDG configuration root         | `/home/user/.config`                     |
 
 ---

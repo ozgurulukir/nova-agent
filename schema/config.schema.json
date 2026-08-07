@@ -58,7 +58,11 @@
     },
     "context": {
       "$ref": "#/$defs/ContextSettings",
-      "description": "Context window management and automatic compaction policy."
+      "description": "Context window management and compaction policy."
+    },
+    "toast": {
+      "$ref": "#/$defs/ToastSettings",
+      "description": "Toast notification settings (transient top-right TUI notices)."
     }
   },
   "additionalProperties": false,
@@ -275,6 +279,37 @@
           "minimum": 1,
           "default": 1024,
           "description": "Byte cap applied to tool results older than keepRecentToolTurns — the head is kept followed by a '[... compacted to save context (was N bytes) ...]' notice. Raise for large command outputs the model must re-read later in the same turn."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ToastSettings": {
+      "type": "object",
+      "description": "Transient toast notifications shown in the top-right corner of the TUI. With the TUI running, warn+ log output routes to the toast bus instead of stderr (which would tear the frame); setting NOVA_LOG_STDERR_LEVEL restores the stderr channel. All fields are optional and omitted from config.json when left at defaults.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch. When false, no toasts are shown (warn+ output is dropped from the TUI; set NOVA_LOG_STDERR_LEVEL to route it back to stderr). Toggled live from the /settings General tab."
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 500,
+          "maximum": 30000,
+          "default": 4000,
+          "description": "Auto-dismiss delay in milliseconds. Out-of-range values are dropped (left null) at parse time, not clamped, so a typo can't produce a toast that never dismisses. Config-file only — not surfaced in the settings panel."
+        },
+        "maxVisible": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "default": 3,
+          "description": "Maximum number of toasts stacked at once. Out-of-range values are dropped at parse time. Config-file only — not surfaced in the settings panel."
+        },
+        "position": {
+          "type": "string",
+          "default": "top-right",
+          "description": "Corner position. Reserved for future use: only 'top-right' is rendered today; other values are parsed and persisted but have no effect yet."
         }
       },
       "additionalProperties": false
