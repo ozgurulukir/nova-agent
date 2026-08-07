@@ -32,7 +32,7 @@ pub const Level = enum { info, success, warn, err };
 pub const Item = struct {
     level: Level = .info,
     msg: [msg_capacity]u8 = undefined,
-    len: u8 = 0,
+    len: u16 = 0,
     /// Monotonic deadline (ms) after which the toast auto-dismisses.
     deadline_ms: i64 = 0,
 
@@ -41,10 +41,16 @@ pub const Item = struct {
     }
 };
 
-pub const msg_capacity: u8 = 255;
+/// Max message bytes. Large enough that a toast can carry a real sentence and
+/// wrap across a couple of rows; the widget soft-wraps at the box width.
+pub const msg_capacity = 1024;
 pub const max_items: u8 = 8;
 pub const default_duration_ms: u32 = 4000;
 pub const default_max_visible: u8 = 3;
+/// A toast's message wraps across at most this many content rows before the
+/// tail is truncated (with the `…` marker) so a huge message can't fill the
+/// screen.
+pub const max_wrap_rows: u16 = 4;
 
 /// Thread-safe ring buffer of toasts. UI thread drains; any thread pushes.
 pub const ToastBus = struct {
@@ -159,11 +165,23 @@ pub const Widget = struct {
         const n = self.bus.drain(&items);
         if (n == 0) return vxfw.Surface.empty(self.widget());
 
-        // Each toast is a bordered box: 2 rows (border top/bottom) + 1 content
-        // row. Stack them top-right, newest at the top.
-        const box_height: u16 = 3;
-        const total_height: u16 = @intCast(@min(n, self.bus.max_visible) * box_height);
+        // Each toast is a bordered box: 2 rows (border top/bottom) + up to
+        // `max_wrap_rows` content rows. The message soft-wraps at the box width
+        // so a long toast reads across several rows instead of truncating to a
+        // single line. Stack them top-right, newest at the top.
         const box_width: u16 = @min(width, 60);
+        const content_width: u16 = box_width -| 2;
+        const visible = @min(n, self.bus.max_visible);
+
+        // Compute each toast's wrapped row count so the total surface height
+        // matches what we draw (no clipping, no wasted rows).
+        var heights: [max_items]u16 = undefined;
+        var total_height: u16 = 0;
+        for (items[0..visible], 0..) |*item, i| {
+            const rows = wrappedRows(item.message(), content_width, ctx);
+            heights[i] = rows;
+            total_height +|= 2 + rows;
+        }
 
         var surface = try vxfw.Surface.initWithChildren(
             ctx.arena,
@@ -173,25 +191,93 @@ pub const Widget = struct {
         );
 
         var row: u16 = 0;
-        for (items[0..n]) |*item| {
-            if (row + box_height > total_height) break;
+        for (items[0..visible], 0..) |*item, i| {
             const style = switch (item.level) {
                 .info => StylePalette.info,
                 .success => StylePalette.success,
                 .warn => StylePalette.warning,
                 .err => StylePalette.error_style,
             };
+            const rows = heights[i];
             // Border top.
             try panel.lineStyledAt(&surface, row, "", ctx, 0, style);
-            // Content row.
-            try panel.lineStyledAt(&surface, row + 1, item.message(), ctx, 1, style);
+            // Content rows: soft-wrap the message, truncating past `max_wrap_rows`.
+            drawWrapped(&surface, item.message(), style, ctx, row + 1, content_width);
             // Border bottom.
-            try panel.lineStyledAt(&surface, row + 2, "", ctx, 0, style);
-            row += box_height;
+            try panel.lineStyledAt(&surface, row + 1 + rows, "", ctx, 0, style);
+            row += 2 + rows;
         }
         return surface;
     }
 };
+
+/// Number of content rows `text` occupies when soft-wrapped at `width`, capped
+/// at `max_wrap_rows`. Mirrors `drawWrapped` so the surface height matches the
+/// drawn rows.
+fn wrappedRows(text: []const u8, width: u16, ctx: vxfw.DrawContext) u16 {
+    if (text.len == 0 or width == 0) return 1;
+    var rows: u16 = 1;
+    var col: u16 = 0;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        const bytes = grapheme.bytes(text);
+        if (std.mem.eql(u8, bytes, "\n")) {
+            rows += 1;
+            col = 0;
+            if (rows >= max_wrap_rows) return max_wrap_rows;
+            continue;
+        }
+        const w: u16 = @intCast(ctx.stringWidth(bytes));
+        if (w == 0) continue;
+        if (col + w > width) {
+            rows += 1;
+            col = 0;
+            if (rows >= max_wrap_rows) return max_wrap_rows;
+        }
+        col += w;
+    }
+    return rows;
+}
+
+/// Draw `text` soft-wrapped at `width` starting at `row`, truncating past
+/// `max_wrap_rows` with a trailing `…` on the last drawn row.
+fn drawWrapped(surface: *vxfw.Surface, text: []const u8, style: vaxis.Style, ctx: vxfw.DrawContext, row: u16, width: u16) void {
+    if (text.len == 0 or width == 0) return;
+    var r: u16 = row;
+    var col: u16 = 0;
+    var iter = ctx.graphemeIterator(text);
+    while (iter.next()) |grapheme| {
+        if (r >= row + max_wrap_rows) break;
+        if (r >= surface.size.height) break;
+        const bytes = grapheme.bytes(text);
+        if (std.mem.eql(u8, bytes, "\n")) {
+            r += 1;
+            col = 0;
+            continue;
+        }
+        const w: u16 = @intCast(ctx.stringWidth(bytes));
+        if (w == 0) continue;
+        if (col + w > width) {
+            r += 1;
+            col = 0;
+            if (r >= row + max_wrap_rows) break;
+        }
+        if (col < surface.size.width) {
+            surface.writeCell(col, r, .{
+                .char = .{ .grapheme = bytes, .width = @intCast(w) },
+                .style = style,
+            });
+        }
+        col += w;
+    }
+    // If the message was truncated by the row cap, mark the tail with `…`.
+    if (r >= row + max_wrap_rows and col > 0 and col < surface.size.width) {
+        surface.writeCell(col, r, .{
+            .char = .{ .grapheme = "…", .width = 1 },
+            .style = style,
+        });
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -213,13 +299,13 @@ test "push and drain round-trip" {
 test "push truncates oversized message" {
     var bus: ToastBus = .{};
     bus.init(std.testing.io);
-    const long = "x" ** 500;
+    const long = "x" ** 2000;
     bus.push(.err, long);
 
     var out: [max_items]Item = undefined;
     const n = bus.drain(&out);
     try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(@as(usize, msg_capacity), out[0].len);
+    try std.testing.expectEqual(@as(u16, msg_capacity), out[0].len);
 }
 
 test "ring overwrites oldest when full" {
@@ -292,4 +378,36 @@ test "disabled bus drops pushes" {
     var out: [max_items]Item = undefined;
     const n = bus.drain(&out);
     try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "wrappedRows counts soft-wrapped rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 10, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    // "hello world" at width 10 wraps to two rows.
+    try std.testing.expectEqual(@as(u16, 2), wrappedRows("hello world", 10, ctx));
+    // A single short word stays on one row.
+    try std.testing.expectEqual(@as(u16, 1), wrappedRows("hi", 10, ctx));
+    // Explicit newline forces a row break.
+    try std.testing.expectEqual(@as(u16, 2), wrappedRows("a\nb", 10, ctx));
+    // Empty text still occupies one content row.
+    try std.testing.expectEqual(@as(u16, 1), wrappedRows("", 10, ctx));
+}
+
+test "wrappedRows caps at max_wrap_rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 5, .height = 1 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    // A long run of words at width 5 would exceed the cap; it clamps.
+    try std.testing.expectEqual(max_wrap_rows, wrappedRows("one two three four five six", 5, ctx));
 }
