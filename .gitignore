@@ -24,3 +24,4 @@ zig-cache-session/
 .zcode/
 .soloncode/
 .opencode/
+zig-x86_64-linux-0.16.0/

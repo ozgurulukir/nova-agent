@@ -49,7 +49,7 @@ test "runMain injects gpa and calls runner" {
             called = true;
         }
     };
-    const dummy_init: std.process.Init = undefined;
+    var dummy_init: std.process.Init = undefined;
     try runMain(dummy_init, Mock.run);
     try std.testing.expect(Mock.called);
 }
