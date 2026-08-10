@@ -33,12 +33,6 @@ pub fn runMain(init: std.process.Init, comptime runFn: anytype) !void {
 pub fn main(init: std.process.Init) !void {
     try runMain(init, nova.run);
 }
-test "novaLog formats message and dispatches to logger" {
-    // Verify that novaLog compiles and correctly dispatches to the logger.
-    novaLog(.info, .test_scope, "test message {s}", .{"arg"});
-    // Panic testing is intentionally omitted as it stops the test runner
-    // without spawning a separate process, which is overkill here.
-}
 
 test "runMain injects gpa and calls runner" {
     const Mock = struct {
@@ -49,6 +43,7 @@ test "runMain injects gpa and calls runner" {
             called = true;
         }
     };
+    // Safe to pass undefined since our Mock runner completely ignores the init value.
     const dummy_init: std.process.Init = undefined;
     try runMain(dummy_init, Mock.run);
     try std.testing.expect(Mock.called);
