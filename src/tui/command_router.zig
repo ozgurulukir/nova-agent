@@ -67,21 +67,21 @@ pub fn handleCommandKey(app: *App, key: vaxis.Key) !bool {
 /// through to the input.
 const TreePicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             app.getTreeState().moveUp();
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             app.getTreeState().moveDown();
             return true;
         }
-        if (key.matches(vaxis.Key.left, .{})) {
+        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
             const filter = try app.peekPaletteInput();
             defer app.gpa.free(filter);
             try app.getTreeState().cycleFilter(filter, false);
             return true;
         }
-        if (key.matches(vaxis.Key.right, .{})) {
+        if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
             const filter = try app.peekPaletteInput();
             defer app.gpa.free(filter);
             try app.getTreeState().cycleFilter(filter, true);
@@ -149,11 +149,11 @@ const ProviderPicker = struct {
 const ModelPicker = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         const models = app.getModels();
-        if (key.matches(vaxis.Key.left, .{})) {
+        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
             models.model_column = models.model_column.previous();
             return true;
         }
-        if (key.matches(vaxis.Key.right, .{})) {
+        if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
             if (models.len() > 0) models.model_column = models.model_column.next();
             return true;
         }
@@ -171,11 +171,11 @@ const ModelPicker = struct {
             provider_model.cycleModelScope(app);
             return true;
         }
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             try provider_model.stepModelSelection(app, false);
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             try provider_model.stepModelSelection(app, true);
             return true;
         }
@@ -225,13 +225,13 @@ const SessionPicker = struct {
             try app.beginRenameSelectedSession();
             return true;
         }
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             const next = previousIndex(app.getResumeSelection(), try app.visibleResumeCount());
             app.setResumeSelection(next);
             app.syncResumeListCursor();
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             const next = nextIndex(app.getResumeSelection(), try app.visibleResumeCount());
             app.setResumeSelection(next);
             app.syncResumeListCursor();
@@ -293,13 +293,13 @@ const SessionPicker = struct {
 /// 'x' deletes it. Lane errors are routed through the existing reporter.
 const Lanes = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             if (app.getLanesSelection() > 0) {
                 app.setLanesSelection(app.getLanesSelection() - 1);
             }
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             const count = app.laneEntryCount();
             if (count > 0 and app.getLanesSelection() + 1 < count) {
                 app.setLanesSelection(app.getLanesSelection() + 1);
@@ -327,12 +327,12 @@ const Lanes = struct {
 /// the selection.
 const CommandMenu = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             const next = previousIndex(app.getCommandSelection(), tui.commandMatchesCount(app));
             app.setCommandSelection(next);
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             const next = nextIndex(app.getCommandSelection(), tui.commandMatchesCount(app));
             app.setCommandSelection(next);
             return true;
@@ -352,10 +352,10 @@ const CommandMenu = struct {
 pub const Transcript = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         // Prompt history navigation: Ctrl+Up / Alt+Up (previous prompt), Ctrl+Down / Alt+Down (next prompt).
-        if (key.matches(vaxis.Key.up, .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .alt = true })) {
+        if (key.matches(vaxis.Key.up, .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{ .alt = true }) or key.matches('k', .{ .ctrl = true }) or key.matches('k', .{ .alt = true })) {
             if (try app.navigatePromptHistory(.up)) return true;
         }
-        if (key.matches(vaxis.Key.down, .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .alt = true })) {
+        if (key.matches(vaxis.Key.down, .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{ .alt = true }) or key.matches('j', .{ .ctrl = true }) or key.matches('j', .{ .alt = true })) {
             if (try app.navigatePromptHistory(.down)) return true;
         }
         // R2.8a: @-mention popup owns up/down while active.
@@ -375,12 +375,12 @@ pub const Transcript = struct {
 pub const MentionPopup = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         if (!app.isAtSearchActive() or !app.atSearchHasResults()) return false;
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             const next = previousIndex(app.getAtSelection(), @intCast(app.atResultsLen()));
             app.setAtSelection(next);
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             const next = nextIndex(app.getAtSelection(), @intCast(app.atResultsLen()));
             app.setAtSelection(next);
             return true;
@@ -407,11 +407,11 @@ pub const BlockNav = struct {
             app.jumpTranscriptToBottom();
             return true;
         }
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             _ = app.navigateTranscript(.previous);
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             // Stepping down past the last block (when it can't scroll further)
             // re-enters the input and traps the cursor there again.
             if (app.getBlockNav() and app.selectionIsLastMessage() and !app.selectedMessageCanScrollDown()) {
@@ -501,13 +501,13 @@ pub const HelpPicker = struct {
 const SearchMode = struct {
     pub fn handle(app: *App, key: vaxis.Key) !bool {
         const state = &app.pickers.search;
-        if (key.matches(vaxis.Key.up, .{})) {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
             if (state.matches.items.len > 0) {
                 state.selection = previousIndex(state.selection, @intCast(state.matches.items.len));
             }
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
             if (state.matches.items.len > 0) {
                 state.selection = nextIndex(state.selection, @intCast(state.matches.items.len));
             }

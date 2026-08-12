@@ -34,19 +34,19 @@ pub fn permissionPending(app: *App) bool {
 }
 
 pub fn handlePermissionKey(app: *App, key: vaxis.Key) !bool {
-    if (key.matches(vaxis.Key.left, .{})) {
+    if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
         app.thread.permission_selection = .approve;
         return true;
     }
-    if (key.matches(vaxis.Key.right, .{})) {
+    if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
         app.thread.permission_selection = .reject;
         return true;
     }
-    if (key.matches(vaxis.Key.up, .{})) {
+    if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
         if (app.thread.permission_scroll > 0) app.thread.permission_scroll -= 1;
         return true;
     }
-    if (key.matches(vaxis.Key.down, .{})) {
+    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
         app.thread.permission_scroll += 1;
         return true;
     }
