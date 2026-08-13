@@ -639,14 +639,15 @@ const VendoredResult = struct {
 };
 
 /// Load the vendored api.json installed alongside the binary at
-/// `<exe_dir>/../share/nova/api.json`. Returns an error when the file is
+/// `<prefix_dir>/share/nova/api.json` (where prefix_dir is the parent of exe_dir). Returns an error when the file is
 /// missing or the executable path cannot be resolved.
 fn loadVendored(gpa: std.mem.Allocator, io: std.Io) !VendoredResult {
     const exe_path = std.process.executablePathAlloc(io, gpa) catch
         return error.FileNotFound;
     defer gpa.free(exe_path);
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.FileNotFound;
-    const vendored_path = try std.fs.path.join(gpa, &.{ exe_dir, "..", "share", "nova", "api.json" });
+    const prefix_dir = std.fs.path.dirname(exe_dir) orelse return error.FileNotFound;
+    const vendored_path = try std.fs.path.join(gpa, &.{ prefix_dir, "share", "nova", "api.json" });
     defer gpa.free(vendored_path);
 
     const file = std.Io.Dir.openFile(.cwd(), io, vendored_path, .{}) catch |err| switch (err) {
