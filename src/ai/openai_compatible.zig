@@ -2126,6 +2126,7 @@ test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)
     try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
     try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
     try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}\"}", stream.builders.items[0].arguments.items);
 }
 
 test "sanitizeToolArguments strips markdown backticks and falls back to empty object" {
