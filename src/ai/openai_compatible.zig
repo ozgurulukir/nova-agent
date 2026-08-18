@@ -2115,18 +2115,18 @@ test "parse streaming tool calls deduplicates repeated tool names (bashbash fix)
     defer stream.deinit(gpa);
 
     _ = try stream_parser.parseStreamChunk(gpa,
-        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":"}}]}}]}
     , &content, &reasoning, &stream);
 
     // Second chunk repeats function.name: "bash" while sending argument continuation
     _ = try stream_parser.parseStreamChunk(gpa,
-        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"\"}"}}]}}]}
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"\"ls\"}"}}]}}]}
     , &content, &reasoning, &stream);
 
     try std.testing.expectEqual(@as(usize, 1), stream.builders.items.len);
     try std.testing.expectEqualStrings("bash", stream.builders.items[0].name.items);
     try std.testing.expectEqualStrings("call_1", stream.builders.items[0].id.items);
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}\"}", stream.builders.items[0].arguments.items);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", stream.builders.items[0].arguments.items);
 }
 
 test "sanitizeToolArguments strips markdown backticks and falls back to empty object" {
