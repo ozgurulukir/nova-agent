@@ -82,6 +82,7 @@ pub fn runWithStdin(
 fn runUnderBash(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
+    if (std.mem.indexOfScalar(u8, options.command, 0) != null) return error.InvalidCharacter;
     var child = try std.process.spawn(io, .{
         .argv = &.{ bashPath(io), "-c", options.command },
         .cwd = .{ .path = options.cwd },
@@ -211,6 +212,7 @@ const capture_read_reserve: usize = 64 * 1024;
 pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Capture {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
+    if (std.mem.indexOfScalar(u8, options.command, 0) != null) return error.InvalidCharacter;
     assert(options.limits.tail_bytes_max > options.limits.bytes_max);
     // The seed write (the untrimmed tail, <= tail_bytes_max) must always fit, or
     // the spill would be created over its own cap.
@@ -680,4 +682,31 @@ test "pruneTempDir removes only matching stale files" {
     try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-pwsh-123456.log"));
     try std.testing.expect(!tmp_has(std.testing.io, tmp.dir, "nova-bg_1.log"));
     try std.testing.expect(tmp_has(std.testing.io, tmp.dir, "keep.txt"));
+}
+
+test "runUnderBash rejects command with null byte" {
+    const gpa = std.testing.allocator;
+
+    const options = RunOptions{
+        .cwd = ".",
+        .command = "echo hello\x00world",
+    };
+
+    try std.testing.expectError(error.InvalidCharacter, runUnderBash(gpa, std.testing.io, options));
+}
+
+test "capture rejects command with null byte" {
+    const gpa = std.testing.allocator;
+
+    const options = CaptureOptions{
+        .cwd = ".",
+        .command = "echo hello\x00world",
+        .limits = .{
+            .bytes_max = 50 * 1024,
+            .lines_max = 2000,
+            .tail_bytes_max = 100 * 1024,
+            .spill_bytes_max = 10 * 1024 * 1024,
+        },
+    };
+    try std.testing.expectError(error.InvalidCharacter, capture(gpa, std.testing.io, options));
 }
