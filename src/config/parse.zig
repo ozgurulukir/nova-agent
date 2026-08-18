@@ -1445,9 +1445,9 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
                 try writer.writeByte('{');
                 for (t.headers, 0..) |h, i| {
                     if (i > 0) try writer.writeByte(',');
-                    try std.json.Stringify.value(h.name, .{}, writer);
+                    try writeFastJsonString(writer, h.name);
                     try writer.writeByte(':');
-                    try std.json.Stringify.value(h.value, .{}, writer);
+                    try writeFastJsonString(writer, h.value);
                 }
                 try writer.writeByte('}');
             }
@@ -1458,6 +1458,39 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
         try writer.writeAll("false");
     }
     try writer.writeByte('}');
+}
+
+fn writeFastJsonString(writer: *std.Io.Writer, s: []const u8) !void {
+    try writer.writeByte('"');
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        switch (c) {
+            '"', '\\' => {
+                try writer.writeAll(s[start..i]);
+                try writer.writeByte('\\');
+                try writer.writeByte(c);
+                start = i + 1;
+            },
+            '\n' => {
+                try writer.writeAll(s[start..i]);
+                try writer.writeAll("\\n");
+                start = i + 1;
+            },
+            '\r' => {
+                try writer.writeAll(s[start..i]);
+                try writer.writeAll("\\r");
+                start = i + 1;
+            },
+            '\t' => {
+                try writer.writeAll(s[start..i]);
+                try writer.writeAll("\\t");
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    try writer.writeAll(s[start..]);
+    try writer.writeByte('"');
 }
 
 fn writePlugins(writer: *std.Io.Writer, plugins: []const PluginConfig) !void {
