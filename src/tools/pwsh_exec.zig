@@ -111,6 +111,7 @@ pub fn runWithStdin(
 fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
+    if (std.mem.indexOfScalar(u8, options.command, 0) != null) return error.InvalidCharacter;
     const script = try exitCheckedScript(gpa, options.command);
     defer gpa.free(script);
     const script_path = try writeScriptTemp(gpa, io, script);
@@ -281,6 +282,7 @@ const capture_read_reserve: usize = 64 * 1024;
 pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Capture {
     assert(options.cwd.len > 0);
     assert(options.command.len > 0);
+    if (std.mem.indexOfScalar(u8, options.command, 0) != null) return error.InvalidCharacter;
     assert(options.limits.tail_bytes_max > options.limits.bytes_max);
     assert(options.limits.spill_bytes_max >= options.limits.tail_bytes_max);
 
@@ -580,4 +582,31 @@ test "exitCheckedScript wraps command and normalizes exit" {
     try std.testing.expect(preamble_pos < command_pos);
     // No `& {` block wrapper (see comment above).
     try std.testing.expect(std.mem.indexOf(u8, script, "& {") == null);
+}
+
+test "runUnderPwsh rejects command with null byte" {
+    const gpa = std.testing.allocator;
+
+    const options = RunOptions{
+        .cwd = ".",
+        .command = "Write-Output hello\x00world",
+    };
+
+    try std.testing.expectError(error.InvalidCharacter, runUnderPwsh(gpa, std.testing.io, options));
+}
+
+test "pwsh capture rejects command with null byte" {
+    const gpa = std.testing.allocator;
+
+    const options = CaptureOptions{
+        .cwd = ".",
+        .command = "Write-Output hello\x00world",
+        .limits = .{
+            .bytes_max = 50 * 1024,
+            .lines_max = 2000,
+            .tail_bytes_max = 100 * 1024,
+            .spill_bytes_max = 10 * 1024 * 1024,
+        },
+    };
+    try std.testing.expectError(error.InvalidCharacter, capture(gpa, std.testing.io, options));
 }
