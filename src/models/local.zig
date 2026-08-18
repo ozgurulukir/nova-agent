@@ -88,6 +88,7 @@ fn spawn(gpa: std.mem.Allocator, io: std.Io, classifier_dir: []const u8, python_
     return std.process.spawn(io, .{
         .argv = &.{
             python_path,
+            "-I",
             "server.py",
             "--model-dir",
             "ModernBERT-bash-classifier",
