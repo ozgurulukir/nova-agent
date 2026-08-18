@@ -24,3 +24,4 @@ zig-cache-session/
 .zcode/
 .soloncode/
 .opencode/
+test_venv
