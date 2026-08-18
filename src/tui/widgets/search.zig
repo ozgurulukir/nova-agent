@@ -111,7 +111,8 @@ pub const Content = struct {
             const m = matches[match_idx];
             const selected = match_idx == self.state.selection;
             const screen_row = viewport.screenRow(match_idx);
-            const label = try std.fmt.allocPrint(ctx.arena, "{d} {s}  ", .{ m.message_index, m.role });
+            var label_buf: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "{d} {s}  ", .{ m.message_index, m.role }) catch unreachable;
             try panel.commandLine(&surface, screen_row, label, ctx, selected);
             if (m.snippet.len > 0 and width > 24) {
                 const desc_style = if (selected) StylePalette.selected_item else StylePalette.thinking_body;
