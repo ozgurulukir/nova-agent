@@ -870,12 +870,12 @@ fn writeRequestPayload(
     // empty-tools case.
 
     // Qwen / DashScope requires a single leading system message; merge + hoist.
-    // This also covers the `.minimal` dialect: Qwen served through third-party
-    // gateways (runinfra.ai etc.) resolves to `.minimal` when the provider is
-    // registered as a generic `openai_compatible` (the resolver returns early
-    // for known builtins and never reaches the base-URL heuristic), so the
-    // normalization must apply to both dialects, not just `.dashscope`.
-    const needs_qwen_normalize = dialect == .dashscope or dialect == .minimal;
+    // Gate this narrowly on the model id (Qwen models start with `qwen`/`qwq`)
+    // or the explicit `.dashscope` dialect so other models on the same provider
+    // (ollama, openrouter, etc.) are never affected — most tolerate multiple /
+    // late system messages and we must not silently rewrite their history.
+    const is_qwen_model = std.mem.startsWith(u8, model, "qwen") or std.mem.startsWith(u8, model, "qwq");
+    const needs_qwen_normalize = dialect == .dashscope or is_qwen_model;
     var normalized: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
     var wrapped: std.ArrayListUnmanaged(ai.MessageView) = .empty;
     var rebuilt = false;
@@ -964,7 +964,7 @@ fn writeRequestPayload(
                 // Clip unsupported effort levels (high/max/minimal → medium/low)
                 // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
                 try out.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":\"");
-                try out.writeAll(wireEffortLabel(dialect, value) orelse value.label());
+                try out.writeAll(wireEffortLabel(dialect, value, is_qwen_model) orelse value.label());
                 try out.writeAll("\"}");
             }
         } else {
@@ -1005,7 +1005,7 @@ fn writeRequestPayload(
     // OpenAI-native and minimal dialects: flat `reasoning_effort` field. The
     // `default` level means "don't override" — emit nothing. Values that the
     // target rejects are clipped by `wireEffortLabel` (see comment there).
-    const wire_label = wireEffortLabel(dialect, effort orelse .default);
+    const wire_label = wireEffortLabel(dialect, effort orelse .default, is_qwen_model);
     if (wire_label) |label| {
         try out.writeAll(",\"reasoning_effort\":\"");
         try out.writeAll(label);
@@ -1028,16 +1028,21 @@ fn writeRequestPayload(
 /// — used by Ollama Cloud, local Ollama, Groq, vLLM, etc. — clips them to
 /// the nearest valid level. The OpenAI-native dialect keeps the raw label
 /// (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
-pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
+///
+/// `is_qwen_model` gates the DashScope clip independently of the wire dialect:
+/// Qwen served through a generic `openai_compatible` gateway (e.g. runinfra.ai)
+/// resolves to `.minimal`, not `.dashscope`, so the clip must key off the model
+/// id, not just the dialect, to keep Qwen from rejecting `high`/`max`/`minimal`.
+pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort, is_qwen_model: bool) ?[]const u8 {
     // Qwen / DashScope rejects `high`, `max`, and `minimal` (HTTP 400), keeping
     // only `low`/`medium`/`none`/`xhigh`. Clip the unsupported levels the same
     // way the minimal dialect does — `minimal` → `low`, and any high-tier level
     // (`high`/`max`) → `medium` (the strongest valid level). `xhigh` is accepted
     // by DashScope, so it is left intact.
-    const dashscope_clip = (dialect == .dashscope);
+    const dashscope_clip = (dialect == .dashscope) or is_qwen_model;
     return switch (effort) {
         .default => null, // omit the parameter entirely
-        .xhigh => if (dialect == .minimal) "max" else effort.label(),
+        .xhigh => if (dialect == .minimal and !is_qwen_model) "max" else effort.label(),
         .minimal => if (dialect == .minimal or dashscope_clip) "low" else effort.label(),
         .high, .max => if (dashscope_clip) "medium" else effort.label(),
         else => effort.label(),
