@@ -940,6 +940,35 @@ test "readStream tolerates DashScope null id/name on tool-call continuation delt
     try std.testing.expectEqualStrings("{\"command\":\"echo 6\"}", call.arguments);
 }
 
+test "readStream tolerates null tool_calls in keep-alive deltas alongside reasoning" {
+    // runinfra's DashScope-hosted Qwen streams reasoning chunks that carry
+    // `"tool_calls": null` (and the final finish chunk does too). The parser
+    // previously called expectArrayBegin on `null`, aborting the turn with
+    // error.UnexpectedToken mid-reasoning — "agent turn failed" with no
+    // tool call ever assembled. Regression: the turn survives, the tool
+    // call assembles, and reasoning lands in the turn.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":null,\"reasoning_content\":null}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":null,\"reasoning_content\":\"thinking\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":\"function\",\"function\":{\"name\":null,\"arguments\":\"{\\\"command\\\":\\\"echo 6\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":null,\"reasoning_content\":null},\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "qwen3-8-27b");
+    defer turn.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .reasoning);
+    try std.testing.expect(turn.assistant.assistant.content[1] == .tool_call);
+    const call = turn.assistant.assistant.content[1].tool_call;
+    try std.testing.expectEqualStrings("bash", call.name);
+    try std.testing.expectEqualStrings("call_a1", call.call_id.slice());
+    try std.testing.expectEqualStrings("{\"command\":\"echo 6\"}", call.arguments);
+}
+
 test "processStreamChunk does not call on_delta_end for empty chunks" {
     const gpa = std.testing.allocator;
     var content: std.ArrayList(u8) = .empty;
