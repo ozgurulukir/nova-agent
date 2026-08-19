@@ -845,8 +845,10 @@ fn writeRequestPayload(
             if (value == .none) {
                 try out.writeAll(",\"enable_thinking\":false}");
             } else {
-                try out.writeAll(",\"reasoning_effort\":\"");
-                try out.writeAll(value.label());
+                // Clip unsupported effort levels (high/max/minimal → medium/low)
+                // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
+                try out.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":\"");
+                try out.writeAll(wireEffortLabel(dialect, value) orelse value.label());
                 try out.writeAll("\"}");
             }
         } else {
@@ -911,10 +913,17 @@ fn writeRequestPayload(
 /// the nearest valid level. The OpenAI-native dialect keeps the raw label
 /// (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
 pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
+    // Qwen / DashScope rejects `high`, `max`, and `minimal` (HTTP 400), keeping
+    // only `low`/`medium`/`none`/`xhigh`. Clip the unsupported levels the same
+    // way the minimal dialect does — `minimal` → `low`, and any high-tier level
+    // (`high`/`max`) → `medium` (the strongest valid level). `xhigh` is accepted
+    // by DashScope, so it is left intact.
+    const dashscope_clip = (dialect == .dashscope);
     return switch (effort) {
         .default => null, // omit the parameter entirely
         .xhigh => if (dialect == .minimal) "max" else effort.label(),
-        .minimal => if (dialect == .minimal) "low" else effort.label(),
+        .minimal => if (dialect == .minimal or dashscope_clip) "low" else effort.label(),
+        .high, .max => if (dashscope_clip) "medium" else effort.label(),
         else => effort.label(),
     };
 }
@@ -1323,6 +1332,52 @@ test "minimal dialect clips minimal reasoning_effort to low" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"low\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "minimal") == null);
+}
+
+test "dashscope dialect clips high/max reasoning_effort to medium" {
+    // Qwen / DashScope rejects `high` and `max` (HTTP 400), keeping only
+    // low/medium/none/xhigh. Clip high-tier levels to medium. Regression:
+    // `high` returned HTTP 400 and the stream parser threw UnexpectedToken.
+    const gpa = std.testing.allocator;
+    var p_high: std.Io.Writer.Allocating = .init(gpa);
+    defer p_high.deinit();
+    try writeRequestPayload(gpa, &p_high.writer, "qwen3-8-27b", "", &.{}, "[]", ai.Reasoning{ .effort = .high }, null, .dashscope, false, false);
+    const body_high = p_high.written();
+    try std.testing.expect(std.mem.indexOf(u8, body_high, "\"reasoning_effort\":\"medium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_high, "high") == null);
+
+    var p_max: std.Io.Writer.Allocating = .init(gpa);
+    defer p_max.deinit();
+    try writeRequestPayload(gpa, &p_max.writer, "qwen3-8-27b", "", &.{}, "[]", ai.Reasoning{ .effort = .max }, null, .dashscope, false, false);
+    const body_max = p_max.written();
+    try std.testing.expect(std.mem.indexOf(u8, body_max, "\"reasoning_effort\":\"medium\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body_max, "max") == null);
+}
+
+test "dashscope dialect clips minimal reasoning_effort to low" {
+    // `minimal` is rejected by DashScope too; clip to low.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "qwen3-8-27b", "", &.{}, "[]", ai.Reasoning{ .effort = .minimal }, null, .dashscope, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "minimal") == null);
+}
+
+test "dashscope dialect preserves xhigh and low/medium reasoning_effort" {
+    // DashScope accepts xhigh/low/medium/none verbatim — only high/max/minimal
+    // are clipped.
+    const gpa = std.testing.allocator;
+    var p_xhigh: std.Io.Writer.Allocating = .init(gpa);
+    defer p_xhigh.deinit();
+    try writeRequestPayload(gpa, &p_xhigh.writer, "qwen3-8-27b", "", &.{}, "[]", ai.Reasoning{ .effort = .xhigh }, null, .dashscope, false, false);
+    try std.testing.expect(std.mem.indexOf(u8, p_xhigh.written(), "\"reasoning_effort\":\"xhigh\"") != null);
+
+    var p_low: std.Io.Writer.Allocating = .init(gpa);
+    defer p_low.deinit();
+    try writeRequestPayload(gpa, &p_low.writer, "qwen3-8-27b", "", &.{}, "[]", ai.Reasoning{ .effort = .low }, null, .dashscope, false, false);
+    try std.testing.expect(std.mem.indexOf(u8, p_low.written(), "\"reasoning_effort\":\"low\"") != null);
 }
 
 test "openai dialect preserves xhigh and minimal reasoning_effort" {
@@ -2458,4 +2513,17 @@ test "prompt exhausts retries on a persistent 5xx" {
 
     try std.testing.expectError(error.HttpServerError, client.prompt(&.{}, ai.streamNoop()));
     try std.testing.expectEqual(@as(u32, 3), server.connection_count.load(.monotonic));
+}
+
+test "wireEffortLabel dashscope clips high to medium directly" {
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    const r1 = wireEffortLabel(.dashscope, .high);
+    try std.testing.expectEqualStrings("medium", r1.?);
+    const r2 = wireEffortLabel(.dashscope, .max);
+    try std.testing.expectEqualStrings("medium", r2.?);
+    const r3 = wireEffortLabel(.dashscope, .minimal);
+    try std.testing.expectEqualStrings("low", r3.?);
+    const r4 = wireEffortLabel(.dashscope, .xhigh);
+    try std.testing.expectEqualStrings("xhigh", r4.?);
 }
