@@ -1959,6 +1959,54 @@ test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only c
     try std.testing.expect(std.mem.indexOf(u8, body_or, "\"session_id\":\"sess\"") != null);
 }
 
+// Ollama (or any generic gateway) can serve Qwen models; the provider resolves to
+// `.minimal`, not `.dashscope`. The Qwen gate must still normalize the history so
+// Qwen does not reject multiple/late system messages. This mirrors running a
+// `qwen2.5:7b` model through a local ollama instance.
+test "writeRequestPayload normalizes system messages for qwen model on minimal dialect" {
+    const gpa = std.testing.allocator;
+
+    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } } }) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
+    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } } }) } };
+    const chat_messages = [_]ai.ChatMessage{ sys1, user, sys2 };
+    var views: [chat_messages.len]ai.MessageView = undefined;
+    for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
+    const messages = views[0..];
+    defer {
+        for (&chat_messages) |m| m.deinit(gpa);
+    }
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    // minimal dialect + a qwen* model id → normalization must fire.
+    try writeRequestPayload(gpa, &payload.writer, "qwen2.5:7b", "", messages, "[]", null, null, .minimal, false, false);
+    const body = payload.written();
+
+    // Exactly one system message, and it is the merged leading block.
+    const sys_count = countSubstring(body, "\"role\":\"system\"");
+    try std.testing.expectEqual(@as(usize, 1), sys_count);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "SYS_A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "SYS_B") != null);
+    // system must precede the user message.
+    const sys_idx = std.mem.indexOf(u8, body, "\"role\":\"system\"").?;
+    const user_idx = std.mem.indexOf(u8, body, "\"role\":\"user\"").?;
+    try std.testing.expect(sys_idx < user_idx);
+}
+
+fn countSubstring(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < haystack.len) : (i += 1) {
+        if (std.mem.indexOf(u8, haystack[i..], needle)) |idx| {
+            count += 1;
+            i += idx;
+        } else break;
+    }
+    return count;
+}
+
 test "readStream accepts an SSE line larger than the transfer buffer" {
     const gpa = std.testing.allocator;
     var stream: std.ArrayList(u8) = .empty;
@@ -2647,6 +2695,23 @@ test "wireEffortLabel dashscope clips high to medium directly" {
     try std.testing.expectEqualStrings("low", r3.?);
     const r4 = wireEffortLabel(.dashscope, .xhigh);
     try std.testing.expectEqualStrings("xhigh", r4.?);
+}
+
+// Ollama (or any generic gateway) can serve Qwen; it resolves to `.minimal`, not
+// `.dashscope`, yet Qwen still rejects high/max/minimal effort. The clip must
+// fire on the model id alone (is_qwen_model), independent of the dialect.
+test "wireEffortLabel clips for qwen model on minimal dialect too" {
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    // .minimal + non-qwen: no clip (raw label returned).
+    try std.testing.expectEqualStrings("high", wireEffortLabel(.minimal, .high, false).?);
+    try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .max, false).?);
+    // .minimal + qwen: clip to the DashScope-valid set.
+    try std.testing.expectEqualStrings("medium", wireEffortLabel(.minimal, .high, true).?);
+    try std.testing.expectEqualStrings("medium", wireEffortLabel(.minimal, .max, true).?);
+    try std.testing.expectEqualStrings("low", wireEffortLabel(.minimal, .minimal, true).?);
+    // xhigh stays (accepted by Qwen).
+    try std.testing.expectEqualStrings("xhigh", wireEffortLabel(.minimal, .xhigh, true).?);
 }
 
 test "normalizeMessagesForQwen merges multiple system messages and hoists to front" {
