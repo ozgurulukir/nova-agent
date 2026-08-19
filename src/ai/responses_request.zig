@@ -59,8 +59,10 @@ pub fn writeRequestPayload(
             // in AGENTS.md), but effort clipping is cheap and keeps the two wire
             // clients consistent so a provider switch never changes the effort
             // semantics unexpectedly.
-            const is_qwen_model = std.mem.startsWith(u8, config.model, "qwen") or std.mem.startsWith(u8, config.model, "qwq");
-            const wire_label = openai_compatible.wireEffortLabel(config.wire_dialect, effort, is_qwen_model);
+            const wire_label = openai_compatible.clipEffortForModel(
+                config.model,
+                openai_compatible.wireEffortLabel(config.wire_dialect, effort),
+            );
             if (wire_label) |label| {
                 try out.writeAll("\"effort\":");
                 try std.json.Stringify.value(label, .{}, out);

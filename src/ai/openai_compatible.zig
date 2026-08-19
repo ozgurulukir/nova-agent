@@ -964,7 +964,7 @@ fn writeRequestPayload(
                 // Clip unsupported effort levels (high/max/minimal → medium/low)
                 // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
                 try out.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":\"");
-                try out.writeAll(wireEffortLabel(dialect, value, is_qwen_model) orelse value.label());
+                try out.writeAll(clipEffortForModel(model, wireEffortLabel(dialect, value)) orelse value.label());
                 try out.writeAll("\"}");
             }
         } else {
@@ -1005,7 +1005,7 @@ fn writeRequestPayload(
     // OpenAI-native and minimal dialects: flat `reasoning_effort` field. The
     // `default` level means "don't override" — emit nothing. Values that the
     // target rejects are clipped by `wireEffortLabel` (see comment there).
-    const wire_label = wireEffortLabel(dialect, effort orelse .default, is_qwen_model);
+    const wire_label = clipEffortForModel(model, wireEffortLabel(dialect, effort orelse .default));
     if (wire_label) |label| {
         try out.writeAll(",\"reasoning_effort\":\"");
         try out.writeAll(label);
@@ -1026,27 +1026,42 @@ fn writeRequestPayload(
 /// declares no per-model `reasoning_options`, so the global picker list
 /// (which includes `xhigh` and `minimal`) is offered. The minimal dialect
 /// — used by Ollama Cloud, local Ollama, Groq, vLLM, etc. — clips them to
-/// the nearest valid level. The OpenAI-native dialect keeps the raw label
-/// (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
+/// Resolve a reasoning effort to the wire label for the given dialect, or `null`
+/// when the parameter should be omitted entirely (the `default` level means
+/// "don't override the model's behaviour").
 ///
-/// `is_qwen_model` gates the DashScope clip independently of the wire dialect:
-/// Qwen served through a generic `openai_compatible` gateway (e.g. runinfra.ai)
-/// resolves to `.minimal`, not `.dashscope`, so the clip must key off the model
-/// id, not just the dialect, to keep Qwen from rejecting `high`/`max`/`minimal`.
-pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort, is_qwen_model: bool) ?[]const u8 {
-    // Qwen / DashScope rejects `high`, `max`, and `minimal` (HTTP 400), keeping
-    // only `low`/`medium`/`none`/`xhigh`. Clip the unsupported levels the same
-    // way the minimal dialect does — `minimal` → `low`, and any high-tier level
-    // (`high`/`max`) → `medium` (the strongest valid level). `xhigh` is accepted
-    // by DashScope, so it is left intact.
-    const dashscope_clip = (dialect == .dashscope) or is_qwen_model;
+/// This is the **dialect** layer only: it knows how each wire format names and
+/// accepts effort values. It deliberately knows nothing about which model is
+/// being served — model-specific constraints (e.g. Qwen rejecting `high`/`max`)
+/// live in `clipEffortForModel`, and the caller composes the two.
+///
+/// Ollama's `/v1/chat/completions` validates `reasoning_effort` strictly: only
+/// `high`/`medium`/`low`/`max`/`none` are accepted, so its `.minimal` dialect
+/// rewrites `xhigh` → `max` (the nearest valid value). The OpenAI-native dialect
+/// keeps the raw label (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
+pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
     return switch (effort) {
         .default => null, // omit the parameter entirely
-        .xhigh => if (dialect == .minimal and !is_qwen_model) "max" else effort.label(),
-        .minimal => if (dialect == .minimal or dashscope_clip) "low" else effort.label(),
-        .high, .max => if (dashscope_clip) "medium" else effort.label(),
+        // Ollama's minimal dialect rejects `xhigh`; map to the nearest valid value.
+        .xhigh => if (dialect == .minimal) "max" else effort.label(),
         else => effort.label(),
     };
+}
+
+/// The **model** layer: clip an already-dialect-resolved effort label to what the
+/// model accepts. Knows nothing about wire dialects — it only encodes per-model
+/// constraints. Qwen / DashScope rejects `high`, `max`, and `minimal` (HTTP 400),
+/// keeping only `low`/`medium`/`none`/`xhigh`. A `null` input (dialect omitted
+/// the field) stays `null`.
+pub fn clipEffortForModel(model: []const u8, label: ?[]const u8) ?[]const u8 {
+    const is_qwen = std.mem.startsWith(u8, model, "qwen") or std.mem.startsWith(u8, model, "qwq");
+    if (!is_qwen) return label;
+    const l = label orelse return null;
+    // Qwen-valid effort set: low/medium/none/xhigh. Map the rejected levels
+    // to the nearest valid one.
+    if (std.mem.eql(u8, l, "high") or std.mem.eql(u8, l, "max")) return "medium";
+    if (std.mem.eql(u8, l, "minimal")) return "low";
+    return l; // low / medium / none / xhigh — already valid for Qwen
 }
 
 test "buildToolsJson produces a valid JSON array for the registry" {
@@ -2684,34 +2699,58 @@ test "prompt exhausts retries on a persistent 5xx" {
     try std.testing.expectEqual(@as(u32, 3), server.connection_count.load(.monotonic));
 }
 
-test "wireEffortLabel dashscope clips high to medium directly" {
+// Dialect layer only: wireEffortLabel knows nothing about models. The `.dashscope`
+// dialect does NOT clip on its own (that constraint belongs to the model layer);
+// only `.minimal` (Ollama) rewrites `xhigh` -> `max`, which its strict validator
+// rejects.
+test "wireEffortLabel is dialect-only (no model awareness)" {
     const gpa = std.testing.allocator;
     _ = gpa;
-    const r1 = wireEffortLabel(.dashscope, .high);
-    try std.testing.expectEqualStrings("medium", r1.?);
-    const r2 = wireEffortLabel(.dashscope, .max);
-    try std.testing.expectEqualStrings("medium", r2.?);
-    const r3 = wireEffortLabel(.dashscope, .minimal);
-    try std.testing.expectEqualStrings("low", r3.?);
-    const r4 = wireEffortLabel(.dashscope, .xhigh);
-    try std.testing.expectEqualStrings("xhigh", r4.?);
+    // .dashscope: raw labels passthrough (model layer handles Qwen constraints).
+    try std.testing.expectEqualStrings("high", wireEffortLabel(.dashscope, .high).?);
+    try std.testing.expectEqualStrings("max", wireEffortLabel(.dashscope, .max).?);
+    try std.testing.expectEqualStrings("minimal", wireEffortLabel(.dashscope, .minimal).?);
+    try std.testing.expectEqualStrings("xhigh", wireEffortLabel(.dashscope, .xhigh).?);
+    // .minimal: only xhigh -> max (Ollama's strict validator); others passthrough.
+    try std.testing.expectEqualStrings("high", wireEffortLabel(.minimal, .high).?);
+    try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .max).?);
+    try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .xhigh).?);
+    // .default is always omitted (null) on every dialect.
+    try std.testing.expectEqual(@as(?[]const u8, null), wireEffortLabel(.dashscope, .default));
+    try std.testing.expectEqual(@as(?[]const u8, null), wireEffortLabel(.minimal, .default));
 }
 
-// Ollama (or any generic gateway) can serve Qwen; it resolves to `.minimal`, not
-// `.dashscope`, yet Qwen still rejects high/max/minimal effort. The clip must
-// fire on the model id alone (is_qwen_model), independent of the dialect.
-test "wireEffortLabel clips for qwen model on minimal dialect too" {
+// Model layer only: clipEffortForModel knows nothing about dialects. It clips a
+// resolved label to the Qwen-valid set; non-Qwen models are untouched.
+test "clipEffortForModel is model-only (no dialect awareness)" {
     const gpa = std.testing.allocator;
     _ = gpa;
-    // .minimal + non-qwen: no clip (raw label returned).
-    try std.testing.expectEqualStrings("high", wireEffortLabel(.minimal, .high, false).?);
-    try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .max, false).?);
-    // .minimal + qwen: clip to the DashScope-valid set.
-    try std.testing.expectEqualStrings("medium", wireEffortLabel(.minimal, .high, true).?);
-    try std.testing.expectEqualStrings("medium", wireEffortLabel(.minimal, .max, true).?);
-    try std.testing.expectEqualStrings("low", wireEffortLabel(.minimal, .minimal, true).?);
-    // xhigh stays (accepted by Qwen).
-    try std.testing.expectEqualStrings("xhigh", wireEffortLabel(.minimal, .xhigh, true).?);
+    // Non-Qwen: every label passes through unchanged (including rejected ones).
+    try std.testing.expectEqualStrings("high", clipEffortForModel("gpt-5", "high").?);
+    try std.testing.expectEqualStrings("minimal", clipEffortForModel("llama3", "minimal").?);
+    // Qwen: high/max -> medium, minimal -> low, xhigh/low/medium/none unchanged.
+    try std.testing.expectEqualStrings("medium", clipEffortForModel("qwen3-8-27b", "high").?);
+    try std.testing.expectEqualStrings("medium", clipEffortForModel("qwen2.5:7b", "max").?);
+    try std.testing.expectEqualStrings("low", clipEffortForModel("qwq-32b", "minimal").?);
+    try std.testing.expectEqualStrings("xhigh", clipEffortForModel("qwen2.5:7b", "xhigh").?);
+    // null (dialect omitted the field) stays null for any model.
+    try std.testing.expectEqual(@as(?[]const u8, null), clipEffortForModel("qwen3-8-27b", null));
+}
+
+// Composition: the caller combines the two layers. Ollama (`.minimal`) serving
+// Qwen must clip `high` -> `medium` (dialect passes `high` through, model layer
+// then clips it). A non-Qwen model on the same `.minimal` dialect keeps `high`.
+test "compose wireEffortLabel + clipEffortForModel (ollama + qwen)" {
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    const qwen_on_ollama = clipEffortForModel("qwen2.5:7b", wireEffortLabel(.minimal, .high));
+    try std.testing.expectEqualStrings("medium", qwen_on_ollama.?);
+    const qwen_xhigh_ollama = clipEffortForModel("qwen2.5:7b", wireEffortLabel(.minimal, .xhigh));
+    try std.testing.expectEqualStrings("xhigh", qwen_xhigh_ollama.?);
+    const nonqwen_on_ollama = clipEffortForModel("llama3", wireEffortLabel(.minimal, .high));
+    try std.testing.expectEqualStrings("high", nonqwen_on_ollama.?);
+    const qwen_on_dashscope = clipEffortForModel("qwen3-8-27b", wireEffortLabel(.dashscope, .max));
+    try std.testing.expectEqualStrings("medium", qwen_on_dashscope.?);
 }
 
 test "normalizeMessagesForQwen merges multiple system messages and hoists to front" {
