@@ -3046,3 +3046,41 @@ test "handleTick invokes the 4 documented phase functions in order" {
     try std.testing.expect(!app.thread.turn.isActive());
     try std.testing.expect(!app.metrics.loading_tick_active);
 }
+
+test "refreshGitLabel updates metrics.git_label on dirty flag and avoids duplicate allocation" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try lifecycle.refreshGitLabel(&app);
+    const initial_label_len = app.metrics.git_label.len;
+    if (initial_label_len > 0) {
+        const ptr_before = app.metrics.git_label.ptr;
+        // Refreshing again when branch is unchanged skips realloc
+        try lifecycle.refreshGitLabel(&app);
+        try std.testing.expectEqual(ptr_before, app.metrics.git_label.ptr);
+    }
+
+    app.git_label_dirty = false;
+    app.armGitLabelRefresh();
+    try std.testing.expect(app.git_label_dirty);
+}
+
+test "handleTick refreshes git label when dirty and resets dirty flag" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    app.git_label_dirty = true;
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expect(!app.git_label_dirty);
+}

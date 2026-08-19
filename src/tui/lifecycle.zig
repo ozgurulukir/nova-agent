@@ -396,7 +396,10 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                 if (lane != active) continue; // a background lane never touches the view
                 if (changed) visible_change = true;
                 switch (event_ptr.*) {
-                    .tool_call_finished => refresh_diff = true,
+                    .tool_call_finished => {
+                        refresh_diff = true;
+                        armGitLabelRefresh(root.app);
+                    },
                     else => {},
                 }
                 if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
@@ -763,7 +766,6 @@ pub fn handleDiffViewerEvent(root: *RootWidget, ctx: *vxfw.EventContext, key: va
     }
 }
 
-
 /// Mark the status-bar git branch label for refresh on the next tick. Called
 /// when the active branch may have changed: a lane switch (any `app.thread`
 /// reassignment) or any tool call that could have run `git` (e.g. the bash
@@ -776,8 +778,8 @@ pub fn armGitLabelRefresh(app: *App) void {
 /// Recompute `metrics.git_label` from the active lane's working directory.
 /// Only called when `git_label_dirty` is set (see `armGitLabelRefresh`), so it
 /// never polls. Skips the realloc when the freshly computed label equals the
-/// cached one.
-fn refreshGitLabel(app: *App) !void {
+/// current `metrics.git_label`.
+pub fn refreshGitLabel(app: *App) !void {
     // A live lane (including the primary) roots its tools at `runtime.cwd`; an
     // idle worktree lane carries its path on `engine.idle`. `.primary` has no
     // worktree path, but its live runtime's cwd already points at the repo root.
@@ -795,14 +797,12 @@ fn refreshGitLabel(app: *App) !void {
     const new_label = diff_utils.loadGitLabel(app.gpa, app.getIo(), cwd) catch "";
 
     // Branch unchanged: free the freshly allocated equal string and keep the
-    // cached copy. Avoids redundant reallocation when a tool call didn't touch
+    // current copy. Avoids redundant reallocation when a tool call didn't touch
     // the branch.
-    if (std.mem.eql(u8, new_label, app.last_git_label)) {
+    if (std.mem.eql(u8, new_label, app.metrics.git_label)) {
         if (new_label.len > 0) app.gpa.free(new_label);
         return;
     }
     if (app.metrics.git_label.len > 0) app.gpa.free(app.metrics.git_label);
-    if (app.last_git_label.len > 0) app.gpa.free(app.last_git_label);
     app.metrics.git_label = new_label;
-    app.last_git_label = try app.gpa.dupe(u8, new_label);
 }

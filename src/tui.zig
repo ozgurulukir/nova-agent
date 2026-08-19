@@ -122,15 +122,9 @@ pub const App = struct {
     /// index) so every `self.thread.X` site reads/mutates the active lane through
     /// auto-deref, even from a `*const App`.
     thread: *Thread,
-    /// Cached branch label; refreshed in `handleTick` when `git_label_dirty`
-    /// is set (a lane switch or a tool call — see `armGitLabelRefresh`).
-    /// Previously only set once at startup, so it went stale on any post-startup
-    /// branch change. Compared (not freed) against the freshly computed label to
-    /// skip redundant reallocations.
-    last_git_label: []const u8 = "",
     /// Set when the active branch may have changed (lane switch, or any tool
-    /// call that could have run `git`). `handleTick` refreshes the label once
-    /// and clears it — never polls, so idle time costs zero `git` calls.
+    /// call that could have run `git`). `handleTick` refreshes `metrics.git_label`
+    /// once and clears it — never polls, so idle time costs zero `git` calls.
     git_label_dirty: bool = true,
     /// The lane whose branch was last shown. `handleTick` compares it against
     /// `thread` to detect a lane switch (which changes the branch) without
@@ -616,6 +610,10 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         lifecycle.deinitApp(self);
+    }
+
+    pub fn armGitLabelRefresh(self: *App) void {
+        lifecycle.armGitLabelRefresh(self);
     }
 
     pub fn awaitTurn(self: *App) void {

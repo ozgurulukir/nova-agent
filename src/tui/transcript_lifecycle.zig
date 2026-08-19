@@ -68,6 +68,7 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     app.mode = .normal;
     app.clearInput();
     app.resetTurnState();
+    app.armGitLabelRefresh();
 }
 
 pub fn clearConversation(app: *App) !void {

@@ -6,7 +6,6 @@ const tui = @import("../tui.zig");
 const agent_mod = @import("../agent.zig");
 const agent_worker = @import("agent_worker.zig");
 const lanes_util = @import("lanes.zig");
-const lifecycle = @import("lifecycle.zig");
 const runtime_mod = @import("../runtime.zig");
 
 const App = tui.App;
@@ -135,9 +134,6 @@ pub fn beginSubmit(app: *App) !bool {
     // allocator (`worker_context.gpa`), not `app.gpa`.
     app.thread.pending_prompt = try app.thread.worker_context.?.gpa.dupe(u8, prompt);
     app.thread.turn.submit();
-    // A submitted prompt may run `git` (e.g. via the bash tool), so arm a
-    // branch-label refresh — the status bar picks it up on the next tick.
-    lifecycle.armGitLabelRefresh(app);
     return true;
 }
 

@@ -210,6 +210,7 @@ pub fn navigateToEntry(app: *App, entry_id: []const u8) !void {
     try rt.reloadMessages();
     try app.rebuildTranscriptFromAgent();
     try restoreCheckpointForBranch(app, rt);
+    app.armGitLabelRefresh();
 }
 
 pub fn reportSessionSwitchError(app: *App, err: anyerror) !void {
