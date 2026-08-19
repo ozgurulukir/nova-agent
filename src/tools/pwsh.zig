@@ -312,7 +312,14 @@ fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, res
     if (normalized.len > normalized_root.len and !root_has_sep and normalized[normalized_root.len] != std.fs.path.sep and normalized[normalized_root.len] != '/') return false;
 
     // Best-effort symlink resolution (TD-4): canonicalize the resolved cwd and
-    // the root and re-check containment.
+    // the root and re-check containment. `realPathFileAbsoluteAlloc` asserts the
+    // path is absolute on the host OS, so a cross-OS path (a Windows drive path
+    // resolved on POSIX, or vice versa) — which `std.fs.path.resolve` leaves
+    // non-absolute on the foreign OS — would trip that assert and crash. When
+    // the normalized path is not absolute on this host the realpath re-check
+    // cannot run; fall back to the lexical verdict already computed above,
+    // mirroring the `catch return true` degradation for realpath failures.
+    if (!std.fs.path.isAbsolute(normalized) or !std.fs.path.isAbsolute(normalized_root)) return true;
     const real_cwd = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized, gpa) catch return true;
     defer gpa.free(real_cwd);
     const real_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized_root, gpa) catch return true;
@@ -921,6 +928,12 @@ test "prependCdGuard canonicalizes forward slashes in project root" {
 }
 
 test "validateCwd handles case-folding, slash differences, and rejects prefix collisions" {
+    // Exercises Windows path-containment semantics (drive-letter roots, mixed
+    // slashes, prefix-collision rejection) that `std.fs.path.resolve` only
+    // honours on Windows — on POSIX it joins the Windows paths as relative
+    // components, so the assertions below can't hold. Like every other pwsh
+    // runtime/containment test in this file, run it only on Windows.
+    if (!os.is_windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
