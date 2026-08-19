@@ -17,6 +17,7 @@ const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const provider_model = @import("provider_model.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
+const diff_utils = @import("diff_utils.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const toast = @import("toast.zig");
@@ -159,6 +160,24 @@ fn deinitOwnedState(self: *App) void {
 pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     std.debug.assert(root.app.threads.len() > 0);
     std.debug.assert(root.app.threads.len() <= max_threads);
+
+    // A lane switch changes the active branch, so arm a refresh. `thread` is a
+    // pointer, so this is a cheap identity compare — no polling.
+    if (root.app.git_label_thread != root.app.thread) {
+        root.app.git_label_thread = root.app.thread;
+        root.app.git_label_dirty = true;
+    }
+
+    // Keep the status-bar git branch in sync with the active branch. `git_label`
+    // was only computed once at startup, so both a lane switch and an in-lane
+    // `git checkout`/`git switch` (bash tool or external terminal) left the stale
+    // branch shown until restart. Refresh is event-driven via `git_label_dirty`
+    // (set on lane switch and on every tool call in `armGitLabelRefresh`), so
+    // idle time costs zero `git` calls — no polling.
+    if (root.app.git_label_dirty) {
+        try refreshGitLabel(root.app);
+        root.app.git_label_dirty = false;
+    }
 
     // Lazy MCP connect: trigger once after the UI is responsive so startup
     // doesn't block on subprocess spawn / handshake / tool discovery.
@@ -377,7 +396,10 @@ fn drainAgentEvents(root: *RootWidget, ctx: *vxfw.EventContext) !bool {
                 if (lane != active) continue; // a background lane never touches the view
                 if (changed) visible_change = true;
                 switch (event_ptr.*) {
-                    .tool_call_finished => refresh_diff = true,
+                    .tool_call_finished => {
+                        refresh_diff = true;
+                        armGitLabelRefresh(root.app);
+                    },
                     else => {},
                 }
                 if (lane.turn_view.awaitingOutput()) try ensureTick(root, ctx);
@@ -742,4 +764,45 @@ pub fn handleDiffViewerEvent(root: *RootWidget, ctx: *vxfw.EventContext, key: va
         .file_search => try handleDiffSearchKey(root, ctx, key),
         .commenting => try handleDiffCommentKey(root, ctx, key),
     }
+}
+
+/// Mark the status-bar git branch label for refresh on the next tick. Called
+/// when the active branch may have changed: a lane switch (any `app.thread`
+/// reassignment) or any tool call that could have run `git` (e.g. the bash
+/// tool). Event-driven — `handleTick` refreshes once and clears the flag, so
+/// idle time costs zero `git` calls.
+pub fn armGitLabelRefresh(app: *App) void {
+    app.git_label_dirty = true;
+}
+
+/// Recompute `metrics.git_label` from the active lane's working directory.
+/// Only called when `git_label_dirty` is set (see `armGitLabelRefresh`), so it
+/// never polls. Skips the realloc when the freshly computed label equals the
+/// current `metrics.git_label`.
+pub fn refreshGitLabel(app: *App) !void {
+    // A live lane (including the primary) roots its tools at `runtime.cwd`; an
+    // idle worktree lane carries its path on `engine.idle`. `.primary` has no
+    // worktree path, but its live runtime's cwd already points at the repo root.
+    // Both live branches are covered first; only an idle worktree lane falls
+    // through to `engine.idle.workingPath()` (primary is never idle).
+    const cwd: []const u8 = if (app.liveRuntime()) |rt|
+        rt.cwd
+    else if (app.thread.engine.idle.workingPath()) |p|
+        p
+    else
+        "";
+    // No usable worktree path (e.g. an idle primary in a headless/test App) —
+    // leave the existing label untouched rather than invoking git with "".
+    if (cwd.len == 0) return;
+    const new_label = diff_utils.loadGitLabel(app.gpa, app.getIo(), cwd) catch "";
+
+    // Branch unchanged: free the freshly allocated equal string and keep the
+    // current copy. Avoids redundant reallocation when a tool call didn't touch
+    // the branch.
+    if (std.mem.eql(u8, new_label, app.metrics.git_label)) {
+        if (new_label.len > 0) app.gpa.free(new_label);
+        return;
+    }
+    if (app.metrics.git_label.len > 0) app.gpa.free(app.metrics.git_label);
+    app.metrics.git_label = new_label;
 }
