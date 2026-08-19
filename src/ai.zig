@@ -109,7 +109,13 @@ pub const WireDialect = enum {
         // 3. Base URL heuristic (covers user-defined providers).
         if (std.mem.indexOf(u8, base_url, "openrouter.ai") != null) return .openrouter;
         if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return .openai;
-        if (std.mem.indexOf(u8, base_url, "dashscope.aliyuncs.com") != null) return .dashscope;
+        // DashScope / Qwen-compatible gateways serve Alibaba Qwen models and
+        // require the `enable_thinking` field instead of `reasoning_effort`
+        // (the latter returns HTTP 400). Match both the official endpoint and
+        // known third-party gateways that proxy Qwen (runinfra.ai).
+        if (std.mem.indexOf(u8, base_url, "dashscope.aliyuncs.com") != null or
+            std.mem.indexOf(u8, base_url, "aliyuncs.com") != null or
+            std.mem.indexOf(u8, base_url, "runinfra.ai") != null) return .dashscope;
         // 4. Safe fallback.
         return .minimal;
     }
@@ -756,6 +762,12 @@ test "WireDialect.resolve falls back to base URL heuristic" {
     try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(null, "", "https://openrouter.ai/api/v1"));
     try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(null, "", "https://api.openai.com/v1"));
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "", "https://dashscope.aliyuncs.com/compatible-mode/v1"));
+    // Third-party Qwen/DashScope gateways proxy Alibaba Qwen and reject the
+    // standard `reasoning_effort` field (HTTP 400) — they must resolve to the
+    // `enable_thinking` dialect too. Regression: runinfra.ai returned minimal,
+    // so the request failed and the stream parser threw UnexpectedToken.
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "", "https://api.runinfra.ai/v1"));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"));
     // Unknown URL → minimal.
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "", "https://api.deepseek.com"));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(null, "", "http://localhost:11434"));

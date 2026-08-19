@@ -432,7 +432,13 @@ fn parseToolCallsArray(
     stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
-    try expectArrayBegin(scanner);
+    // runinfra's DashScope-hosted Qwen (and OpenAI-compatible proxies) emit
+    // a keep-alive delta with `"tool_calls": null` (often alongside reasoning
+    // streaming). Calling expectArrayBegin on `null` aborts the whole turn
+    // with UnexpectedToken, so tolerate null as "no tool deltas this chunk".
+    const token = try scanner.next();
+    if (token == .null) return;
+    if (token != .array_begin) return error.UnexpectedToken;
     while (true) {
         const peeked = try scanner.peekNextTokenType();
         if (peeked == .array_end) {
@@ -471,8 +477,18 @@ fn parseToolCallObject(
             }
             resolved_index = @intCast(index);
         } else if (std.mem.eql(u8, key, "id")) {
-            _ = try appendStringValue(scanner, gpa, &pending.id, .reject_null);
-            has_pending_id = true;
+            // runinfra's DashScope-hosted Qwen emits `"id": null` on every
+            // tool_call delta EXCEPT the first (which carries the real id),
+            // and sometimes `"name": null` too. Treat null as "not provided":
+            // don't set the has_pending flag so a later real value wins, and
+            // `toToolCall` falls back to a synthetic `call_{seq}` id when the
+            // whole call streamed without one. `.reject_null` used to raise
+            // error.UnexpectedToken here, aborting the ENTIRE turn after
+            // thinking had streamed (user-visible: "agent turn failed:
+            // UnexpectedToken", no final message).
+            if (try appendStringValue(scanner, gpa, &pending.id, .allow_null)) {
+                has_pending_id = true;
+            }
         } else if (std.mem.eql(u8, key, "function")) {
             try parseToolCallFunction(gpa, scanner, &pending, &has_pending_name, &has_pending_arguments);
         } else {
@@ -572,11 +588,19 @@ fn parseToolCallFunction(
     try expectObjectBegin(scanner);
     while (try nextObjectKey(scanner)) |key| {
         if (std.mem.eql(u8, key, "name")) {
-            _ = try appendStringValue(scanner, gpa, &pending.name, .reject_null);
-            has_pending_name.* = true;
+            // See parseToolCallObject: providers may stream `"name": null`
+            // on continuation deltas. Null must not raise or clear state;
+            // only a real string marks the name as seen.
+            if (try appendStringValue(scanner, gpa, &pending.name, .allow_null)) {
+                has_pending_name.* = true;
+            }
         } else if (std.mem.eql(u8, key, "arguments")) {
-            _ = try appendStringValue(scanner, gpa, &pending.arguments, .reject_null);
-            has_pending_arguments.* = true;
+            // Same reasoning as name: only a real string contributes. Some
+            // providers emit an explicit `"arguments": null` alongside the
+            // id/name nulls in what is otherwise a pure bookkeeping delta.
+            if (try appendStringValue(scanner, gpa, &pending.arguments, .allow_null)) {
+                has_pending_arguments.* = true;
+            }
         } else {
             try scanner.skipValue();
         }
@@ -881,6 +905,68 @@ test "processStreamChunk calls observer for tool deltas" {
     try std.testing.expectEqualStrings("bash", observer_ctx.tool_calls.items[1].name);
     try std.testing.expectEqualStrings("{\"command\":\"ls\"}", observer_ctx.tool_calls.items[1].arguments);
     try std.testing.expectEqual(@as(usize, 2), observer_ctx.delta_ends);
+}
+
+test "readStream tolerates DashScope null id/name on tool-call continuation deltas" {
+    // Live wire format from runinfra's DashScope-hosted Qwen3 with
+    // `enable_thinking:true`: the FIRST tool_calls chunk carries the real
+    // `id`, every subsequent delta echoes `"id": null` (and often
+    // `"name": null`) while streaming `arguments`. The parser used
+    // `.reject_null` for id/name/arguments, so any continuation delta
+    // aborted the WHOLE turn with error.UnexpectedToken after thinking had
+    // streamed — user-visible as "agent turn failed: UnexpectedToken" with
+    // no final message. Regression: the full turn must survive with one
+    // assembled tool call (first real value wins, args concatenated).
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking about it\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_82d42ab2797b4205b00c8509\",\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":null,\"index\":0,\"type\":\"function\",\"function\":{\"name\":null,\"arguments\":\"{\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":null,\"index\":0,\"type\":\"function\",\"function\":{\"arguments\":\"\\\"command\\\":\\\"echo 6\\\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":null,\"index\":0,\"type\":\"function\",\"function\":{\"arguments\":\"}\"}}]}}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "qwen3-8-27b");
+    defer turn.deinit(gpa);
+
+    // Reasoning must have streamed into the turn.
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .reasoning);
+    try std.testing.expect(turn.assistant.assistant.content[1] == .tool_call);
+    const call = turn.assistant.assistant.content[1].tool_call;
+    try std.testing.expectEqualStrings("bash", call.name);
+    try std.testing.expectEqualStrings("call_82d42ab2797b4205b00c8509", call.call_id.slice());
+    try std.testing.expectEqualStrings("{\"command\":\"echo 6\"}", call.arguments);
+}
+
+test "readStream tolerates null tool_calls in keep-alive deltas alongside reasoning" {
+    // runinfra's DashScope-hosted Qwen streams reasoning chunks that carry
+    // `"tool_calls": null` (and the final finish chunk does too). The parser
+    // previously called expectArrayBegin on `null`, aborting the turn with
+    // error.UnexpectedToken mid-reasoning — "agent turn failed" with no
+    // tool call ever assembled. Regression: the turn survives, the tool
+    // call assembles, and reasoning lands in the turn.
+    const gpa = std.testing.allocator;
+    const stream =
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":null,\"reasoning_content\":null}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":null,\"reasoning_content\":\"thinking\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":\"function\",\"function\":{\"name\":null,\"arguments\":\"{\\\"command\\\":\\\"echo 6\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":null,\"reasoning_content\":null},\"finish_reason\":\"tool_calls\"}]}\n" ++
+        "data: [DONE]\n";
+    var reader: std.Io.Reader = .fixed(stream);
+    var tool_call_seq: u64 = 0;
+    var turn = try readStream(gpa, &reader, ai.streamNoop(), &tool_call_seq, 16, "qwen3-8-27b");
+    defer turn.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), turn.assistant.assistant.content.len);
+    try std.testing.expect(turn.assistant.assistant.content[0] == .reasoning);
+    try std.testing.expect(turn.assistant.assistant.content[1] == .tool_call);
+    const call = turn.assistant.assistant.content[1].tool_call;
+    try std.testing.expectEqualStrings("bash", call.name);
+    try std.testing.expectEqualStrings("call_a1", call.call_id.slice());
+    try std.testing.expectEqualStrings("{\"command\":\"echo 6\"}", call.arguments);
 }
 
 test "processStreamChunk does not call on_delta_end for empty chunks" {
