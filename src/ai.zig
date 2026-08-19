@@ -91,13 +91,17 @@ pub const WireDialect = enum {
         provider_id: []const u8,
         base_url: []const u8,
     ) WireDialect {
-        // 1. Builtin provider enum.
+        // 1. Builtin provider enum — only dialects with a *unique* wire shape
+        // short-circuit here. `openai_compatible` is the generic OpenAI shape,
+        // so it falls through to the base-URL heuristic (step 3) below; that lets
+        // Qwen/DashScope gateways registered as a generic provider (e.g.
+        // runinfra.ai) resolve to `.dashscope` instead of the `.minimal` fallback
+        // (which would send `reasoning_effort` and break Qwen).
         if (builtin) |p| {
-            return switch (p) {
-                .openai => .openai,
-                .openrouter => .openrouter,
-                else => .minimal,
-            };
+            if (p == .openai) return .openai;
+            if (p == .openrouter) return .openrouter;
+            if (p != .openai_compatible) return .minimal;
+            // openai_compatible falls through to the base-URL heuristic below.
         }
         // 2. Dynamic provider id (models.dev registry key).
         const id_lower = provider_id;

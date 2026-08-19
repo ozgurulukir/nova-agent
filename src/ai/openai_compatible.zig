@@ -628,6 +628,14 @@ test "errorDetailMentionsCache is case-insensitive and handles null" {
     client.last_error_detail = null;
 }
 
+/// Result of `normalizeMessagesForQwen`: the (possibly rebuilt) message list
+/// plus a `rebuilt` flag the caller passes to `deinitNormalizedMessages` so the
+/// owned system block is only freed when we actually allocated one.
+const NormalizedMessages = struct {
+    list: std.ArrayListUnmanaged(ai.ChatMessage),
+    rebuilt: bool,
+};
+
 /// Qwen / DashScope rejects requests whose message history contains more than
 /// one `system` message, or whose `system` message is not the very first entry
 /// (HTTP 400: "System message must be at the beginning"). OpenAI and most
@@ -636,14 +644,13 @@ test "errorDetailMentionsCache is case-insensitive and handles null" {
 /// the message array for the DashScope dialect: all `system` messages are merged
 /// into one (joined by a blank line) and hoisted to the front.
 ///
-/// Returns the (possibly rebuilt) message list. When no normalization is needed
-/// the input slice is returned untouched. The caller owns the result: if it
-/// differs from `messages`, free it with `deinitNormalizedMessages` (which frees
-/// both the slice and the owned system block it allocates).
+/// When no normalization is needed the returned list is a shallow copy sharing
+/// the caller's message storage (`rebuilt = false`); otherwise it owns a merged
+/// system block (`rebuilt = true`). Free with `deinitNormalizedMessages`.
 fn normalizeMessagesForQwen(
     gpa: std.mem.Allocator,
     messages: []const ai.MessageView,
-) !std.ArrayListUnmanaged(ai.ChatMessage) {
+) !NormalizedMessages {
     // Fast path: zero or one system message already at index 0.
     var system_count: u32 = 0;
     for (messages) |view| {
@@ -652,7 +659,7 @@ fn normalizeMessagesForQwen(
     if (system_count <= 1 and (messages.len == 0 or messages[0].message().* == .system)) {
         var passthrough: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
         for (messages) |view| try passthrough.append(gpa, view.message().*);
-        return passthrough;
+        return .{ .list = passthrough, .rebuilt = false };
     }
 
     // Need a rebuild: merged system first, then all non-system messages in order.
@@ -685,7 +692,7 @@ fn normalizeMessagesForQwen(
         if (m == .system) continue;
         try result.append(gpa, m);
     }
-    return result;
+    return .{ .list = result, .rebuilt = true };
 }
 
 /// Free a normalized message list returned by `normalizeMessagesForQwen`.
@@ -863,18 +870,27 @@ fn writeRequestPayload(
     // empty-tools case.
 
     // Qwen / DashScope requires a single leading system message; merge + hoist.
+    // This also covers the `.minimal` dialect: Qwen served through third-party
+    // gateways (runinfra.ai etc.) resolves to `.minimal` when the provider is
+    // registered as a generic `openai_compatible` (the resolver returns early
+    // for known builtins and never reaches the base-URL heuristic), so the
+    // normalization must apply to both dialects, not just `.dashscope`.
+    const needs_qwen_normalize = dialect == .dashscope or dialect == .minimal;
     var normalized: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
     var wrapped: std.ArrayListUnmanaged(ai.MessageView) = .empty;
-    const effective_messages: []const ai.MessageView = if (dialect == .dashscope) blk: {
-        normalized = try normalizeMessagesForQwen(gpa, messages);
+    var rebuilt = false;
+    const effective_messages: []const ai.MessageView = if (needs_qwen_normalize) blk: {
+        const res = try normalizeMessagesForQwen(gpa, messages);
+        rebuilt = res.rebuilt;
+        normalized = res.list;
         for (normalized.items) |*m| {
             try wrapped.append(gpa, ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) });
         }
         break :blk wrapped.items;
     } else messages;
-    defer if (dialect == .dashscope) {
+    defer if (needs_qwen_normalize) {
         wrapped.deinit(gpa);
-        deinitNormalizedMessages(gpa, normalized, true);
+        deinitNormalizedMessages(gpa, normalized, rebuilt);
     };
 
     try out.writeAll("{\"model\":");
