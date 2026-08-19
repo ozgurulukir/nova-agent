@@ -432,7 +432,13 @@ fn parseToolCallsArray(
     stream: *ToolCallStream,
     change: *ChunkChange,
 ) !void {
-    try expectArrayBegin(scanner);
+    // runinfra's DashScope-hosted Qwen (and OpenAI-compatible proxies) emit
+    // a keep-alive delta with `"tool_calls": null` (often alongside reasoning
+    // streaming). Calling expectArrayBegin on `null` aborts the whole turn
+    // with UnexpectedToken, so tolerate null as "no tool deltas this chunk".
+    const token = try scanner.next();
+    if (token == .null) return;
+    if (token != .array_begin) return error.UnexpectedToken;
     while (true) {
         const peeked = try scanner.peekNextTokenType();
         if (peeked == .array_end) {
