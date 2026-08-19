@@ -870,11 +870,11 @@ fn writeRequestPayload(
     // empty-tools case.
 
     // Qwen / DashScope requires a single leading system message; merge + hoist.
-    // Gate this narrowly on the model id (Qwen models start with `qwen`/`qwq`)
-    // or the explicit `.dashscope` dialect so other models on the same provider
-    // (ollama, openrouter, etc.) are never affected — most tolerate multiple /
-    // late system messages and we must not silently rewrite their history.
-    const is_qwen_model = std.mem.startsWith(u8, model, "qwen") or std.mem.startsWith(u8, model, "qwq");
+    // Gate this narrowly on the model id (see `isQwenModel`) or the explicit
+    // `.dashscope` dialect so other models on the same provider (ollama,
+    // openrouter, etc.) are never affected — most tolerate multiple / late
+    // system messages and we must not silently rewrite their history.
+    const is_qwen_model = isQwenModel(model);
     const needs_qwen_normalize = dialect == .dashscope or is_qwen_model;
     var normalized: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
     var wrapped: std.ArrayListUnmanaged(ai.MessageView) = .empty;
@@ -1015,17 +1015,6 @@ fn writeRequestPayload(
     }
 }
 
-/// Resolve a reasoning effort to the wire label for the given dialect, or
-/// `null` when the parameter should be omitted entirely (the `default`
-/// level means "don't override the model's behaviour").
-///
-/// Ollama's `/v1/chat/completions` validates `reasoning_effort` strictly:
-/// only `high`/`medium`/`low`/`max`/`none` are accepted. Sending `xhigh`
-/// or `minimal` returns HTTP 400 (`"invalid reasoning value"`). Both
-/// values are reachable on Ollama Cloud because the builtin registry entry
-/// declares no per-model `reasoning_options`, so the global picker list
-/// (which includes `xhigh` and `minimal`) is offered. The minimal dialect
-/// — used by Ollama Cloud, local Ollama, Groq, vLLM, etc. — clips them to
 /// Resolve a reasoning effort to the wire label for the given dialect, or `null`
 /// when the parameter should be omitted entirely (the `default` level means
 /// "don't override the model's behaviour").
@@ -1036,16 +1025,32 @@ fn writeRequestPayload(
 /// live in `clipEffortForModel`, and the caller composes the two.
 ///
 /// Ollama's `/v1/chat/completions` validates `reasoning_effort` strictly: only
-/// `high`/`medium`/`low`/`max`/`none` are accepted, so its `.minimal` dialect
-/// rewrites `xhigh` → `max` (the nearest valid value). The OpenAI-native dialect
-/// keeps the raw label (gpt-5 honours `xhigh`/`max`; `minimal` is valid there).
+/// `high`/`medium`/`low`/`max`/`none` are accepted. Sending `xhigh` or `minimal`
+/// returns HTTP 400 (`"invalid reasoning value"`), and both values are reachable
+/// via the global picker list (the Ollama Cloud builtin declares no per-model
+/// `reasoning_options`), so the `.minimal` dialect — used by Ollama Cloud, local
+/// Ollama, Groq, vLLM, etc. — rewrites each to the nearest accepted value. The
+/// OpenAI-native dialect keeps raw labels (gpt-5 honours `xhigh`/`max`;
+/// `minimal` is valid there).
 pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]const u8 {
     return switch (effort) {
         .default => null, // omit the parameter entirely
-        // Ollama's minimal dialect rejects `xhigh`; map to the nearest valid value.
+        // Ollama's minimal dialect rejects `xhigh`/`minimal`; map each to the
+        // nearest value its validator accepts.
         .xhigh => if (dialect == .minimal) "max" else effort.label(),
+        .minimal => if (dialect == .minimal) "low" else effort.label(),
         else => effort.label(),
     };
+}
+
+/// Qwen model-id gate shared by the effort clip and the message normalizer.
+/// Matches every id style: DashScope (`qwen3-8-27b`), Ollama (`qwen2.5:7b`),
+/// OpenRouter (`qwen/qwen3-...`) and HuggingFace/vLLM (`Qwen/Qwen3-32B`,
+/// `QwQ-32B`). Case-insensitive because HF org ids are capitalized — a
+/// byte-level `startsWith` would miss exactly the vLLM-hosted Qwens whose Jinja
+/// template enforces a single leading system message.
+pub fn isQwenModel(model: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(model, "qwen") or std.ascii.startsWithIgnoreCase(model, "qwq");
 }
 
 /// The **model** layer: clip an already-dialect-resolved effort label to what the
@@ -1054,8 +1059,7 @@ pub fn wireEffortLabel(dialect: ai.WireDialect, effort: ai.ReasoningEffort) ?[]c
 /// keeping only `low`/`medium`/`none`/`xhigh`. A `null` input (dialect omitted
 /// the field) stays `null`.
 pub fn clipEffortForModel(model: []const u8, label: ?[]const u8) ?[]const u8 {
-    const is_qwen = std.mem.startsWith(u8, model, "qwen") or std.mem.startsWith(u8, model, "qwq");
-    if (!is_qwen) return label;
+    if (!isQwenModel(model)) return label;
     const l = label orelse return null;
     // Qwen-valid effort set: low/medium/none/xhigh. Map the rejected levels
     // to the nearest valid one.
@@ -1981,15 +1985,15 @@ test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only c
 test "writeRequestPayload normalizes system messages for qwen model on minimal dialect" {
     const gpa = std.testing.allocator;
 
-    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } } }) } };
-    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
-    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } } }) } };
-    const chat_messages = [_]ai.ChatMessage{ sys1, user, sys2 };
+    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } }}) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } }}) } };
+    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } }}) } };
+    var chat_messages = [_]ai.ChatMessage{ sys1, user, sys2 };
     var views: [chat_messages.len]ai.MessageView = undefined;
     for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
     const messages = views[0..];
     defer {
-        for (&chat_messages) |m| m.deinit(gpa);
+        for (&chat_messages) |*m| m.deinit(gpa);
     }
 
     var payload: std.Io.Writer.Allocating = .init(gpa);
@@ -2008,6 +2012,39 @@ test "writeRequestPayload normalizes system messages for qwen model on minimal d
     const sys_idx = std.mem.indexOf(u8, body, "\"role\":\"system\"").?;
     const user_idx = std.mem.indexOf(u8, body, "\"role\":\"user\"").?;
     try std.testing.expect(sys_idx < user_idx);
+}
+
+// The exact scenario from vllm-project/vllm#41114: a vLLM server hosting a
+// HuggingFace-style `Qwen/Qwen3-32B` id. The provider is a generic
+// OpenAI-compatible URL (resolves to `.minimal`), and the model id starts with
+// a capitalized `Qwen/` — so both the history normalization AND the effort clip
+// must key off the case-insensitive model-id gate, not the dialect alone.
+test "writeRequestPayload normalizes system messages and clips effort for vLLM-style Qwen id" {
+    const gpa = std.testing.allocator;
+
+    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } }}) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } }}) } };
+    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } }}) } };
+    var chat_messages = [_]ai.ChatMessage{ sys1, user, sys2 };
+    var views: [chat_messages.len]ai.MessageView = undefined;
+    for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
+    const messages = views[0..];
+    defer {
+        for (&chat_messages) |*m| m.deinit(gpa);
+    }
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "Qwen/Qwen3-32B", "", messages, "[]", ai.Reasoning{ .effort = .high }, null, .minimal, false, false);
+    const body = payload.written();
+
+    // Single leading merged system block. The join newline is JSON-escaped in
+    // the payload, so assert the escaped two-character `\n` sequence.
+    try std.testing.expectEqual(@as(usize, 1), countSubstring(body, "\"role\":\"system\""));
+    try std.testing.expect(std.mem.indexOf(u8, body, "SYS_A\\nSYS_B") != null);
+    // `high` is invalid for Qwen — clipped to `medium` even on the `.minimal`
+    // dialect (dialect passes it through, the model layer clips it).
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
 }
 
 fn countSubstring(haystack: []const u8, needle: []const u8) usize {
@@ -2701,20 +2738,20 @@ test "prompt exhausts retries on a persistent 5xx" {
 
 // Dialect layer only: wireEffortLabel knows nothing about models. The `.dashscope`
 // dialect does NOT clip on its own (that constraint belongs to the model layer);
-// only `.minimal` (Ollama) rewrites `xhigh` -> `max`, which its strict validator
-// rejects.
+// `.minimal` (Ollama) rewrites the two labels its strict validator rejects:
+// `xhigh` -> `max` and `minimal` -> `low`.
 test "wireEffortLabel is dialect-only (no model awareness)" {
-    const gpa = std.testing.allocator;
-    _ = gpa;
     // .dashscope: raw labels passthrough (model layer handles Qwen constraints).
     try std.testing.expectEqualStrings("high", wireEffortLabel(.dashscope, .high).?);
     try std.testing.expectEqualStrings("max", wireEffortLabel(.dashscope, .max).?);
     try std.testing.expectEqualStrings("minimal", wireEffortLabel(.dashscope, .minimal).?);
     try std.testing.expectEqualStrings("xhigh", wireEffortLabel(.dashscope, .xhigh).?);
-    // .minimal: only xhigh -> max (Ollama's strict validator); others passthrough.
+    // .minimal: xhigh -> max and minimal -> low (Ollama's strict validator);
+    // the labels it accepts pass through untouched.
     try std.testing.expectEqualStrings("high", wireEffortLabel(.minimal, .high).?);
     try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .max).?);
     try std.testing.expectEqualStrings("max", wireEffortLabel(.minimal, .xhigh).?);
+    try std.testing.expectEqualStrings("low", wireEffortLabel(.minimal, .minimal).?);
     // .default is always omitted (null) on every dialect.
     try std.testing.expectEqual(@as(?[]const u8, null), wireEffortLabel(.dashscope, .default));
     try std.testing.expectEqual(@as(?[]const u8, null), wireEffortLabel(.minimal, .default));
@@ -2723,8 +2760,6 @@ test "wireEffortLabel is dialect-only (no model awareness)" {
 // Model layer only: clipEffortForModel knows nothing about dialects. It clips a
 // resolved label to the Qwen-valid set; non-Qwen models are untouched.
 test "clipEffortForModel is model-only (no dialect awareness)" {
-    const gpa = std.testing.allocator;
-    _ = gpa;
     // Non-Qwen: every label passes through unchanged (including rejected ones).
     try std.testing.expectEqualStrings("high", clipEffortForModel("gpt-5", "high").?);
     try std.testing.expectEqualStrings("minimal", clipEffortForModel("llama3", "minimal").?);
@@ -2733,31 +2768,44 @@ test "clipEffortForModel is model-only (no dialect awareness)" {
     try std.testing.expectEqualStrings("medium", clipEffortForModel("qwen2.5:7b", "max").?);
     try std.testing.expectEqualStrings("low", clipEffortForModel("qwq-32b", "minimal").?);
     try std.testing.expectEqualStrings("xhigh", clipEffortForModel("qwen2.5:7b", "xhigh").?);
+    // The gate is case-insensitive so HuggingFace/vLLM org-style ids match —
+    // `Qwen/Qwen3-32B` is the exact id shape from vllm-project/vllm#41114.
+    try std.testing.expect(isQwenModel("Qwen/Qwen3-32B"));
+    try std.testing.expect(isQwenModel("QwQ-32B"));
+    try std.testing.expect(isQwenModel("qwen2.5:7b"));
+    try std.testing.expect(!isQwenModel("llama3"));
+    try std.testing.expect(!isQwenModel("gpt-5"));
     // null (dialect omitted the field) stays null for any model.
     try std.testing.expectEqual(@as(?[]const u8, null), clipEffortForModel("qwen3-8-27b", null));
 }
 
 // Composition: the caller combines the two layers. Ollama (`.minimal`) serving
 // Qwen must clip `high` -> `medium` (dialect passes `high` through, model layer
-// then clips it). A non-Qwen model on the same `.minimal` dialect keeps `high`.
+// then clips it) and `xhigh` -> `medium` (dialect rewrites to `max` first, then
+// the model layer clips `max`). A non-Qwen model on the same `.minimal` dialect
+// keeps `high` and gets the dialect-only `minimal` -> `low` rewrite.
 test "compose wireEffortLabel + clipEffortForModel (ollama + qwen)" {
-    const gpa = std.testing.allocator;
-    _ = gpa;
     const qwen_on_ollama = clipEffortForModel("qwen2.5:7b", wireEffortLabel(.minimal, .high));
     try std.testing.expectEqualStrings("medium", qwen_on_ollama.?);
     const qwen_xhigh_ollama = clipEffortForModel("qwen2.5:7b", wireEffortLabel(.minimal, .xhigh));
-    try std.testing.expectEqualStrings("xhigh", qwen_xhigh_ollama.?);
+    try std.testing.expectEqualStrings("medium", qwen_xhigh_ollama.?);
+    const qwen_minimal_ollama = clipEffortForModel("qwen2.5:7b", wireEffortLabel(.minimal, .minimal));
+    try std.testing.expectEqualStrings("low", qwen_minimal_ollama.?);
     const nonqwen_on_ollama = clipEffortForModel("llama3", wireEffortLabel(.minimal, .high));
     try std.testing.expectEqualStrings("high", nonqwen_on_ollama.?);
+    // Regression: the dialect layer's own `minimal` -> `low` rewrite must still
+    // apply to non-Qwen models (Ollama rejects `minimal` for every model).
+    const nonqwen_minimal_ollama = clipEffortForModel("llama3", wireEffortLabel(.minimal, .minimal));
+    try std.testing.expectEqualStrings("low", nonqwen_minimal_ollama.?);
     const qwen_on_dashscope = clipEffortForModel("qwen3-8-27b", wireEffortLabel(.dashscope, .max));
     try std.testing.expectEqualStrings("medium", qwen_on_dashscope.?);
 }
 
 test "normalizeMessagesForQwen merges multiple system messages and hoists to front" {
     const gpa = std.testing.allocator;
-    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } } }) } };
-    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
-    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } } }) } };
+    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } }}) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } }}) } };
+    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } }}) } };
     const chat_messages = [_]ai.ChatMessage{ user, sys1, sys2 };
     var views: [chat_messages.len]ai.MessageView = undefined;
     for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
@@ -2771,29 +2819,23 @@ test "normalizeMessagesForQwen merges multiple system messages and hoists to fro
         gpa.free(user.user.content);
     }
 
-    var norm = try normalizeMessagesForQwen(gpa, messages);
-    // norm owns exactly one merged system block; free it, then the list.
-    defer {
-        if (norm.items.len > 0 and norm.items[0] == .system) {
-            const sys = &norm.items[0].system;
-            const block = &sys.content[0];
-            gpa.free(block.text.text);
-            gpa.free(sys.content);
-        }
-        norm.deinit(gpa);
-    }
+    const norm = try normalizeMessagesForQwen(gpa, messages);
+    // norm owns exactly one merged system block; the helper frees it (and only
+    // it — non-system entries are borrowed) plus the list storage.
+    defer deinitNormalizedMessages(gpa, norm.list, norm.rebuilt);
 
     // Two system messages merged into one leading system, followed by the user.
-    try std.testing.expectEqual(@as(usize, 2), norm.items.len);
-    try std.testing.expect(norm.items[0] == .system);
-    try std.testing.expect(norm.items[1] == .user);
-    try std.testing.expectEqualStrings("SYS_A\nSYS_B", norm.items[0].system.content[0].text.text);
+    try std.testing.expect(norm.rebuilt);
+    try std.testing.expectEqual(@as(usize, 2), norm.list.items.len);
+    try std.testing.expect(norm.list.items[0] == .system);
+    try std.testing.expect(norm.list.items[1] == .user);
+    try std.testing.expectEqualStrings("SYS_A\nSYS_B", norm.list.items[0].system.content[0].text.text);
 }
 
 test "normalizeMessagesForQwen passthrough when single leading system" {
     const gpa = std.testing.allocator;
-    const sys = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS") } } }) } };
-    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
+    const sys = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS") } }}) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } }}) } };
     const chat_messages = [_]ai.ChatMessage{ sys, user };
     var views: [chat_messages.len]ai.MessageView = undefined;
     for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
@@ -2805,11 +2847,12 @@ test "normalizeMessagesForQwen passthrough when single leading system" {
         gpa.free(user.user.content);
     }
 
-    var norm = try normalizeMessagesForQwen(gpa, messages);
-    // Passthrough path: norm shares the caller's system/user content, so only
-    // the list storage (not the inner buffers) is owned by norm.
-    defer norm.deinit(gpa);
+    const norm = try normalizeMessagesForQwen(gpa, messages);
+    // Passthrough path: norm shares the caller's system/user content, so the
+    // helper frees only the list storage, not the inner buffers.
+    defer deinitNormalizedMessages(gpa, norm.list, norm.rebuilt);
 
     // No rebuild → shares the caller's backing storage.
-    try std.testing.expectEqual(@as(usize, 2), norm.items.len);
+    try std.testing.expect(!norm.rebuilt);
+    try std.testing.expectEqual(@as(usize, 2), norm.list.items.len);
 }
