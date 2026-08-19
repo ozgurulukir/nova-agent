@@ -960,6 +960,15 @@ fn writeRequestPayload(
         if (effort) |value| {
             if (value == .none) {
                 try out.writeAll(",\"enable_thinking\":false}");
+            } else if (value == .default) {
+                // `.default` means "don't override the model's own behaviour" —
+                // and runinfra's DashScope-hosted Qwen rejects
+                // `reasoning_effort:"default"` with HTTP 400 (upstream_error).
+                // Live-verified: `enable_thinking:true` WITHOUT the effort
+                // field streams thinking + the final message cleanly (200).
+                // Sending the raw "default" label is invalid there. Keep the
+                // thinking boolean, omit the effort field entirely.
+                try out.writeAll(",\"enable_thinking\":true}");
             } else {
                 // Clip unsupported effort levels (high/max/minimal → medium/low)
                 // to avoid HTTP 400 — DashScope rejects them. See wireEffortLabel.
@@ -1437,6 +1446,36 @@ test "writeRequestPayload disables thinking for reasoning effort none" {
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+}
+
+test "writeRequestPayload dashscope default effort omits reasoning_effort but keeps thinking" {
+    // runinfra DashScope-hosted Qwen rejects `reasoning_effort:"default"`
+    // with HTTP 400 (upstream_error). `.default` means "don't override the
+    // model's own behaviour" — it must NOT serialize the raw "default" label.
+    // Live-verified that `enable_thinking:true` alone (no effort field)
+    // streams thinking + the final message cleanly. Regression for the
+    // user's `"reasoningEffort":"default"` config on `qwen3-8-27b`.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "qwen3-8-27b", "", &.{}, "[]", .{ .effort = .default }, null, .dashscope, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "default") == null);
+}
+
+test "writeRequestPayload dashscope medium effort keeps enable_thinking plus effort" {
+    // Sanity: an explicit valid DashScope effort level still serializes both
+    // `enable_thinking:true` and `reasoning_effort`. Only `.default` and
+    // `.none` special-case the boolean.
+    const gpa = std.testing.allocator;
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "qwen3-8-27b", "", &.{}, "[]", .{ .effort = .medium }, null, .dashscope, false, false);
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
 }
 
 test "writeRequestPayload uses reasoning_effort none for minimal dialect" {
