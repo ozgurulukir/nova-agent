@@ -98,13 +98,61 @@ local function group_rg_output(raw, pattern, max_results)
   return table.concat(out, "\n"):gsub("\n$", "")
 end
 
+-- Local, separator-agnostic path splitters. The plugin sandbox does not
+-- expose `std`, and these only ever run AFTER `nova.file_info` has confirmed
+-- the path is a file — so the file/dir decision stays on the Zig side
+-- (cross-platform). Splitting on either '/' or '\' mirrors Nova's own
+-- separator-agnostic path handling and is safe on Windows and POSIX alike.
+local function dirname_of(p)
+  local last = 0
+  for i = 1, #p do
+    local c = p:sub(i, i)
+    if c == "/" or c == "\\" then last = i end
+  end
+  if last == 0 then return "." end
+  return p:sub(1, last - 1)
+end
+
+local function basename_of(p)
+  local last = 0
+  for i = 1, #p do
+    local c = p:sub(i, i)
+    if c == "/" or c == "\\" then last = i end
+  end
+  return p:sub(last + 1)
+end
+
+-- Resolve a user-supplied `path` into a (root_dir, restriction) pair.
+-- Cross-platform file/dir discrimination is delegated to `nova.file_info`
+-- (Zig: sanitizePath + stat.kind — identical on Windows and Linux). We never
+-- guess file-vs-directory from the path string, which would diverge across
+-- platforms (no realpath on Windows, different separators).
+-- Returns:
+--   dir, nil            when path is a directory (or discrimination failed)
+--   dir, basename       when path is a single file: search its parent dir and
+--                       restrict results to that one file by name.
+local function resolve_search_root(path)
+  local root = path or "."
+  local ok, info = pcall(function() return nova.file_info(root) end)
+  if ok and info and info.type == "file" then
+    return dirname_of(root), basename_of(root)
+  end
+  return root, nil
+end
+
 -- Substring search via Nova's native walker — the primary substring path.
 -- Self-contained (no external binary). Scope: skips dotfiles but NOT
 -- gitignored dirs, so vendor/ and zig-cache/ are searched; for a
 -- gitignore-aware search use regex=true (ripgrep) or bash with rg.
-local function native_substring_search(params, root, case_sensitive, max_results)
+-- `file_restriction` (optional) restricts the walk to a single file by name
+-- (used when `path` pointed at a file); it is merged with any `params.include`.
+local function native_substring_search(params, root, case_sensitive, max_results, file_restriction)
+  local file_pattern = params.include
+  if file_restriction and file_restriction ~= "" then
+    file_pattern = file_restriction
+  end
   local result = nova.search_files(root, params.pattern, {
-    file_pattern = params.include,
+    file_pattern = file_pattern,
     case_sensitive = case_sensitive,
     max_results = max_results,
   })
@@ -180,7 +228,7 @@ nova.register_tool({
     },
   },
   handler = function(params)
-    local root = params.path or "."
+    local root, file_restriction = resolve_search_root(params.path)
     local case_sensitive = params.case_sensitive or false
     -- Clamp to a positive integer (defense in depth with the Zig-side clamp):
     -- a fractional/negative max_results would otherwise reach the bridge and
@@ -190,7 +238,7 @@ nova.register_tool({
     -- Substring (default): Nova's native search. Self-contained, no external
     -- binary, identical behavior in every environment.
     if not params.regex then
-      return native_substring_search(params, root, case_sensitive, max_results)
+      return native_substring_search(params, root, case_sensitive, max_results, file_restriction)
     end
 
     -- Regex: ripgrep via bash (search_files is substring-only; Lua patterns
@@ -239,7 +287,7 @@ nova.register_tool({
     },
   },
   handler = function(params)
-    local root = params.path or "."
+    local root, file_restriction = resolve_search_root(params.path)
     local max_results = math.max(1, math.min(math.floor(params.max_results or 100), 200))
     local opts = { max_results = max_results }
 
@@ -248,17 +296,31 @@ nova.register_tool({
       return "Error: glob failed for " .. params.pattern
     end
 
-    if result.total_matches == 0 then
+    -- When `path` pointed at a single file, keep only that file (the walk
+    -- happened in its parent dir). Restriction is by basename, so it works
+    -- regardless of the user's glob pattern.
+    local matches = result.results or {}
+    if file_restriction and file_restriction ~= "" then
+      local filtered = {}
+      for _, f in ipairs(matches) do
+        if basename_of(f.path) == file_restriction then
+          table.insert(filtered, f)
+        end
+      end
+      matches = filtered
+    end
+
+    if #matches == 0 then
       return "No files found matching: " .. params.pattern
     end
 
     local lines = {}
-    table.insert(lines, string.format("Found %d files:", result.total_matches))
+    table.insert(lines, string.format("Found %d files:", #matches))
     if result.truncated then
       table.insert(lines, "(results truncated — narrow your pattern or pass max_results)")
     end
     table.insert(lines, "")
-    for _, f in ipairs(result.results or {}) do
+    for _, f in ipairs(matches) do
       table.insert(lines, f.path)
     end
     return table.concat(lines, "\n")

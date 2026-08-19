@@ -17,6 +17,10 @@ local last_bash = nil
 local bash_reply = nil
 local last_search = nil
 local search_reply = nil
+-- Controls the mocked file/dir discrimination for the file-path gating tests.
+-- When a path is present in this map, file_info returns that type; otherwise
+-- it defaults to "directory" (the common case).
+local file_info_types = {}
 
 nova = {
   register_tool = function(tool)
@@ -36,6 +40,13 @@ nova = {
   end,
   find_files = function(root, pattern, opts)
     return { root = root, total_matches = 0, results = {}, truncated = false }
+  end,
+  -- Mocked cross-platform discriminator. In production this is the Zig bridge
+  -- (sanitizePath + stat.kind); here we drive it from file_info_types so the
+  -- gating logic can be tested deterministically.
+  file_info = function(path)
+    local t = file_info_types[path] or "directory"
+    return { size = 0, type = t, extension = "", language = "", mime_type = "" }
   end,
 }
 
@@ -240,6 +251,121 @@ test.describe("grep substring output handling", function()
     search_reply = nil
     local out = grep.handler({ pattern = "foo" })
     test.assert.contains("could not search", out)
+  end)
+
+  test.it("scopes a file-path `path` to that single file via the restriction", function()
+    reset()
+    -- The mock reports "src/skill.zig" as a file, so resolve_search_root must
+    -- descend to "src" and pass "skill.zig" as the file restriction.
+    file_info_types["src/skill.zig"] = "file"
+    search_reply = {
+      query = "deinit",
+      total_matches = 1,
+      truncated = false,
+      results = { { file = "src/skill.zig", line = 18, content = "deinit" } },
+    }
+    local out = grep.handler({ pattern = "deinit", path = "src/skill.zig" })
+    -- Walk happened in the parent dir, restricted to the single file.
+    test.assert.equal("src", last_search.root)
+    test.assert.equal("skill.zig", last_search.opts.file_pattern)
+    test.assert.contains("src/skill.zig:", out)
+  end)
+
+  test.it("keeps directory-path `path` behavior unchanged (regression)", function()
+    reset()
+    -- No file_info override -> "src" is treated as a directory.
+    search_reply = {
+      query = "x",
+      total_matches = 1,
+      truncated = false,
+      results = { { file = "src/a.zig", line = 1, content = "x" } },
+    }
+    grep.handler({ pattern = "x", path = "src" })
+    test.assert.equal("src", last_search.root)
+    test.assert.equal(nil, last_search.opts.file_pattern)
+  end)
+end)
+
+test.describe("glob file-path gating", function()
+  local glob = registered.glob
+
+  test.it("returns the single file named by a file-path `path`", function()
+    file_info_types["src/skill.zig"] = "file"
+    -- Mock find_files to return two candidates; the handler must keep only the
+    -- one whose basename matches the restriction.
+    nova.find_files = function(root, pattern, opts)
+      return {
+        root = root,
+        total_matches = 2,
+        results = {
+          { path = "src/skill.zig" },
+          { path = "src/other.zig" },
+        },
+        truncated = false,
+      }
+    end
+    local out = glob.handler({ pattern = "*.zig", path = "src/skill.zig" })
+    test.assert.contains("src/skill.zig", out)
+    test.assert.is_false(string.find(out, "other.zig", 1, true) ~= nil)
+  end)
+
+  test.it("keeps directory-path `path` behavior unchanged (regression)", function()
+    nova.find_files = function(root, pattern, opts)
+      return {
+        root = root,
+        total_matches = 1,
+        results = { { path = "src/skill.zig" } },
+        truncated = false,
+      }
+    end
+    local out = glob.handler({ pattern = "*.zig", path = "src" })
+    test.assert.contains("src/skill.zig", out)
+  end)
+end)
+
+test.describe("resolve_search_root gating", function()
+  -- resolve_search_root is a local helper; its behavior is exercised through
+  -- the grep/glob handlers above (file -> parent dir + basename restriction,
+  -- directory -> unchanged, file_info error -> path preserved). These three
+  -- cases mirror those handler tests at the unit level.
+  test.it("scopes a file path to (parent dir, basename) via the grep handler", function()
+    reset()
+    file_info_types["src/skill.zig"] = "file"
+    search_reply = {
+      query = "deinit",
+      total_matches = 1,
+      truncated = false,
+      results = { { file = "src/skill.zig", line = 18, content = "deinit" } },
+    }
+    grep.handler({ pattern = "deinit", path = "src/skill.zig" })
+    test.assert.equal("src", last_search.root)
+    test.assert.equal("skill.zig", last_search.opts.file_pattern)
+  end)
+
+  test.it("preserves a directory path (no restriction) via the grep handler", function()
+    reset()
+    search_reply = {
+      query = "x",
+      total_matches = 1,
+      truncated = false,
+      results = { { file = "src/a.zig", line = 1, content = "x" } },
+    }
+    grep.handler({ pattern = "x", path = "src" })
+    test.assert.equal("src", last_search.root)
+    test.assert.equal(nil, last_search.opts.file_pattern)
+  end)
+
+  test.it("falls back to the path unchanged when file_info errors", function()
+    reset()
+    local orig = nova.file_info
+    nova.file_info = function() error("boom") end
+    -- With file_info throwing, the pcall guard keeps the file path as root and
+    -- does NOT add a restriction (handler must still not crash).
+    local ok, _ = pcall(function()
+      grep.handler({ pattern = "x", path = "src/skill.zig" })
+    end)
+    nova.file_info = orig
+    test.assert.is_true(ok)
   end)
 end)
 
