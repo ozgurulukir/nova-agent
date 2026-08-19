@@ -628,6 +628,91 @@ test "errorDetailMentionsCache is case-insensitive and handles null" {
     client.last_error_detail = null;
 }
 
+/// Qwen / DashScope rejects requests whose message history contains more than
+/// one `system` message, or whose `system` message is not the very first entry
+/// (HTTP 400: "System message must be at the beginning"). OpenAI and most
+/// OpenAI-compatible servers tolerate multiple/late system messages, but Qwen's
+/// Jinja chat template enforces a single leading system block. This normalizes
+/// the message array for the DashScope dialect: all `system` messages are merged
+/// into one (joined by a blank line) and hoisted to the front.
+///
+/// Returns the (possibly rebuilt) message list. When no normalization is needed
+/// the input slice is returned untouched. The caller owns the result: if it
+/// differs from `messages`, free it with `deinitNormalizedMessages` (which frees
+/// both the slice and the owned system block it allocates).
+fn normalizeMessagesForQwen(
+    gpa: std.mem.Allocator,
+    messages: []const ai.MessageView,
+) !std.ArrayListUnmanaged(ai.ChatMessage) {
+    // Fast path: zero or one system message already at index 0.
+    var system_count: u32 = 0;
+    for (messages) |view| {
+        if (view.message().* == .system) system_count += 1;
+    }
+    if (system_count <= 1 and (messages.len == 0 or messages[0].message().* == .system)) {
+        var passthrough: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
+        for (messages) |view| try passthrough.append(gpa, view.message().*);
+        return passthrough;
+    }
+
+    // Need a rebuild: merged system first, then all non-system messages in order.
+    var result: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
+    errdefer result.deinit(gpa);
+
+    // Merge every system message's text blocks into one content buffer.
+    var merged: std.ArrayListUnmanaged(u8) = .empty;
+    defer merged.deinit(gpa);
+    for (messages) |view| {
+        const m = view.message().*;
+        if (m != .system) continue;
+        if (merged.items.len > 0) try merged.append(gpa, '\n');
+        for (m.system.content) |block| {
+            if (block == .text) try merged.appendSlice(gpa, block.text.text);
+        }
+    }
+    if (merged.items.len > 0) {
+        const owned = try gpa.dupe(u8, merged.items);
+        errdefer gpa.free(owned);
+        const block = ai.ContentBlock{ .text = .{ .text = owned } };
+        const content = try gpa.dupe(ai.ContentBlock, &.{block});
+        errdefer gpa.free(content);
+        try result.append(gpa, ai.ChatMessage{ .system = .{ .content = content } });
+    }
+
+    // Append all non-system messages, preserving order.
+    for (messages) |view| {
+        const m = view.message().*;
+        if (m == .system) continue;
+        try result.append(gpa, m);
+    }
+    return result;
+}
+
+/// Free a normalized message list returned by `normalizeMessagesForQwen`.
+/// Only frees the owned system block when the list was rebuilt (the caller
+/// passes `rebuilt` to indicate that); the passthrough path shares ownership
+/// with the caller's input and frees nothing extra.
+fn deinitNormalizedMessages(gpa: std.mem.Allocator, list: std.ArrayListUnmanaged(ai.ChatMessage), rebuilt: bool) void {
+    if (!rebuilt) {
+        var mut = list;
+        mut.deinit(gpa);
+        return;
+    }
+    // The rebuilt list owns exactly one merged system block (allocated here).
+    // Non-system entries are borrowed from the caller's input and must not be
+    // freed. Free only the system content buffer, then the slice.
+    for (list.items) |*m| {
+        if (m.* == .system) {
+            const sys = &m.system;
+            const block = &sys.content[0];
+            gpa.free(block.text.text);
+            gpa.free(sys.content);
+        }
+    }
+    var mut_list = list;
+    mut_list.deinit(gpa);
+}
+
 fn writeMessage(out: *std.Io.Writer, gpa: std.mem.Allocator, message: ai.ChatMessage) !void {
     try out.writeAll("{\"role\":");
     const role_label: []const u8 = switch (message) {
@@ -777,10 +862,25 @@ fn writeRequestPayload(
     // than erroring; never reintroduce an assert or an early return for the
     // empty-tools case.
 
+    // Qwen / DashScope requires a single leading system message; merge + hoist.
+    var normalized: std.ArrayListUnmanaged(ai.ChatMessage) = .empty;
+    var wrapped: std.ArrayListUnmanaged(ai.MessageView) = .empty;
+    const effective_messages: []const ai.MessageView = if (dialect == .dashscope) blk: {
+        normalized = try normalizeMessagesForQwen(gpa, messages);
+        for (normalized.items) |*m| {
+            try wrapped.append(gpa, ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) });
+        }
+        break :blk wrapped.items;
+    } else messages;
+    defer if (dialect == .dashscope) {
+        wrapped.deinit(gpa);
+        deinitNormalizedMessages(gpa, normalized, true);
+    };
+
     try out.writeAll("{\"model\":");
     try std.json.Stringify.value(model, .{}, out);
     try out.writeAll(",\"messages\":[");
-    for (messages, 0..) |*view, index| {
+    for (effective_messages, 0..) |*view, index| {
         if (index > 0) try out.writeByte(',');
         try writeMessage(out, gpa, view.message().*);
     }
@@ -2526,4 +2626,65 @@ test "wireEffortLabel dashscope clips high to medium directly" {
     try std.testing.expectEqualStrings("low", r3.?);
     const r4 = wireEffortLabel(.dashscope, .xhigh);
     try std.testing.expectEqualStrings("xhigh", r4.?);
+}
+
+test "normalizeMessagesForQwen merges multiple system messages and hoists to front" {
+    const gpa = std.testing.allocator;
+    const sys1 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_A") } } }) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
+    const sys2 = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS_B") } } }) } };
+    const chat_messages = [_]ai.ChatMessage{ user, sys1, sys2 };
+    var views: [chat_messages.len]ai.MessageView = undefined;
+    for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
+    const messages = views[0..];
+    defer {
+        gpa.free(sys1.system.content[0].text.text);
+        gpa.free(sys1.system.content);
+        gpa.free(sys2.system.content[0].text.text);
+        gpa.free(sys2.system.content);
+        gpa.free(user.user.content[0].text.text);
+        gpa.free(user.user.content);
+    }
+
+    var norm = try normalizeMessagesForQwen(gpa, messages);
+    // norm owns exactly one merged system block; free it, then the list.
+    defer {
+        if (norm.items.len > 0 and norm.items[0] == .system) {
+            const sys = &norm.items[0].system;
+            const block = &sys.content[0];
+            gpa.free(block.text.text);
+            gpa.free(sys.content);
+        }
+        norm.deinit(gpa);
+    }
+
+    // Two system messages merged into one leading system, followed by the user.
+    try std.testing.expectEqual(@as(usize, 2), norm.items.len);
+    try std.testing.expect(norm.items[0] == .system);
+    try std.testing.expect(norm.items[1] == .user);
+    try std.testing.expectEqualStrings("SYS_A\nSYS_B", norm.items[0].system.content[0].text.text);
+}
+
+test "normalizeMessagesForQwen passthrough when single leading system" {
+    const gpa = std.testing.allocator;
+    const sys = ai.ChatMessage{ .system = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "SYS") } } }) } };
+    const user = ai.ChatMessage{ .user = .{ .content = try gpa.dupe(ai.ContentBlock, &.{ai.ContentBlock{ .text = .{ .text = try gpa.dupe(u8, "hi") } } }) } };
+    const chat_messages = [_]ai.ChatMessage{ sys, user };
+    var views: [chat_messages.len]ai.MessageView = undefined;
+    for (&chat_messages, 0..) |*m, i| views[i] = ai.MessageView{ .borrowed = @ptrCast(@constCast(m)) };
+    const messages = views[0..];
+    defer {
+        gpa.free(sys.system.content[0].text.text);
+        gpa.free(sys.system.content);
+        gpa.free(user.user.content[0].text.text);
+        gpa.free(user.user.content);
+    }
+
+    var norm = try normalizeMessagesForQwen(gpa, messages);
+    // Passthrough path: norm shares the caller's system/user content, so only
+    // the list storage (not the inner buffers) is owned by norm.
+    defer norm.deinit(gpa);
+
+    // No rebuild → shares the caller's backing storage.
+    try std.testing.expectEqual(@as(usize, 2), norm.items.len);
 }
