@@ -316,13 +316,20 @@ fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, res
 
     // Best-effort symlink resolution (TD-4): canonicalize the resolved cwd and
     // the root and re-check containment. Any error skips this check — never a
-    // hard failure.
+    // hard failure. `realPathFileAbsoluteAlloc` asserts the path is absolute on
+    // the host OS; a cross-OS path (a Windows drive path resolved on POSIX, or
+    // vice versa) that `std.fs.path.resolve` leaves non-absolute on the foreign
+    // OS would trip that assert and crash. When the normalized path is not
+    // absolute on this host the realpath re-check cannot run; fall back to the
+    // lexical verdict already computed above, mirroring the `catch return true`
+    // degradation for realpath failures.
+    if (!std.fs.path.isAbsolute(normalized) or !std.fs.path.isAbsolute(normalized_root)) return true;
     const real_cwd = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized, gpa) catch return true;
     defer gpa.free(real_cwd);
     const real_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized_root, gpa) catch return true;
     defer gpa.free(real_root);
     if (!std.mem.startsWith(u8, real_cwd, real_root)) return false;
-    if (real_cwd.len > real_root.len and real_cwd[real_root.len] != std.fs.path.sep) return false;
+    if (real_cwd.len > real_root.len and real_cwd[real_root.len] != std.fs.path.sep and real_cwd[real_root.len] != '/') return false;
     return true;
 }
 
@@ -959,7 +966,7 @@ test "bash observation strips ANSI codes" {
     const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
     defer gpa.free(cwd);
 
-    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf '\\x1b[31;1mboom\\x1b[0m'\",\"description\":\"ANSI error\"}");
+    var output = try runToolForTest(gpa, std.testing.io, cwd, "{\"command\":\"printf '\\\\x1b[31;1mboom\\\\x1b[0m'\",\"description\":\"ANSI error\"}");
     defer output.deinit(gpa);
     const observation = try testObservationText(gpa, output);
     defer gpa.free(observation);
