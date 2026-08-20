@@ -357,7 +357,7 @@ pub const TreeState = struct {
         // 1. Visibility mask: filter + search, minus fold-hidden subtrees.
         // Legacy `checkpoint`-kind entries (from old jj-era sessions) never appear
         // as their own rows.
-        if (self.nodes.len > self.visible_mask.items.len) return error.OutOfMemory;
+        std.debug.assert(self.nodes.len <= self.visible_mask.items.len);
         const visible_mask = self.visible_mask.items[0..self.nodes.len];
         for (self.nodes, 0..) |node, i| {
             const kind_ok = node.kind != .checkpoint and (node.is_leaf or self.kindPasses(node.kind));
