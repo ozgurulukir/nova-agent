@@ -609,18 +609,6 @@ test "submitMode lanes is a no-op when not confirming a merge" {
 // `worker_context` null) so submitMode's idle-lane guards can be exercised
 // without a full lane lifecycle. Mirrors `addFakeWorkingLane` in
 // lane_lifecycle.zig — `Thread` is fully default-initialized except `engine`.
-fn addIdleFocusedLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !void {
-    const lane = try gpa.create(tui.Thread);
-    errdefer gpa.destroy(lane);
-    const branch = try std.fmt.allocPrint(gpa, "nova/{s}", .{id});
-    errdefer gpa.free(branch);
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
-    errdefer gpa.free(path);
-    lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
-    try app.threads.append(lane);
-    app.thread = lane; // focus the idle lane
-}
-
 fn transcriptNoticeContains(app: *App, needle: []const u8) bool {
     for (app.thread.transcript.messages.items) |m| {
         const body: []const u8 = switch (m) {
@@ -633,6 +621,7 @@ fn transcriptNoticeContains(app: *App, needle: []const u8) bool {
 }
 
 test "submitMode refuses on a focused idle lane instead of crashing (provider/model/session)" {
+    const test_helpers = @import("test_helpers.zig");
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
@@ -640,7 +629,7 @@ test "submitMode refuses on a focused idle lane instead of crashing (provider/mo
     defer app.deinit();
 
     // The primary stays at threads[0]; focus a fresh idle lane.
-    try addIdleFocusedLane(gpa, &app, "idle1");
+    try test_helpers.addIdleFocusedLane(gpa, &app, "idle1");
     try std.testing.expect(app.liveRuntime() == null); // idle → null (the precondition)
 
     // Each crashing branch refuses with the idle-lane notice instead of
@@ -657,13 +646,14 @@ test "submitMode refuses on a focused idle lane instead of crashing (provider/mo
 }
 
 test "submitMode refuses on the crashing commands but leaves safe commands working" {
+    const test_helpers = @import("test_helpers.zig");
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    try addIdleFocusedLane(gpa, &app, "idle2");
+    try test_helpers.addIdleFocusedLane(gpa, &app, "idle2");
     try std.testing.expect(app.liveRuntime() == null);
 
     // A crashing command (.resume_session) refuses with the notice.

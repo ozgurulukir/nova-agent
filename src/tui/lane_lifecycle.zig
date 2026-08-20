@@ -3676,37 +3676,8 @@ test "resolveLane handles case-insensitivity and suggests open worker IDs on fai
     try std.testing.expectEqualStrings("lane: no open lane with id 'badhex123'. Open worker lanes: [a1b2c3d4e5f6]. (Note: [0] is the driver lane, not a worker).\n", res2.text);
 }
 
-/// Minimal heap runtime whose surface survives `AgentRuntime.deinit`
-/// (mirrors the tests.zig createRuntime fixture, plus a real session writer).
-fn makeParkTestRuntime(gpa: std.mem.Allocator, home_abs: []const u8) !*runtime_mod.AgentRuntime {
-    const session_mod = @import("../session.zig");
-    const runtime = try gpa.create(runtime_mod.AgentRuntime);
-    errdefer gpa.destroy(runtime);
-    runtime.* = undefined;
-    runtime.gpa = gpa;
-    runtime.io = std.testing.io;
-    runtime.cwd = try gpa.dupe(u8, ".");
-    errdefer gpa.free(runtime.cwd);
-    runtime.home_dir = home_abs; // borrowed; not freed by deinit
-    runtime.client = .none;
-    runtime.base_system_prompt = try gpa.dupe(u8, "");
-    errdefer gpa.free(runtime.base_system_prompt);
-    runtime.system_prompt = try gpa.dupe(u8, "");
-    errdefer gpa.free(runtime.system_prompt);
-    runtime.skills = &.{};
-    runtime.plugin_prompts = &.{};
-    runtime.diagnostics = &.{};
-    runtime.owned_client = null;
-    runtime.owned_compaction_client = null;
-    runtime.owned_naming_client = null;
-    runtime.modelsdev_registry = null;
-    runtime.naming_client = .none;
-    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
-    try session_mod.SessionWriter.initDefault(&runtime.session_writer, gpa, std.testing.io, home_abs, ".");
-    return runtime;
-}
-
 test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
+    const test_helpers = @import("test_helpers.zig");
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3728,7 +3699,7 @@ test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
     const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest", .{});
     lane.* = .{ .engine = .{ .live = .{
         .lane = .{ .working = .{ .branch = branch, .path = path } },
-        .runtime = try makeParkTestRuntime(gpa, home_abs),
+        .runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs),
         .owns = true,
     } } };
     try app.threads.append(lane);
@@ -3755,7 +3726,7 @@ test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
     const path2 = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest2", .{});
     lane2.* = .{ .engine = .{ .live = .{
         .lane = .{ .working = .{ .branch = branch2, .path = path2 } },
-        .runtime = try makeParkTestRuntime(gpa, home_abs),
+        .runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs),
         .owns = true,
     } } };
     try app.threads.append(lane2);

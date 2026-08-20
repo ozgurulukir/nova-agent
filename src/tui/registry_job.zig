@@ -88,45 +88,51 @@ pub fn drain(app: *App) !bool {
     return true;
 }
 
-/// Swap in a freshly fetched registry. Three borrow hazards, in order:
-/// (1) an open `.dynamic` form handle holds a Provider by value whose
-///     strings point into the OLD registry — re-resolve by id, or drop the
-///     form when the provider vanished;
-/// (2) the merged picker entries borrow the old registry too — rebuild them
-///     BEFORE freeing it;
-/// (3) if the rebuild fails (OOM), the still-installed old entries would
-///     dangle the moment the old registry is freed — invalidate them so the
-///     picker rebuilds safely on its next open.
+/// Swap in a freshly fetched registry. The adoption protocol is three named
+/// steps, in a fixed order, each guarding one borrow hazard:
+///
+///     install → rebindDynamicFormHandle → rebuild entries → free old registry
+///
+/// (1) rebind: an open `.dynamic` form handle holds a Provider by value whose
+///     strings point into the OLD registry — re-resolve against the new one;
+/// (2) rebuild BEFORE the free: the merged picker entries borrow the old
+///     registry's string storage too;
+/// (3) free old LAST — and if the rebuild failed (OOM), invalidate the
+///     still-installed old entries first, or they would dangle here.
 pub fn adoptRefreshedRegistry(app: *App, registry: modelsdev.Registry) void {
     var old = app.provider_state.modelsdev_registry;
     app.provider_state.modelsdev_registry = registry;
 
-    if (app.pickers.provider.stage == .form) {
-        if (app.pickers.provider.form_handle) |handle| {
-            switch (handle) {
-                .dynamic => |provider| {
-                    const rebound: ?modelsdev.Provider = if (app.provider_state.modelsdev_registry) |*reg|
-                        reg.lookup(provider.id)
-                    else
-                        null;
-                    if (rebound) |fresh| {
-                        app.pickers.provider.form_handle = .{ .dynamic = fresh };
-                    } else {
-                        app.pickers.provider.stage = .list;
-                        app.pickers.provider.form_handle = null;
-                        app.input_buffers.provider_key.clearRetainingCapacity();
-                    }
-                },
-                else => {},
-            }
-        }
-    }
+    rebindDynamicFormHandle(app);
 
     provider_model.rebuildProviderEntries(app) catch |err| {
         log.warn("registry.refresh.rebuild_failed err={s}", .{@errorName(err)});
         provider_model.invalidateProviderEntries(app);
     };
     if (old) |*o| o.deinit(app.gpa);
+}
+
+/// Adoption step 1: re-resolve an open `.dynamic` form handle against the
+/// freshly installed registry, or drop the form when the provider vanished
+/// from it (same cleanup as cancelMode's form branch). `.builtin` handles
+/// are enum values and `.config` handles borrow cached_config — both pass
+/// through untouched.
+fn rebindDynamicFormHandle(app: *App) void {
+    if (app.pickers.provider.stage != .form) return;
+    const handle = app.pickers.provider.form_handle orelse return;
+    if (handle != .dynamic) return;
+
+    const rebound: ?modelsdev.Provider = if (app.provider_state.modelsdev_registry) |*reg|
+        reg.lookup(handle.dynamic.id)
+    else
+        null;
+    if (rebound) |fresh| {
+        app.pickers.provider.form_handle = .{ .dynamic = fresh };
+    } else {
+        app.pickers.provider.stage = .list;
+        app.pickers.provider.form_handle = null;
+        app.input_buffers.provider_key.clearRetainingCapacity();
+    }
 }
 
 /// Cancel + join an in-flight refresh (app teardown). `Future.cancel` is
@@ -147,6 +153,7 @@ pub fn active(app: *const App) bool {
 }
 
 test "start no-ops without a live runtime" {
+    const test_helpers = @import("test_helpers.zig");
     const agent_mod = @import("../agent.zig");
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -154,18 +161,8 @@ test "start no-ops without a live runtime" {
     var app = try tui.App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
 
-    // Focused idle lane (mirrors the mode_lifecycle fixture): no runtime, so
-    // start must arm nothing.
-    const lane = try gpa.create(tui.Thread);
-    errdefer gpa.destroy(lane);
-    const branch = try std.fmt.allocPrint(gpa, "nova/regjob", .{});
-    errdefer gpa.free(branch);
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/regjob", .{});
-    errdefer gpa.free(path);
-    lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
-    try app.threads.append(lane);
-    app.thread = lane;
-
+    // Focused idle lane: no runtime, so start must arm nothing.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "regjob");
     try start(&app);
     try std.testing.expect(app.provider_state.registry_refresh == .idle);
 }

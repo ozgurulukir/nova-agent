@@ -1752,21 +1752,8 @@ test "buildMergedProviderList keeps old entries installed on OOM" {
     try std.testing.expect(succeeded);
 }
 
-/// Test fixture: append a fresh idle lane and focus it (mirrors the helper
-/// in mode_lifecycle.zig — the primary keeps its runtime so deinit is clean).
-fn addIdleFocusedLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !void {
-    const lane = try gpa.create(tui.Thread);
-    errdefer gpa.destroy(lane);
-    const branch = try std.fmt.allocPrint(gpa, "nova/{s}", .{id});
-    errdefer gpa.free(branch);
-    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/{s}", .{id});
-    errdefer gpa.free(path);
-    lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = branch, .path = path } } } };
-    try app.threads.append(lane);
-    app.thread = lane;
-}
-
 test "openProviderPicker leaves mode unchanged when preparation fails" {
+    const test_helpers = @import("test_helpers.zig");
     const agent_mod = @import("../agent.zig");
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -1777,7 +1764,7 @@ test "openProviderPicker leaves mode unchanged when preparation fails" {
     // Focused idle lane: no live runtime → refreshProviderApiKeys fails
     // BEFORE the mode flip. Previously the mode was set first and the error
     // left a half-open picker backed by stale entries.
-    try addIdleFocusedLane(gpa, &app, "idle-open");
+    try test_helpers.addIdleFocusedLane(gpa, &app, "idle-open");
     try std.testing.expect(app.liveRuntime() == null);
     try std.testing.expectError(error.NoActiveRuntime, openProviderPicker(&app));
     try std.testing.expectEqual(App.Mode.normal, app.mode);
