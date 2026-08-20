@@ -132,12 +132,65 @@ fn refuseOnIdleLane(app: *App) bool {
         lanes_util.lastPathSegment(w.path)
     else
         "this lane";
-    const notice = std.fmt.allocPrint(
-        app.gpa,
+    // Stack-buffer formatting: a refusal must never itself fail (the previous
+    // allocPrint-based version silently refused without a notice on OOM), so
+    // fall back to a static literal when the id doesn't fit.
+    var buffer: [192]u8 = undefined;
+    const notice = std.fmt.bufPrint(
+        &buffer,
         "Lane {s} is idle — no agent is attached. From the driver, `lane enter {s}` to work here, or `lane spawn` to start a worker in it.\n",
         .{ id, id },
-    ) catch return true;
-    defer app.gpa.free(notice);
+    ) catch "This lane is idle — no agent is attached. From the driver, use `lane enter` or `lane spawn`.\n";
+    _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
+    return true;
+}
+
+/// Close any open overlay whose key/submit handlers deref the live runtime.
+/// Called when the FOCUSED lane is about to lose its runtime (a finished
+/// spawned worker parks, `lane_lifecycle.parkFinishedWorker`): the
+/// submit-time `refuseOnIdleLane` guards are point-in-time checks and go
+/// stale the moment the lane parks — the session-picker sub-state keys
+/// ('y', Ctrl+A) and the provider-form submit would then deref a null
+/// runtime. Runtime-free modes (help, settings, theme, search, command
+/// menu, mcp, plugins, lanes, diff viewer) stay open. Returns true when a
+/// mode was closed.
+pub fn closeRuntimeBoundOverlays(app: *App, lane_id: []const u8) bool {
+    const runtime_bound = switch (app.mode) {
+        .session_picker, .provider_picker, .model_picker, .tree_picker, .save_message => true,
+        else => false,
+    };
+    if (!runtime_bound) return false;
+
+    // Sub-state cleanup mirrors cancelMode: a pending model load must not
+    // install into a picker that is about to close, session sub-states and
+    // summaries are freed, and an open provider form drops its borrowed
+    // handle (it points into cached_config / registry storage).
+    switch (app.mode) {
+        .model_picker => {
+            provider_model.cancelModelLoad(app);
+            app.pickers.models.restore();
+        },
+        .session_picker => app.resumeClear(),
+        .provider_picker => {
+            if (app.pickers.provider.stage == .form) {
+                app.pickers.provider.stage = .list;
+                app.pickers.provider.form_handle = null;
+                app.input_buffers.provider_key.clearRetainingCapacity();
+            }
+        },
+        else => {},
+    }
+    app.mode = .normal;
+    app.clearInput();
+    app.clearPaletteInput();
+    // Stack-buffer notice with a static fallback: the park must never fail
+    // because its explanation didn't fit.
+    var buffer: [192]u8 = undefined;
+    const notice = std.fmt.bufPrint(
+        &buffer,
+        "Lane {s} finished and was parked — the open panel needed a live agent and was closed.",
+        .{lane_id},
+    ) catch "This lane finished and was parked — the open panel needed a live agent and was closed.";
     _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
     return true;
 }
@@ -218,6 +271,15 @@ pub fn submitMode(app: *App) !bool {
         }
         const summary = try app.selectedResumeSummary() orelse return true;
         app.switchToSession(summary.id, summary.cwd) catch |err| {
+            // A lane delivery turn may have started from the tick while the
+            // picker was open. Report it but KEEP the picker (and selection)
+            // open so the user can retry once it finishes — the generic
+            // reporter resets the mode and would silently discard the
+            // user's open picker.
+            if (err == error.InFlightTurn) {
+                _ = app.thread.transcript.append(app.gpa, .notice, "agent", "A lane result is being delivered on this lane — press Enter again once it finishes to switch.") catch {};
+                return true;
+            }
             try app.reportSessionSwitchError(err);
             return true;
         };
@@ -313,9 +375,9 @@ pub fn submitMode(app: *App) !bool {
             app.clearInput();
             switch (command) {
                 .new => app.switchToNewSession() catch |err| try app.reportSessionSwitchError(err),
-                .resume_session => try app.openResumePicker(),
+                .resume_session => app.openResumePicker() catch |err| try app.reportSessionSwitchError(err),
                 .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
-                .connect => try provider_model.openProviderPicker(app),
+                .connect => provider_model.openProviderPicker(app) catch |err| try app.reportConnectionError(err),
                 .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
                 .mcp => tui.openMcp(app),
                 .plugins => tui.openPlugins(app),
@@ -752,4 +814,90 @@ test "submitMode on theme_picker with no matching filter reverts the preview" {
     // The preview is reverted (M2): a non-commit exit must restore the look.
     try std.testing.expectEqual(tui_style.default_theme.body, tui_style.activePalette().body.fg.rgb);
     try std.testing.expect(app.theme_preview_original == null);
+}
+
+test "closeRuntimeBoundOverlays resets each runtime-bound mode with a notice" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Session picker: sub-state + summaries cleared.
+    app.mode = .session_picker;
+    app.nav.session_action = .deleting;
+    try std.testing.expect(closeRuntimeBoundOverlays(&app, "w1"));
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+    try std.testing.expectEqual(@import("app_state.zig").NavState.SessionAction.browsing, app.nav.session_action);
+    try std.testing.expect(transcriptNoticeContains(&app, "parked"));
+
+    // Provider picker form: borrowed handle dropped, back to list stage.
+    app.mode = .provider_picker;
+    app.pickers.provider.stage = .form;
+    app.pickers.provider.form_handle = .{ .builtin = .openai };
+    try std.testing.expect(closeRuntimeBoundOverlays(&app, "w1"));
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+    try std.testing.expectEqual(@import("widgets/provider_picker.zig").Stage.list, app.pickers.provider.stage);
+    try std.testing.expect(app.pickers.provider.form_handle == null);
+
+    // Model picker / tree picker / save message: plain close.
+    for ([_]App.Mode{ .model_picker, .tree_picker, .save_message }) |m| {
+        app.mode = m;
+        try std.testing.expect(closeRuntimeBoundOverlays(&app, "w1"));
+        try std.testing.expectEqual(App.Mode.normal, app.mode);
+    }
+}
+
+test "closeRuntimeBoundOverlays leaves runtime-free modes open" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    inline for (.{ App.Mode.help, App.Mode.settings, App.Mode.search, App.Mode.command, App.Mode.lanes }) |m| {
+        app.mode = m;
+        try std.testing.expect(!closeRuntimeBoundOverlays(&app, "w1"));
+        try std.testing.expectEqual(m, app.mode);
+    }
+}
+
+test "submitMode keeps the session picker open on InFlightTurn" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // One selectable summary + a delivery turn running on the focused lane
+    // (started from the tick while the picker was open).
+    try app.resume_summaries.append(gpa, .{
+        .id = try gpa.dupe(u8, "sess-1"),
+        .title = null,
+        .cwd = try gpa.dupe(u8, "/tmp"),
+        .created_at_ms = 0,
+        .updated_at_ms = 0,
+        .leaf_entry_id = null,
+        .model_provider = null,
+        .model_id = null,
+        .reasoning_effort = null,
+    });
+    // App.init leaves the primary lane idle in tests; make it live so the
+    // submit-time idle-lane guard passes. The runtime is never dereferenced
+    // on this path (switchToSession refuses on the active turn first).
+    const runtime_mod = @import("../runtime.zig");
+    var fake_runtime: runtime_mod.AgentRuntime = undefined;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &fake_runtime, .owns = false } };
+    app.thread.turn.state = .active;
+    app.mode = .session_picker;
+    app.nav.session_action = .browsing;
+
+    try std.testing.expect(try app.submitMode());
+
+    // The picker (and its data) must survive the refusal so Enter can retry
+    // once the turn finishes; the notice names the cause.
+    try std.testing.expectEqual(App.Mode.session_picker, app.mode);
+    try std.testing.expect(app.nav.session_action == .browsing);
+    try std.testing.expectEqual(@as(usize, 1), app.resume_summaries.items.len);
+    try std.testing.expect(transcriptNoticeContains(&app, "being delivered"));
 }

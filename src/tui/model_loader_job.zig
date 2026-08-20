@@ -19,6 +19,34 @@ pub fn cancelModelLoad(self: *App) void {
     }
 }
 
+/// Install the concurrent future for a freshly-armed `.loading` state,
+/// guaranteeing the union never stays `.loading` with an `undefined` future
+/// when the spawn fails: the state first moves to `.failed` (picker error
+/// row) or `.idle` (message alloc failed), then the error re-raises so the
+/// caller's errdefers free the job + configured snapshot. Without this,
+/// `cancelModelLoad` would copy the undefined future (UB) and
+/// `drainModelLoad` would poll `done` forever, spinning the tick.
+pub fn spawnLoadFuture(app: *App, job: *model_loader.Job) !void {
+    app.pickers.models.load.loading.future = app.io.concurrent(model_loader.run, .{job}) catch |err| {
+        markLoadSpawnFailed(app, err);
+        return err;
+    };
+}
+
+/// Move an armed-but-unspawned `.loading` state out of `.loading` so the
+/// cancel/drain paths never touch the never-installed future. The `.failed`
+/// message is owned by the catalogue and freed by its existing sites.
+pub fn markLoadSpawnFailed(app: *App, err: anyerror) void {
+    var buffer: [96]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, "Model load could not start: {s}", .{@errorName(err)}) catch
+        "Model load could not start.";
+    if (app.gpa.dupe(u8, message)) |owned| {
+        app.pickers.models.load = .{ .failed = .{ .message = owned } };
+    } else |_| {
+        app.pickers.models.load = .idle;
+    }
+}
+
 /// Called from the tick handler. Polls the non-blocking `done` flag, and
 /// only `await`s once the worker has signalled completion. Returns true
 /// if a redraw is needed.
@@ -224,4 +252,31 @@ pub fn collectModelCacheConfigured(self: *App) !std.ArrayList(model_cache.Config
     }
 
     return list;
+}
+
+test "markLoadSpawnFailed moves an armed loading state to failed and keeps cancelModelLoad safe" {
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Arm exactly like startModelLoad does right before the spawn: future is
+    // undefined until io.concurrent succeeds.
+    app.pickers.models.load = .{ .loading = .{
+        .future = undefined,
+        .done = .init(false),
+        .merge = true,
+    } };
+    markLoadSpawnFailed(&app, error.SystemResources);
+
+    try std.testing.expect(app.pickers.models.load == .failed);
+    try std.testing.expect(std.mem.indexOf(u8, app.pickers.models.load.failed.message, "SystemResources") != null);
+
+    // Cancel/drain on the failed state must be no-ops — they must never touch
+    // the never-installed (undefined) future.
+    cancelModelLoad(&app);
+    try std.testing.expect(app.pickers.models.load == .failed);
+    try std.testing.expect(!try drainModelLoad(&app));
 }

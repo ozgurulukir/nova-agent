@@ -390,6 +390,11 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         if (app.cached_config_owned) app.cached_config.deinit(app.gpa);
         app.cached_config = rc;
         app.cached_config_owned = true;
+        // The provider picker's `.config` entries and any open form handle
+        // borrow the OLD config's storage, which the deinit above just freed.
+        // Dropping them here makes the dangle temporally impossible no matter
+        // which code path touches the picker next.
+        provider_model.invalidateProviderEntries(app);
         app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
     }
 

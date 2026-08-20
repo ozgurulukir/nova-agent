@@ -13,6 +13,8 @@ const agent_worker = @import("agent_worker.zig");
 const lane_bridge = tui.lane_bridge_mod;
 const lanes_util = @import("lanes.zig");
 const lanes_picker = @import("widgets/lanes_picker.zig");
+const lifecycle = @import("lifecycle.zig");
+const mode_lifecycle = @import("mode_lifecycle.zig");
 const naming_mod = @import("naming.zig");
 const turn_view_mod = @import("turn_view.zig");
 const queue_mod = @import("queue.zig");
@@ -502,6 +504,12 @@ pub fn closeActiveLane(app: *App) !void {
     // close does not prematurely suppress the completion. laneByGeneration still
     // resolves — the lane stays in app.threads until the orderedRemove below.
     discardUndeliveredCompletion(app, lane);
+    // No focus pin here, deliberately: /close only runs from the command
+    // menu, where the entire focus chain is App-owned (root → overlay →
+    // palette) — nothing in it references the dying runtime. A wants_focus
+    // write would be applied at the START of the next event (vxfw App.zig)
+    // and override the palette focus that submit's syncFocus just set,
+    // dead-ending the command menu's text input.
     _ = app.threads.orderedRemove(index);
     lane.deinit(app.gpa);
     app.gpa.destroy(lane);
@@ -1738,6 +1746,22 @@ fn parkFinishedWorker(app: *App, lane: *Thread) void {
         .idle => return,
     };
     app.cancelLaneNaming(lane);
+    // When the focused lane loses its runtime, every open runtime-bound
+    // overlay goes stale (its handlers deref liveRuntime(); the submit-time
+    // idle-lane guards are point-in-time checks). Closing such an overlay
+    // changes the drawn surface tree — a focus path built on the overlay's
+    // per-frame widgets would empty on the next frame (the vendored
+    // FocusHandler crash class), so pin to root (always drawn) before the
+    // runtime dies, then land on the main input (mode is .normal now). When
+    // NO overlay closed, leave focus untouched: the existing chain is
+    // App-owned and stays valid across the park, and an unconditional pin
+    // would strand focus on root while an overlay's palette expects it.
+    const focused = lane == app.thread;
+    var refocus_input = false;
+    if (focused) {
+        refocus_input = mode_lifecycle.closeRuntimeBoundOverlays(app, laneIdOf(lane) orelse "this lane");
+        if (refocus_input) lifecycle.pinFocusToRoot(app);
+    }
     live.runtime.deinit();
     app.gpa.destroy(live.runtime);
     if (lane.worker_context) |*worker| {
@@ -1748,6 +1772,7 @@ fn parkFinishedWorker(app: *App, lane: *Thread) void {
     lane.agent = null;
     lane.turn_future = null;
     lane.engine = .{ .idle = live.lane };
+    if (refocus_input) lifecycle.focusPrimaryInput(app);
 }
 
 /// Deliver finished spawned-worker completions to the spawner (S11): parked
@@ -3649,4 +3674,93 @@ test "resolveLane handles case-insensitivity and suggests open worker IDs on fai
     defer gpa.free(res2.text);
     try std.testing.expect(res2.code != 0);
     try std.testing.expectEqualStrings("lane: no open lane with id 'badhex123'. Open worker lanes: [a1b2c3d4e5f6]. (Note: [0] is the driver lane, not a worker).\n", res2.text);
+}
+
+/// Minimal heap runtime whose surface survives `AgentRuntime.deinit`
+/// (mirrors the tests.zig createRuntime fixture, plus a real session writer).
+fn makeParkTestRuntime(gpa: std.mem.Allocator, home_abs: []const u8) !*runtime_mod.AgentRuntime {
+    const session_mod = @import("../session.zig");
+    const runtime = try gpa.create(runtime_mod.AgentRuntime);
+    errdefer gpa.destroy(runtime);
+    runtime.* = undefined;
+    runtime.gpa = gpa;
+    runtime.io = std.testing.io;
+    runtime.cwd = try gpa.dupe(u8, ".");
+    errdefer gpa.free(runtime.cwd);
+    runtime.home_dir = home_abs; // borrowed; not freed by deinit
+    runtime.client = .none;
+    runtime.base_system_prompt = try gpa.dupe(u8, "");
+    errdefer gpa.free(runtime.base_system_prompt);
+    runtime.system_prompt = try gpa.dupe(u8, "");
+    errdefer gpa.free(runtime.system_prompt);
+    runtime.skills = &.{};
+    runtime.plugin_prompts = &.{};
+    runtime.diagnostics = &.{};
+    runtime.owned_client = null;
+    runtime.owned_compaction_client = null;
+    runtime.owned_naming_client = null;
+    runtime.modelsdev_registry = null;
+    runtime.naming_client = .none;
+    runtime.agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    try session_mod.SessionWriter.initDefault(&runtime.session_writer, gpa, std.testing.io, home_abs, ".");
+    return runtime;
+}
+
+test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Focused live worker with a session picker open in the deleting
+    // sub-state — exactly the R1 window: the picker was opened while the
+    // lane was live, and the park invalidates its runtime derefs.
+    const lane = try gpa.create(tui.Thread);
+    const branch = try std.fmt.allocPrint(gpa, "nova/parktest", .{});
+    const path = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest", .{});
+    lane.* = .{ .engine = .{ .live = .{
+        .lane = .{ .working = .{ .branch = branch, .path = path } },
+        .runtime = try makeParkTestRuntime(gpa, home_abs),
+        .owns = true,
+    } } };
+    try app.threads.append(lane);
+    app.thread = lane;
+    app.mode = .session_picker;
+    app.nav.session_action = .deleting;
+
+    parkFinishedWorker(&app, lane);
+
+    try std.testing.expectEqual(tui.App.Mode.normal, app.mode);
+    try std.testing.expect(lane.engine == .idle);
+    try std.testing.expect(lane.agent == null);
+    var noticed = false;
+    for (lane.transcript.messages.items) |m| {
+        if (m == .notice and std.mem.indexOf(u8, m.notice.body, "parked") != null) noticed = true;
+    }
+    try std.testing.expect(noticed);
+
+    // Parking an UNFOCUSED live lane must not touch the focused lane's
+    // open overlay: re-focus the (now idle) lane, open a picker again, and
+    // park a second live worker that nobody focuses.
+    const lane2 = try gpa.create(tui.Thread);
+    const branch2 = try std.fmt.allocPrint(gpa, "nova/parktest2", .{});
+    const path2 = try std.fmt.allocPrint(gpa, "/tmp/nova-lanes/parktest2", .{});
+    lane2.* = .{ .engine = .{ .live = .{
+        .lane = .{ .working = .{ .branch = branch2, .path = path2 } },
+        .runtime = try makeParkTestRuntime(gpa, home_abs),
+        .owns = true,
+    } } };
+    try app.threads.append(lane2);
+    app.mode = .model_picker;
+    parkFinishedWorker(&app, lane2);
+    try std.testing.expectEqual(tui.App.Mode.model_picker, app.mode);
+    try std.testing.expect(lane2.engine == .idle);
 }

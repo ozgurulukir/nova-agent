@@ -10,6 +10,7 @@ const transcript_mod = @import("../transcript.zig");
 const runtime_mod = @import("../runtime.zig");
 const search_mod = @import("../search.zig");
 const skill_mod = @import("../skill.zig");
+const lifecycle = @import("lifecycle.zig");
 
 const App = tui.App;
 
@@ -28,15 +29,10 @@ pub fn installRuntime(app: *App, runtime: *runtime_mod.AgentRuntime) !void {
     const cwd_changed = if (app.liveRuntime()) |old| !std.mem.eql(u8, old.cwd, runtime.cwd) else true;
     if (app.liveRuntime()) |old| {
         // Before destroying the old runtime, reset vxfw focus to the root
-        // widget. The focused TextField's userdata points into the old
-        // runtime's memory; once it's deinit'd, FocusHandler.update can no
-        // longer find it in the surface tree, leaves the focus path empty,
-        // and the next key event crashes (App.zig:594). Root is always drawn
-        // and runtime-independent, so pinning here is safe. Best-effort: if
-        // the framework handle isn't wired (tests), skip silently.
-        if (app.fw_app) |fw| {
-            if (app.root_widget) |root| fw.wants_focus = root;
-        }
+        // widget (see lifecycle.pinFocusToRoot for the FocusHandler crash
+        // this prevents). One auditable site shared with the lane park/close
+        // teardown paths.
+        lifecycle.pinFocusToRoot(app);
         old.deinit();
         app.gpa.destroy(old);
     }

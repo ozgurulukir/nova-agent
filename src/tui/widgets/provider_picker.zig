@@ -113,7 +113,10 @@ pub const State = struct {
 
         const count = self.rowCount();
         if (count == 0) return false;
-        assert(self.selection < count);
+        // The background registry refresh can rebuild (and shrink) `entries`
+        // while the picker is open; a stale selection must clamp, not assert —
+        // `assert` is stripped in ReleaseFast and would index out of bounds.
+        if (self.selection >= count) self.selection = 0;
         if (key.matches(vaxis.Key.left, .{})) {
             self.column = .provider;
             return true;
@@ -149,10 +152,19 @@ pub const State = struct {
         return false;
     }
 
+    /// Drop the selection back into range after `entries` was rebuilt. A
+    /// background registry refresh can shrink the list while the picker is
+    /// open; call this from every rebuild site.
+    pub fn clampSelection(self: *State) void {
+        if (self.selection >= self.rowCount()) self.selection = 0;
+    }
+
     pub fn selectedAction(self: *const State) Action {
         const count = self.rowCount();
-        assert(self.selection < count);
-        if (self.selection == 0) {
+        // Total guard, not an assert: ReleaseFast strips asserts and a stale
+        // selection (entries shrank between key handling and submit) would
+        // index out of bounds. Row 0 (codex) is the safe resolution.
+        if (self.selection == 0 or self.selection >= count) {
             if (self.column == .sign_out) return .sign_out_codex;
             return .connect_codex;
         }
@@ -499,4 +511,29 @@ test "provider picker form stage defers keys to the input field" {
     var state: State = .{ .stage = .form };
     try std.testing.expect(!state.handleKey(.{ .codepoint = 'a' }, false));
     try std.testing.expect(!state.handleKey(.{ .codepoint = vaxis.Key.down }, true));
+}
+
+test "selectedAction is total for a stale selection" {
+    // Entries shrank between key handling and submit (background registry
+    // refresh): a selection past the end must resolve to the codex row, never
+    // index out of bounds.
+    var state: State = .{ .selection = 7 };
+    try std.testing.expectEqual(Action.connect_codex, state.selectedAction());
+    state.column = .sign_out;
+    try std.testing.expectEqual(Action.sign_out_codex, state.selectedAction());
+    // In-range selections keep resolving to the entry.
+    const entries = [_]ProviderHandle{.{ .builtin = .openai }};
+    var in_range: State = .{ .selection = 1, .entries = &entries };
+    try std.testing.expect(std.meta.activeTag(in_range.selectedAction()) == .open_entry);
+}
+
+test "handleKey clamps a stale selection instead of asserting" {
+    var state: State = .{ .selection = 5 };
+    // Any navigation key first clamps the stale selection into range.
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.up }, false));
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
+    // clampSelection is the rebuild-site counterpart.
+    state.selection = 9;
+    state.clampSelection();
+    try std.testing.expectEqual(@as(u32, 0), state.selection);
 }
