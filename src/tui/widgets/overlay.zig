@@ -163,9 +163,12 @@ const OverlayInner = struct {
 
         // The provider setup form, the settings panel, and the help modal host
         // their own headers/navigation, so they skip the shared search row
-        // entirely and fill the panel from the top.
+        // entirely and fill the panel from the top. `.plugins` matches: its
+        // focus stays on root (syncFocus routes it there), so a drawn palette
+        // filter row could never receive focus or text.
         const is_full_panel = (self.app.mode == .provider_picker and self.app.pickers.provider.stage == .form) or
-            self.app.mode == .settings or self.app.mode == .help or self.app.mode == .mcp;
+            self.app.mode == .settings or self.app.mode == .help or self.app.mode == .mcp or
+            self.app.mode == .plugins;
         if (is_full_panel) {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{

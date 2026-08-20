@@ -16,6 +16,7 @@ const agent_worker = @import("agent_worker.zig");
 const auth = @import("../auth/store.zig");
 const blackhole = @import("../tui/blackhole.zig");
 const provider_model = @import("provider_model.zig");
+const registry_job = @import("registry_job.zig");
 const diff_lifecycle = @import("diff_lifecycle.zig");
 const diff_utils = @import("diff_utils.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
@@ -77,6 +78,7 @@ fn deinitSharedServices(self: *App) void {
     self.background_modal_state.pending.deinit(self.gpa);
 
     provider_model.cancelModelLoad(self);
+    registry_job.cancel(self);
     self.pickers.tree.deinit();
     self.pickers.search.deinit(self.gpa);
     self.pickers.models.deinit(self.gpa);
@@ -129,6 +131,10 @@ fn deinitOwnedState(self: *App) void {
     self.retired_transcripts.deinit(self.gpa);
     self.resumeClear();
     self.resumeClearFolds();
+    // `resumeClear` only clears items (keeps capacity for the next open);
+    // the backing array itself is freed here. Nothing populated the list in
+    // tests before, so the missing deinit was latent.
+    self.resume_summaries.deinit(self.gpa);
     self.resume_folded_projects.deinit(self.gpa);
 
     // Non-empty labels are always heap-allocated by `loadGitLabel`; the
@@ -236,6 +242,7 @@ fn drainModelsAndMcp(root: *RootWidget) !bool {
     lane_lifecycle.serviceLaneBridge(root.app);
     var visible_change = false;
     if (try provider_model.drainModelLoad(root.app)) visible_change = true;
+    if (try registry_job.drain(root.app)) visible_change = true;
     if (provider_model.drainMcpNotifications(root.app)) visible_change = true;
     if (provider_model.drainMcpConnects(root.app)) visible_change = true;
     return visible_change;
@@ -321,6 +328,7 @@ fn decideShouldTick(root: *RootWidget) bool {
     const manual_compact_active = compaction_lifecycle.manualCompactActive(root.app);
     const toasts_visible = toast.global.hasToasts();
     const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
+    const registry_refresh_active = registry_job.active(root.app);
 
     return turn_active or
         model_loading or
@@ -332,7 +340,8 @@ fn decideShouldTick(root: *RootWidget) bool {
         mcp_connect_pending or
         manual_compact_active or
         toasts_visible or
-        worktree_async_active;
+        worktree_async_active or
+        registry_refresh_active;
 }
 
 /// Per-lane byte budget for drain-to-empty: events applied beyond this budget
@@ -688,6 +697,25 @@ pub fn handleDiffCommentKey(root: *RootWidget, ctx: *vxfw.EventContext, key: vax
         return;
     }
     // Typed text / backspace handled by the focused comment input.
+}
+
+/// Pin vxfw focus to the root widget before destroying a runtime. The focused
+/// TextField's userdata can point into the dying runtime's memory; once it is
+/// deinit'd, FocusHandler.update can no longer find it in the surface tree,
+/// leaves the focus path empty, and the next key event crashes (vendored
+/// App.zig:594, locally patched as NOVA-LOCAL-PATCH). Root is always drawn and
+/// runtime-independent, so pinning here is safe. Best-effort: tests have no
+/// framework handle wired.
+pub fn pinFocusToRoot(app: *App) void {
+    if (app.fw_app) |fw| {
+        if (app.root_widget) |root| fw.wants_focus = root;
+    }
+}
+
+/// Re-target focus to the main prompt input after a teardown + overlay close.
+/// The input is App-owned (stable across runtimes) and drawn in `.normal`.
+pub fn focusPrimaryInput(app: *App) void {
+    if (app.fw_app) |fw| fw.wants_focus = app.inputs.input.widget();
 }
 
 /// Route focus to the correct widget for the current mode. The provider

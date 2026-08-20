@@ -33,18 +33,22 @@ fn cachedProvider(self: *const App) ?config_mod.Provider {
 }
 
 pub fn openProviderPicker(self: *App) !void {
-    self.mode = .provider_picker;
+    // Every fallible step runs BEFORE the mode flip: on error the app stays
+    // in its prior mode and the caller reports the failure — a half-open
+    // picker rendering stale (possibly freed) entries can never happen.
+    try refreshProviderApiKeys(self);
+    // Disk-cached registry only (never network here — a blocking HTTP fetch
+    // on the UI thread froze the whole TUI on slow networks). A background
+    // refresh job keeps the registry fresh instead.
+    try ensureModelsDevRegistry(self);
     self.pickers.provider.reset();
+    self.mode = .provider_picker;
     self.clearInput();
     self.clearPaletteInput();
-    try refreshProviderApiKeys(self);
-    // Always refresh the models.dev registry so newly added providers
-    // appear immediately instead of waiting for the 24h cache TTL.
-    if (self.provider_state.modelsdev_registry) |*r| {
-        r.deinit(self.gpa);
-        self.provider_state.modelsdev_registry = null;
-    }
-    try ensureModelsDevRegistry(self);
+    // Background registry refresh: keeps newly added providers visible
+    // without a blocking network fetch on the UI thread (the picker is
+    // already usable from the disk cache installed above).
+    registry_job.start(self) catch |err| log.warn("registry.refresh.start_failed err={s}", .{@errorName(err)});
     // Refresh the badges from a live model load (merge, so the catalogue isn't
     // cleared). The load's per-provider outcome drives `conn_status`, so the
     // badge reads the same source as the model picker and can't disagree.
@@ -54,11 +58,36 @@ pub fn openProviderPicker(self: *App) !void {
 pub fn ensureModelsDevRegistry(self: *App) !void {
     if (self.provider_state.modelsdev_registry == null) {
         const home = if (self.liveRuntime()) |r| r.home_dir else "";
-        self.provider_state.modelsdev_registry = modelsdev.loadOrFetchRegistry(self.gpa, self.io, home);
+        self.provider_state.modelsdev_registry = modelsdev.loadRegistryCached(self.gpa, self.io, home);
     }
     if (self.provider_state.modelsdev_registry) |*reg| {
         try buildMergedProviderList(self, reg.providers);
     }
+}
+
+/// Rebuild the merged provider entries from the installed registry + cached
+/// config, then clamp the picker selection — a background registry refresh
+/// can shrink the list while the picker is open.
+pub fn rebuildProviderEntries(self: *App) !void {
+    const providers: []const modelsdev.Provider = if (self.provider_state.modelsdev_registry) |*reg|
+        reg.providers
+    else
+        &.{};
+    try buildMergedProviderList(self, providers);
+    self.pickers.provider.clampSelection();
+}
+
+/// Drop the merged provider entries + form state. Entries and form handles
+/// borrow cached_config / registry storage; call whenever either backing is
+/// replaced (e.g. the cross-project session switch frees the old config) —
+/// otherwise the next frame would render freed memory.
+pub fn invalidateProviderEntries(self: *App) void {
+    if (self.provider_state.entries_slice) |slice| self.gpa.free(slice);
+    self.provider_state.entries_slice = null;
+    self.pickers.provider.entries = &.{};
+    self.pickers.provider.selection = 0;
+    self.pickers.provider.stage = .list;
+    self.pickers.provider.form_handle = null;
 }
 
 /// Three-layer merge: builtin catalogue → models.dev (overrides) → config
@@ -102,8 +131,13 @@ fn buildMergedProviderList(self: *App, all_providers: []const modelsdev.Provider
         }
     }
 
-    if (self.provider_state.entries_slice) |old| self.gpa.free(old);
+    // Allocate the replacement before freeing the old slice: on OOM the old
+    // entries stay installed and valid. Freeing first would leave
+    // `entries_slice` (and `pickers.provider.entries`) pointing at freed
+    // memory, and `deinitSharedServices` would free it again — UAF +
+    // double-free.
     const owned = try entries.toOwnedSlice(self.gpa);
+    if (self.provider_state.entries_slice) |old| self.gpa.free(old);
     self.provider_state.entries_slice = owned;
     self.pickers.provider.entries = owned;
 }
@@ -125,7 +159,10 @@ pub fn catalogueIndexById(id: []const u8) ?usize {
 /// Reload the cached provider API keys from `~/.config/nova/auth.json`. Drives the
 /// picker badges and the multi-provider model catalogue.
 pub fn refreshProviderApiKeys(self: *App) !void {
-    const home = self.liveRuntime().?.home_dir;
+    // Real early return, never an unwrap — this path is reachable with a
+    // focused idle lane, and `.?` would be UB in ReleaseFast.
+    const runtime = self.liveRuntime() orelse return error.NoActiveRuntime;
+    const home = runtime.home_dir;
     if (home.len == 0) return;
     var fresh = try auth.loadAllProviderApiKeys(self.gpa, self.io, home);
     auth.freeApiKeyMap(self.gpa, &self.provider_state.api_keys);
@@ -237,6 +274,8 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         for (configured) |c| {
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
+            if (c.display_name) |d| self.gpa.free(d);
+            if (c.auth_key_id) |a| self.gpa.free(a);
         }
         if (configured.len > 0) self.gpa.free(configured);
     }
@@ -263,7 +302,7 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         .codex_signed_in = self.isCodexSignedIn(),
         .done = &self.pickers.models.load.loading.done,
     };
-    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
+    try model_loader_job.spawnLoadFuture(self, job);
 }
 
 /// Every OpenAI-compatible provider to fetch for a full catalogue reload:
@@ -385,6 +424,7 @@ pub fn appendConfigured(
 }
 
 pub const model_loader_job = @import("model_loader_job.zig");
+pub const registry_job = @import("registry_job.zig");
 pub const cancelModelLoad = model_loader_job.cancelModelLoad;
 pub const drainModelLoad = model_loader_job.drainModelLoad;
 pub const installModelLoadResult = model_loader_job.installModelLoadResult;
@@ -729,7 +769,7 @@ pub fn startOpenAiCompatibleModelLoad(
         .codex_signed_in = false,
         .done = &self.pickers.models.load.loading.done,
     };
-    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
+    try model_loader_job.spawnLoadFuture(self, job);
 }
 
 /// Incremental, merge-on-arrival load of a single provider's `/models`.
@@ -770,7 +810,7 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
         .codex_signed_in = self.isCodexSignedIn(),
         .done = &self.pickers.models.load.loading.done,
     };
-    self.pickers.models.load.loading.future = try self.io.concurrent(model_loader.run, .{job});
+    try model_loader_job.spawnLoadFuture(self, job);
 }
 
 pub fn applySelectedModel(self: *App) !void {
@@ -1673,4 +1713,78 @@ test "resolveProviderKey resolves typed, saved, and blank-required keys" {
     try std.testing.expect(resolveProviderKey(" \t", null, true) == null);
     // Blank + optional provider -> empty key (anonymous free-tier path).
     try std.testing.expectEqualStrings("", resolveProviderKey("", null, false).?);
+}
+
+test "buildMergedProviderList keeps old entries installed on OOM" {
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // First build installs a valid slice (builtin catalogue, no registry).
+    try buildMergedProviderList(&app, &.{});
+    const installed = app.provider_state.entries_slice.?;
+    const installed_len = installed.len;
+    try std.testing.expect(installed_len > 0);
+
+    // Every allocation failure during a rebuild must leave that exact slice
+    // installed and valid — freeing the old slice before the replacement
+    // alloc would leave entries_slice dangling (UAF now, double-free at
+    // deinit). The testing allocator flags both at process end.
+    var succeeded = false;
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
+        app.gpa = failing.allocator();
+        const result = buildMergedProviderList(&app, &.{});
+        app.gpa = gpa;
+        if (result) |_| {
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(installed, app.provider_state.entries_slice.?);
+            try std.testing.expectEqual(installed_len, app.pickers.provider.entries.len);
+        }
+    }
+    try std.testing.expect(succeeded);
+}
+
+test "openProviderPicker leaves mode unchanged when preparation fails" {
+    const test_helpers = @import("test_helpers.zig");
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Focused idle lane: no live runtime → refreshProviderApiKeys fails
+    // BEFORE the mode flip. Previously the mode was set first and the error
+    // left a half-open picker backed by stale entries.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "idle-open");
+    try std.testing.expect(app.liveRuntime() == null);
+    try std.testing.expectError(error.NoActiveRuntime, openProviderPicker(&app));
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+}
+
+test "rebuildProviderEntries merges registry providers and clamps selection" {
+    const agent_mod = @import("../agent.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Install a builtins-only registry (empty home → cache/vendored miss →
+    // builtin fallback) and rebuild: entries appear and a stale selection
+    // (the background registry refresh can shrink the list) clamps to 0.
+    app.provider_state.modelsdev_registry = modelsdev.loadRegistryCached(app.gpa, std.testing.io, "");
+    try std.testing.expect(app.provider_state.modelsdev_registry != null);
+    app.pickers.provider.selection = 99;
+    try rebuildProviderEntries(&app);
+    try std.testing.expect(app.pickers.provider.entries.len > 0);
+    try std.testing.expectEqual(@as(u32, 0), app.pickers.provider.selection);
 }

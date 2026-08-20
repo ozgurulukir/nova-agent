@@ -262,6 +262,10 @@ pub const ProviderState = struct {
     /// Models.dev dynamic provider registry, loaded on `/connect` open.
     /// Owned; freed in `deinit`.
     modelsdev_registry: ?modelsdev.Registry = null,
+    /// Background models.dev refresh (see registry_job.zig). The open path
+    /// installs the disk cache synchronously; this job keeps it fresh without
+    /// a blocking network fetch on the UI thread.
+    registry_refresh: RegistryRefreshState = .idle,
     /// Backing slice for provider picker's merged provider list. Owned; freed in `deinit`.
     entries_slice: ?[]const provider_picker.ProviderHandle = null,
     /// Per-model reasoning options from config, cached for the model picker.
@@ -275,6 +279,17 @@ pub const ProviderState = struct {
     /// True while the in-flight model load is a full connected-provider sweep,
     /// so the picker knows to reset `conn_status` when outcomes arrive.
     conn_recompute: bool = false,
+
+    /// Background refresh state machine for the models.dev registry. Mirrors
+    /// `ModelCatalogue.LoadState`'s "illegal combinations unrepresentable"
+    /// rule: an armed `.loading` always carries a spawned future.
+    pub const RegistryRefreshState = union(enum) {
+        idle,
+        loading: struct {
+            future: std.Io.Future(modelsdev.Registry),
+            done: std.atomic.Value(bool) = .init(false),
+        },
+    };
 };
 
 /// Inline edit buffers for text fields across overlays. Grouped to keep
