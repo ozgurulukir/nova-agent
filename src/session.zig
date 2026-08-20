@@ -1074,6 +1074,22 @@ test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
     }
 }
 
+test "initDefault creates directory and initializes database" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
+    var manager = try SessionManager.initDefault(gpa, std.testing.io, home_dir);
+    defer manager.deinit();
+
+    // Verify the file was actually created in the right spot
+    const expected_path = ".config/nova/sessions.sqlite";
+    try tmp.dir.access(std.testing.io, expected_path, .{});
+}
+
 test "create rejects session id with wrong length" {
     var manager = try SessionManager.init(std.testing.allocator, std.testing.io, ":memory:");
     defer manager.deinit();
