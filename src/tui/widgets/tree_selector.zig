@@ -97,6 +97,11 @@ pub const TreeState = struct {
     /// Direct-child count per node, indexed by node index. Structural property —
     /// computed once in `load`, constant across reflattens. Freed with nodes.
     child_count: []u32 = &.{},
+    visible_mask: std.ArrayListUnmanaged(bool) = .empty,
+    visible_parent: std.ArrayListUnmanaged(?usize) = .empty,
+    has_snap: std.ArrayListUnmanaged(bool) = .empty,
+    snap_id: std.ArrayListUnmanaged(?Id) = .empty,
+    child_lists: std.ArrayListUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) TreeState {
         return .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -116,6 +121,17 @@ pub const TreeState = struct {
         self.nodes = &.{};
         self.gpa.free(self.child_count);
         self.child_count = &.{};
+        self.visible_mask.deinit(self.gpa);
+        self.visible_mask = .empty;
+        self.visible_parent.deinit(self.gpa);
+        self.visible_parent = .empty;
+        self.has_snap.deinit(self.gpa);
+        self.has_snap = .empty;
+        self.snap_id.deinit(self.gpa);
+        self.snap_id = .empty;
+        for (self.child_lists.items) |*list| list.deinit(self.gpa);
+        self.child_lists.deinit(self.gpa);
+        self.child_lists = .empty;
     }
 
     /// Replace the tree from a session's entries (oldest-first). `leaf_id` marks
@@ -141,7 +157,7 @@ pub const TreeState = struct {
         }
         for (children) |*list| list.* = .empty;
 
-        var roots: std.ArrayList(usize) = .empty;
+        var roots: std.ArrayListUnmanaged(usize) = .empty;
         defer roots.deinit(self.gpa);
         for (records, 0..) |record, i| {
             if (record.parent_id) |parent_id| {
@@ -229,6 +245,13 @@ pub const TreeState = struct {
             }
         }
         self.child_count = counts;
+        try self.visible_mask.resize(self.gpa, self.nodes.len);
+        try self.visible_parent.resize(self.gpa, self.nodes.len);
+        try self.has_snap.resize(self.gpa, self.nodes.len);
+        try self.snap_id.resize(self.gpa, self.nodes.len);
+        const old_len = self.child_lists.items.len;
+        try self.child_lists.resize(self.gpa, self.nodes.len);
+        for (self.child_lists.items[old_len..]) |*list| list.* = .empty;
 
         try self.reflatten("");
         self.selection = self.leafSelection() orelse 0;
@@ -334,7 +357,8 @@ pub const TreeState = struct {
         // 1. Visibility mask: filter + search, minus fold-hidden subtrees.
         // Legacy `checkpoint`-kind entries (from old jj-era sessions) never appear
         // as their own rows.
-        const visible_mask = try arena.alloc(bool, self.nodes.len);
+        if (self.nodes.len > self.visible_mask.items.len) return error.OutOfMemory;
+        const visible_mask = self.visible_mask.items[0..self.nodes.len];
         for (self.nodes, 0..) |node, i| {
             const kind_ok = node.kind != .checkpoint and (node.is_leaf or self.kindPasses(node.kind));
             const search_ok = search.len == 0 or containsIgnoreCase(node.text, search);
@@ -347,22 +371,24 @@ pub const TreeState = struct {
         // snapshot in a row's collapsed segment wins (last-write), so the row maps
         // to the latest code state produced under it — which is what navigation
         // restores.
-        const visible_parent = try arena.alloc(?usize, self.nodes.len);
-        const has_snap = try arena.alloc(bool, self.nodes.len);
+        const visible_parent = self.visible_parent.items[0..self.nodes.len];
+        const has_snap = self.has_snap.items[0..self.nodes.len];
         @memset(has_snap, false);
-        const snap_id = try arena.alloc(?Id, self.nodes.len);
+        const snap_id = self.snap_id.items[0..self.nodes.len];
         @memset(snap_id, null);
-        const child_lists = try arena.alloc(std.ArrayList(usize), self.nodes.len);
-        for (child_lists) |*list| list.* = .empty;
-        var roots: std.ArrayList(usize) = .empty;
+        const child_lists = self.child_lists.items[0..self.nodes.len];
+        for (child_lists) |*list| list.clearRetainingCapacity();
+
+        var roots: std.ArrayListUnmanaged(usize) = .empty;
+        defer roots.deinit(self.gpa);
         for (self.nodes, 0..) |node, i| {
             if (visible_mask[i]) {
                 const ancestor = self.nearestVisibleAncestor(i, visible_mask);
                 visible_parent[i] = ancestor;
                 if (ancestor) |parent| {
-                    try child_lists[parent].append(arena, i);
+                    try child_lists[parent].append(self.gpa, i);
                 } else {
-                    try roots.append(arena, i);
+                    try roots.append(self.gpa, i);
                 }
                 if (node.has_snapshot) {
                     has_snap[i] = true;
