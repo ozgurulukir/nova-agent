@@ -352,6 +352,17 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
   `turn_started` events.
 - **file-watcher** — Event-driven plugin using `nova.on("tool_call_finished", ...)`
 - **hello-world** — Minimal tool registration (demo)
+- **sitting-duck** — tree-sitter ASTs as SQL over the `duckdb` CLI + the
+  `sitting_duck` community extension (auto-installed on first use): `ast_outline`
+  (glob → symbol list with `node_id` handles), `ast_find_pattern` (tree-sitter
+  S-expression structural search), `ast_get_source` (`node_id` → numbered source
+  snippet), `ast_query` (read-only SQL over `read_ast()` — single
+  SELECT/WITH statement; chained statements and dot-commands rejected).
+  State lives in `.nova/sitting-duck/` (bootstrap marker + the `query.sql`
+  debug artifact). First example consuming `plugin.get_config()` and
+  `nova.shell_quote`: binary resolution is
+  `plugins.sitting-duck.settings.duckdb_path` →
+  `NOVA_SITTING_DUCK_BIN` → `duckdb` on PATH. Linux-first.
 
 Each plugin ships a `prompt.md` whose body is injected into the system prompt
 (see the "prompt.md" section above), teaching the model when and how to use

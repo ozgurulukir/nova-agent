@@ -753,6 +753,9 @@ test "plugin manager: loads all shipped example plugins" {
         .{ .dir = "hello-world", .min_tools = 1 }, // greet (demo, at least one)
         .{ .dir = "file-watcher", .min_tools = 1 }, // track_file_op / file_stats
         .{ .dir = "todo", .min_tools = 9 }, // todo_list, todo_add, todo_done, todo_delete, todo_prioritize, todo_write, todo_get_plan, todo_set_plan, todo_check_step
+        // Zero I/O at load (bootstrap happens lazily inside tool handlers),
+        // so this load test needs no duckdb binary present.
+        .{ .dir = "sitting-duck", .min_tools = 4 }, // ast_outline, ast_find_pattern, ast_get_source, ast_query
     };
 
     var manager = PluginManager.init(testing.allocator, testing.io, "", "");

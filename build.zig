@@ -434,6 +434,7 @@ pub fn build(b: *std.Build) void {
         run_lua_tests.addArg("examples/plugins/file-watcher/test.lua");
         run_lua_tests.addArg("examples/plugins/path-tools/test.lua");
         run_lua_tests.addArg("examples/plugins/modular-demo/test.lua");
+        run_lua_tests.addArg("examples/plugins/sitting-duck/test.lua");
         lua_test_step.dependOn(&run_lua_tests.step);
     }
 
