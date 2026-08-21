@@ -25,7 +25,12 @@ return one row per AST node.
 2. Drill into one symbol with `ast_get_source` — pass the file plus the
    `node_id`; you get the exact numbered lines (plus optional context).
 3. Use `ast_find_pattern` for shape queries a name search can't express —
-   tree-sitter S-expressions like `(function_declaration name: (identifier) @fn)`.
+   a minimal code skeleton in the target language with `__NAME__` capture
+   wildcards: zig `fn __FN__(__) void {}`, python `def __F__(__):`.
+   Literals in the skeleton must match exactly; `__` is an anonymous
+   wildcard; the skeleton must parse in that language (zig needs the
+   return type). `language` is inferred from the glob's extension or
+   passed explicitly.
 4. Reserve `ast_query` for aggregates and joins (counts per file, GROUP BY,
    ast_match joins). It accepts ONE read-only statement that must start with
    SELECT or WITH — chained statements after a `;` and dot-command lines

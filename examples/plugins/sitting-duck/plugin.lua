@@ -5,7 +5,7 @@
 -- and nova.shell_quote.
 return {
   name = "sitting-duck",
-  version = "1.0.0",
+  version = "1.0.1",
   author = "Nova",
   description = "Query tree-sitter ASTs with SQL via the duckdb CLI and the sitting_duck extension",
   license = "MIT",

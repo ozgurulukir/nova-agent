@@ -354,8 +354,8 @@ shapes models already know from Claude Code / OpenCode / Zed agents:
 - **hello-world** — Minimal tool registration (demo)
 - **sitting-duck** — tree-sitter ASTs as SQL over the `duckdb` CLI + the
   `sitting_duck` community extension (auto-installed on first use): `ast_outline`
-  (glob → symbol list with `node_id` handles), `ast_find_pattern` (tree-sitter
-  S-expression structural search), `ast_get_source` (`node_id` → numbered source
+  (glob → symbol list with `node_id` handles), `ast_find_pattern` (structural
+  search via code-skeleton patterns with `__NAME__` wildcards), `ast_get_source` (`node_id` → numbered source
   snippet), `ast_query` (read-only SQL over `read_ast()` — single
   SELECT/WITH statement; chained statements and dot-commands rejected).
   State lives in `.nova/sitting-duck/` (bootstrap marker + the `query.sql`

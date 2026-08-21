@@ -38,8 +38,11 @@ local QUERY_TIMEOUT_S     = 60
 -- Queries assume the extension is installed. The bootstrap script has its
 -- own prelude (INSTALL before LOAD).
 local PRELUDE = ".mode json\nLOAD sitting_duck;\n"
--- Single edit point for read_ast schema drift.
-local COLS = "node_id, node_type, file_path, name, start_line, end_line"
+-- Single edit point for read_ast schema drift. Verified against the
+-- sitting_duck community extension (duckdb v1.5.5): the node-kind column
+-- is `type` (NOT node_type) — full rows also carry semantic_type (an enum:
+-- cast to VARCHAR to compare), language, parent_id, depth, peek, ...
+local COLS = "node_id, type, file_path, name, start_line, end_line"
 
 -- Session cache: false until the marker+version check (or a bootstrap)
 -- succeeds in this Lua state.
@@ -283,10 +286,10 @@ end
 local function outline_sql(glob, kinds, limit)
   local filters = {}
   for k in tostring(kinds or "function,class"):gmatch("[^,%s]+") do
-    table.insert(filters, "node_type LIKE " .. sql_str("%" .. k .. "%"))
+    table.insert(filters, "type LIKE " .. sql_str("%" .. k .. "%"))
   end
   if #filters == 0 then
-    table.insert(filters, "node_type LIKE " .. sql_str("%function%"))
+    table.insert(filters, "type LIKE " .. sql_str("%function%"))
   end
   return PRELUDE
     .. "SELECT " .. COLS .. "\n"
@@ -296,12 +299,44 @@ local function outline_sql(glob, kinds, limit)
     .. "LIMIT " .. string.format("%d", limit) .. ";\n"
 end
 
+-- ast_match's language parameter has no auto-detect (macro default is
+-- 'python'), so infer it from the glob's extension when the caller omits
+-- it. Only extensions whose sitting_duck language name is short and
+-- unambiguous are mapped; everything else must pass `language` explicitly.
+local LANG_BY_EXT = {
+  zig = "zig", py = "python", js = "javascript", mjs = "javascript",
+  ts = "typescript", tsx = "typescript", go = "go", rs = "rust",
+  c = "c", h = "c", cpp = "cpp", cc = "cpp", cxx = "cpp", hpp = "cpp",
+  java = "java", rb = "ruby", lua = "lua",
+}
+
+local function infer_language(glob)
+  local ext = glob:match("%.([%w]+)%s*$")
+  -- A glob's tail may carry pattern runes inside the "extension" ('*.z*');
+  -- only a clean extension maps.
+  if ext == nil or ext:find("[%*%?]") then return nil end
+  return LANG_BY_EXT[ext:lower()]
+end
+
 -- The ast_match call shape is centralized here: if the extension's
--- signature drifts, this one line is the fix (plus its pinned test).
-local function pattern_sql(pattern, glob, limit)
+-- signature drifts, this one block is the fix (plus its pinned test).
+-- Real signature (sitting_duck SQL macro, verified against duckdb v1.5.5):
+--   ast_match(source_glob, pattern_str, language)
+-- ast_match feeds `source` straight to read_ast(source, language) and the
+-- language macro-defaults to 'python' — with no explicit language, every
+-- non-python file under the glob is elided and the call dies with
+-- "read_ast needs at least one file to read". So the plugin ALWAYS passes
+-- the language, inferring it from the glob's extension when omitted.
+-- Output: one row per match — match_id, root_node_id (resolvable as a
+-- read_ast node_id; verified stable across invocations for the same file),
+-- file_path, start_line, end_line, peek, and a captures map
+-- (name → LIST of {capture, node_id, type, name, peek, start_line,
+-- end_line}).
+local function pattern_sql(pattern, glob, language, limit)
   return PRELUDE
-    .. "SELECT " .. COLS .. "\n"
-    .. "FROM ast_match(" .. sql_str(pattern) .. ", " .. sql_str(glob or "**/*") .. ")\n"
+    .. "SELECT root_node_id AS node_id, file_path, start_line, end_line, peek, captures\n"
+    .. "FROM ast_match(" .. sql_str(glob or "**/*") .. ", " .. sql_str(pattern)
+    .. ", " .. sql_str(language) .. ")\n"
     .. "ORDER BY file_path, start_line\n"
     .. "LIMIT " .. string.format("%d", limit) .. ";\n"
 end
@@ -310,7 +345,7 @@ end
 -- nova.read_file, not from SQL — one fewer extension surface to trust.
 local function span_sql(file, node_id)
   return PRELUDE
-    .. "SELECT node_id, node_type, name, start_line, end_line\n"
+    .. "SELECT node_id, type, name, start_line, end_line\n"
     .. "FROM read_ast(" .. sql_str(file) .. ")\n"
     .. "WHERE node_id = " .. sql_str(tostring(node_id)) .. "\n"
     .. "LIMIT 1;\n"
@@ -457,8 +492,8 @@ local function shape_outline(rows, glob, limit)
     end
     table.insert(out, string.format("  L%d-%d %s %s (node_id: %s)",
       tonumber(r.start_line) or 0, tonumber(r.end_line) or 0,
-      truncate_cell(r.node_type or "?", 30),
-      truncate_cell(r.name or r.node_type or "?", 60),
+      truncate_cell(r.type or "?", 30),
+      truncate_cell(r.name or r.type or "?", 60),
       tostring(r.node_id or "?")))
   end
   if #rows >= limit then
@@ -478,10 +513,23 @@ local function shape_pattern(rows, pattern)
   table.insert(out, string.format("## Structural matches — %s (%d shown)",
     truncate_cell(pattern, 60), #rows))
   for _, r in ipairs(rows) do
-    table.insert(out, string.format("%s:L%d %s %s (node_id: %s)",
-      tostring(r.file_path or "?"), tonumber(r.start_line) or 0,
-      truncate_cell(r.node_type or "?", 30),
-      truncate_cell(r.name or "-", 40),
+    -- captures is a map: name → LIST of {capture, node_id, type, name,
+    -- peek, start_line, end_line}. Render the first entry per name,
+    -- sorted — JSON object key order is not contractual.
+    local caps = {}
+    for cname, list in pairs(r.captures or {}) do
+      local c = (type(list) == "table") and list[1] or nil
+      if type(c) == "table" then
+        table.insert(caps, string.format("%s=%s (%s)", cname,
+          truncate_cell(tostring(c.name or "?"), 40),
+          truncate_cell(tostring(c.type or "?"), 30)))
+      end
+    end
+    table.sort(caps)
+    local cap_str = (#caps > 0) and (" " .. table.concat(caps, " ")) or ""
+    table.insert(out, string.format("%s:L%d-%d%s node_id: %s",
+      tostring(r.file_path or "?"),
+      tonumber(r.start_line) or 0, tonumber(r.end_line) or 0, cap_str,
       tostring(r.node_id or "?")))
   end
   return table.concat(out, "\n")
@@ -490,7 +538,7 @@ end
 local function shape_span(node, file, content, first_line)
   local out = {}
   table.insert(out, string.format("%s %s — %s L%d-L%d",
-    tostring(node.node_type or "node"),
+    tostring(node.type or "node"),
     tostring(node.name or "(anonymous)"),
     file, tonumber(node.start_line) or 0, tonumber(node.end_line) or 0))
   table.insert(out, "")
@@ -600,25 +648,38 @@ nova.register_tool({
 
 nova.register_tool({
   name = "ast_find_pattern",
-  description = "Structural code search: find AST nodes matching a"
-    .. " tree-sitter S-expression query such as '(function_definition"
-    .. " name: (identifier) @fn)', optionally scoped to a file glob. Finds"
-    .. " code shapes regex cannot (nesting, named captures). Returns file,"
-    .. " line, node type, name, and a node_id handle per match. Requires"
-    .. " the duckdb CLI (plugins.sitting-duck.settings.duckdb_path /"
-    .. " NOVA_SITTING_DUCK_BIN / PATH). LIMIT defaults to 50 (max 200);"
-    .. " output hard-capped at 512KB.",
+  description = "Structural code search with sitting_duck's text patterns:"
+    .. " write a minimal code skeleton in the target language and mark the"
+    .. " parts to capture with __NAME__ wildcards (uppercase names) or __"
+    .. " (anonymous); every literal in the skeleton must match exactly."
+    .. " Examples: zig 'fn __FN__(__) void {}' finds void-returning"
+    .. " functions (zig skeletons need the return type to parse), python"
+    .. " 'def __F__(__):'. language is inferred from the glob's extension"
+    .. " (.zig → zig, .py → python, ...) or passed explicitly. Returns one"
+    .. " row per match: file, line span, captures, and the matched root's"
+    .. " node_id — usable with ast_get_source. Requires the duckdb CLI"
+    .. " (plugins.sitting-duck.settings.duckdb_path / NOVA_SITTING_DUCK_BIN"
+    .. " / PATH). LIMIT defaults to 50 (max 200); output hard-capped at"
+    .. " 512KB.",
   parameters = {
     pattern = {
       type = "string",
-      description = "Tree-sitter S-expression query, e.g."
-        .. " '(function_declaration name: (identifier) @fn)'",
+      description = "Code skeleton in the target language with __NAME__"
+        .. " wildcards, e.g. 'fn __FN__(__) void {}' (zig) or"
+        .. " 'def __F__(__):' (python)",
     },
     glob = {
       type = "string",
       optional = true,
       default = "**/*",
       description = "File glob to search",
+    },
+    language = {
+      type = "string",
+      optional = true,
+      description = "sitting_duck language name (zig, python, typescript,"
+        .. " ...). Inferred from the glob's extension when omitted;"
+        .. " required for extension-less globs like '**/*'",
     },
     limit = {
       type = "number",
@@ -630,12 +691,21 @@ nova.register_tool({
   handler = function(params)
     local pattern = params.pattern
     if type(pattern) ~= "string" or trim(pattern) == "" then
-      return "Error: pattern is required (a tree-sitter S-expression query)."
+      return "Error: pattern is required (a code skeleton with __NAME__"
+        .. " wildcards, e.g. 'fn __FN__(__) void {}')."
     end
     local glob = params.glob or "**/*"
     if not safe_rel_path(glob) then return path_error("glob") end
+    local language = trim(tostring(params.language or ""))
+    if language == "" then
+      language = infer_language(glob) or ""
+    end
+    if language == "" then
+      return "Error: language is required for this glob (no recognizable"
+        .. " file extension) — pass it explicitly, e.g. 'zig' or 'python'."
+    end
     local limit = clamp_limit(params.limit)
-    local rows, err = run_query(pattern_sql(pattern, glob, limit))
+    local rows, err = run_query(pattern_sql(pattern, glob, language, limit))
     if rows == nil then return err end
     return shape_pattern(rows, pattern)
   end,
@@ -713,9 +783,12 @@ nova.register_tool({
   name = "ast_query",
   description = "Escape hatch: run raw DuckDB SQL against the sitting_duck"
     .. " read_ast() table — aggregates, joins, and counts the dedicated"
-    .. " tools cannot express. Columns include node_id, node_type,"
-    .. " file_path, name, start_line, end_line, plus predicates via"
-    .. " ast_match(...). One READ-ONLY statement per call: it must start"
+    .. " tools cannot express. Columns include node_id, type, name,"
+    .. " file_path, language, start_line, end_line, semantic_type (an enum —"
+    .. " cast to VARCHAR to compare), parent_id, depth, peek. Structural"
+    .. " predicates via ast_match(glob, pattern, language) — the language is"
+    .. " NOT auto-detected there (it defaults to 'python'). One READ-ONLY"
+    .. " statement per call: it must start"
     .. " with SELECT or WITH; chained statements after a ';' and"
     .. " dot-command lines (.shell, .output, ...) are rejected —"
     .. " COPY/INSTALL/ATTACH/EXPORT cannot run. Reads inside the SQL are"
