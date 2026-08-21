@@ -633,7 +633,7 @@ pub const AgentRuntime = struct {
         const client = try self.gpa.create(ai.codex_responses.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
-            .base_url = "https://chatgpt.com/backend-api",
+            .base_url = ai.codex_responses.default_codex_endpoint,
             .api_key = credentials.access,
             .model = model_id,
             .tools = tools_mod.builtinRegistry(),
@@ -654,7 +654,7 @@ pub const AgentRuntime = struct {
         attach_compaction: {
             const compaction_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_compaction;
             compaction_client.init(self.gpa, self.io, .{
-                .base_url = "https://chatgpt.com/backend-api",
+                .base_url = ai.codex_responses.default_codex_endpoint,
                 .api_key = credentials.access,
                 .model = model_id,
                 .tools = &.{},
@@ -675,7 +675,7 @@ pub const AgentRuntime = struct {
         attach_naming: {
             const naming_client = self.gpa.create(ai.codex_responses.Client) catch break :attach_naming;
             naming_client.init(self.gpa, self.io, .{
-                .base_url = "https://chatgpt.com/backend-api",
+                .base_url = ai.codex_responses.default_codex_endpoint,
                 .api_key = credentials.access,
                 .model = model_id,
                 .tools = &.{},
@@ -742,8 +742,8 @@ pub const AgentRuntime = struct {
             .wire_dialect = self.wire_dialect,
             .is_reasoning_model = compaction.isReasoningModel(model_info),
             .max_output_tokens = self.context_settings.max_output_tokens,
-            .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse 16,
-            .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
+            .max_parallel_tool_calls = self.context_settings.max_parallel_tool_calls orelse ai.default_max_parallel_tool_calls,
+            .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
             .disable_prompt_cache = self.disable_prompt_cache,
             .session_id = self.session_writer.session.id.slice(),
         });
@@ -770,7 +770,7 @@ pub const AgentRuntime = struct {
                 // reasoning_effort) and honor the user's request timeout (H2).
                 .wire_dialect = self.wire_dialect,
                 .is_reasoning_model = compaction.isReasoningModel(model_info),
-                .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse 300,
+                .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
                 .disable_prompt_cache = self.disable_prompt_cache,
             }) catch {
                 self.gpa.destroy(compaction_client);

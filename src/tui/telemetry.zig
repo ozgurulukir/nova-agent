@@ -11,6 +11,13 @@
 
 const std = @import("std");
 
+/// Samples closer together than this are skipped so a burst of per-frame
+/// calls doesn't over-smooth the velocity gauge.
+const velocity_min_sample_interval_ns: i128 = 200 * std.time.ns_per_ms;
+/// Context-meter bar block count; █/░ are 3-byte UTF-8, hence the ×3 scratch
+/// buffer in `formatContextBar`.
+const bar_blocks: usize = 10;
+
 /// Context-meter severity. The caller resolves this to a palette color; the
 /// meter itself stays pure data (color knowledge lives in `style.zig`).
 pub const MeterLevel = enum { normal, warn, alert };
@@ -28,7 +35,7 @@ pub const TelemetryTracker = struct {
     /// turn end) safe.
     pub fn updateVelocity(self: *TelemetryTracker, now_ns: i128, total_tokens: usize, alpha: f64) void {
         const delta_ns = now_ns - self.last_sample_ns;
-        if (delta_ns < 200 * std.time.ns_per_ms) return;
+        if (delta_ns < velocity_min_sample_interval_ns) return;
         const delta_tokens = total_tokens -| self.last_token_count;
         const delta_sec = @as(f64, @floatFromInt(delta_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
         const instant_rate = @as(f64, @floatFromInt(delta_tokens)) / delta_sec;
@@ -49,16 +56,16 @@ pub const TelemetryTracker = struct {
         if (max_tokens == 0) return .{ .text = "", .level = .normal };
         const fraction = @as(f64, @floatFromInt(used_tokens)) / @as(f64, @floatFromInt(max_tokens));
         const clamped = @min(@max(fraction, 0.0), 1.0);
-        const filled_blocks: usize = @intFromFloat(clamped * 10.0);
+        const filled_blocks: usize = @intFromFloat(clamped * @as(f64, @floatFromInt(bar_blocks)));
         const used_k = @as(f64, @floatFromInt(used_tokens)) / 1000.0;
         const max_k = @as(f64, @floatFromInt(max_tokens)) / 1000.0;
         const percent: usize = @intFromFloat(clamped * 100.0);
         const level: MeterLevel = if (clamped >= alert) .alert else if (clamped >= warn) .warn else .normal;
 
-        // Build the 10-block bar into a scratch buffer (█/░ are 3-byte UTF-8).
-        var blocks: [30]u8 = undefined;
+        // Build the bar into a scratch buffer (█/░ are 3-byte UTF-8).
+        var blocks: [bar_blocks * 3]u8 = undefined;
         var bn: usize = 0;
-        for (0..10) |i| {
+        for (0..bar_blocks) |i| {
             const block: []const u8 = if (i < filled_blocks) "█" else "░";
             @memcpy(blocks[bn..][0..3], block);
             bn += 3;

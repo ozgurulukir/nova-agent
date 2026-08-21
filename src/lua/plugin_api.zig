@@ -41,6 +41,11 @@ const max_read_size: usize = 1 * 1024 * 1024;
 
 /// Maximum results for search_files.
 const max_search_results: u32 = 200;
+/// Default result cap for find_files when the caller omits `max_results`; an
+/// explicit value is clamped by `max_search_results` above.
+const find_files_default_max_results: u32 = 100;
+/// Line-content truncation for search_files results.
+const search_line_truncate_bytes: usize = 200;
 
 /// Language map for file extension → language name.
 const lang_map = std.StaticStringMap([]const u8).initComptime(.{
@@ -607,7 +612,7 @@ pub fn findFiles(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    var max_results: u32 = 100;
+    var max_results: u32 = find_files_default_max_results;
     if (state.getTop() >= 3 and state.isTable(3)) {
         if (bridge.getTableInteger(&state, 3, "max_results")) |v| {
             max_results = @min(@as(u32, @intCast(@max(v, 1))), max_search_results);
@@ -2853,7 +2858,7 @@ fn walkAndSearch(
                             _ = c.lua_setfield(L_ptr, -2, "file");
                             st.pushInteger(@as(i64, @intCast(line_num)));
                             _ = c.lua_setfield(L_ptr, -2, "line");
-                            const truncated = if (line.len > 200) line[0..200] else line;
+                            const truncated = if (line.len > search_line_truncate_bytes) line[0..search_line_truncate_bytes] else line;
                             st.pushString(truncated);
                             _ = c.lua_setfield(L_ptr, -2, "content");
                             _ = c.lua_rawseti(L_ptr, -2, @as(c_int, @intCast(result_count.*)));

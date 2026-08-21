@@ -38,6 +38,7 @@ const os = @import("../os.zig");
 const assert = std.debug.assert;
 
 const bash_exec = @import("bash_exec.zig");
+const temp_files = @import("temp_files.zig");
 
 pub const Result = struct {
     stdout: []u8,
@@ -145,7 +146,7 @@ fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8
     var random: [16]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-pwsh-script-{s}.ps1", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, temp_files.pwsh_prefix ++ "script-{s}.ps1", .{hex[0..]});
     defer gpa.free(name);
     const path = try bash_exec.namedTempPath(gpa, name);
     errdefer gpa.free(path);
@@ -437,7 +438,7 @@ fn tempSpillPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var random: [16]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-pwsh-{s}.log", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, temp_files.pwsh_prefix ++ "{s}.log", .{hex[0..]});
     defer gpa.free(name);
     const dir = try bash_exec.tempDir(gpa);
     defer gpa.free(dir);

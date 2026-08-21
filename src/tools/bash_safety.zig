@@ -10,11 +10,12 @@
 //! provides defense-in-depth against obviously destructive commands.
 
 const std = @import("std");
+const http = @import("../http.zig");
 
 const assert = std.debug.assert;
 
 const response_bytes_max: u32 = 4096;
-const redirect_buffer_bytes: u32 = 8192;
+const redirect_buffer_bytes = http.redirect_buffer_bytes;
 
 pub const Verdict = enum {
     safe,
@@ -358,13 +359,12 @@ fn classifyFallible(
         .redirect_buffer = &redirect_buffer,
         .keep_alive = true,
         .headers = .{
-            .content_type = .{ .override = "application/json" },
+            .content_type = .{ .override = http.content_type_json },
         },
     });
     if (response_body.written().len > response_bytes_max) return error.ResponseTooLarge;
     const status_code: u16 = @intFromEnum(status.status);
-    if (status_code < 200) return error.HttpUnexpectedStatus;
-    if (status_code >= 300) return error.HttpUnexpectedStatus;
+    if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
     return parseResponse(gpa, response_body.written());
 }
 

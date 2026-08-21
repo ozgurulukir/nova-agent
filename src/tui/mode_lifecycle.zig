@@ -128,19 +128,16 @@ pub fn cancelMode(app: *App) !bool {
 /// idle lane (`lane create` / a rested worker).
 fn refuseOnIdleLane(app: *App) bool {
     if (app.liveRuntime() != null) return false;
-    const id = if (lanes_util.workingLaneOf(app.thread)) |w|
-        lanes_util.lastPathSegment(w.path)
-    else
-        "this lane";
+    const id = lanes_util.idleLaneId(app.thread);
     // Stack-buffer formatting: a refusal must never itself fail (the previous
     // allocPrint-based version silently refused without a notice on OOM), so
     // fall back to a static literal when the id doesn't fit.
     var buffer: [192]u8 = undefined;
     const notice = std.fmt.bufPrint(
         &buffer,
-        "Lane {s} is idle — no agent is attached. From the driver, `lane enter {s}` to work here, or `lane spawn` to start a worker in it.\n",
+        lanes_util.idle_lane_notice_template,
         .{ id, id },
-    ) catch "This lane is idle — no agent is attached. From the driver, use `lane enter` or `lane spawn`.\n";
+    ) catch lanes_util.idle_lane_notice_fallback;
     _ = app.thread.transcript.append(app.gpa, .notice, "lane", notice) catch {};
     return true;
 }

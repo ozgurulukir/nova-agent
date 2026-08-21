@@ -35,6 +35,17 @@ const Compactor = agent_compactor.Compactor;
 /// path backs off (emitting one notice); the manual `/compact` command is
 /// never gated (TD-6).
 pub const compaction_failure_limit: u32 = 3;
+/// Upper bound on tool-call iterations in one `run` — a runaway model loop
+/// terminates with an error instead of spinning the turn forever.
+const tool_call_limit_per_turn: u32 = 100;
+/// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
+/// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
+/// little gain; a comptime constant is simpler.
+const coalesce_threshold_bytes: usize = 1024;
+/// Defensive bound for the manual-compaction completion poll: 1000 yields
+/// before giving up with `error.CompactionNotReady` (a state that never
+/// resolves, e.g. a torn-down client the poll failed to clear).
+const manual_compact_poll_spins_max: u32 = 1000;
 
 pub const Agent = struct {
     gpa: std.mem.Allocator,
@@ -479,9 +490,8 @@ pub const Agent = struct {
         const L = Agent.Listener(Ctx);
         const l: L = listener;
         try l.emit(.turn_started);
-        const tool_call_limit = 100;
         var calls: u32 = 0;
-        while (calls < tool_call_limit) : (calls += 1) {
+        while (calls < tool_call_limit_per_turn) : (calls += 1) {
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .agent = self,
@@ -756,10 +766,6 @@ pub const Agent = struct {
             reasoning_sized: bool = false,
 
             const Self = @This();
-            /// Byte threshold at which a pending buffer flushes mid-stream.
-            /// ~2s of text at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds
-            /// surface area for little gain; a comptime constant is simpler.
-            const coalesce_threshold_bytes: usize = 1024;
 
             fn deinit(self: *Self) void {
                 // Belt-and-suspenders flush: frees + flushes any bytes stranded
@@ -829,7 +835,7 @@ pub const Agent = struct {
                 if (ctx.pending_reasoning.items.len > 0) try ctx.flushPending();
                 try ctx.maybeSizeContent(delta);
                 try ctx.pending_content.appendSlice(ctx.agent.gpa, delta);
-                if (ctx.pending_content.items.len >= StreamContext(L).coalesce_threshold_bytes) {
+                if (ctx.pending_content.items.len >= coalesce_threshold_bytes) {
                     try ctx.flushPending();
                 }
             }
@@ -844,7 +850,7 @@ pub const Agent = struct {
                 if (ctx.pending_content.items.len > 0) try ctx.flushPending();
                 try ctx.maybeSizeReasoning(delta);
                 try ctx.pending_reasoning.appendSlice(ctx.agent.gpa, delta);
-                if (ctx.pending_reasoning.items.len >= StreamContext(L).coalesce_threshold_bytes) {
+                if (ctx.pending_reasoning.items.len >= coalesce_threshold_bytes) {
                     try ctx.flushPending();
                 }
             }
@@ -1222,10 +1228,11 @@ pub const Agent = struct {
         // A deferred start (a stale auto-run was still producing) resolves on
         // the first poll; loop until the manual run lands. The poll returns
         // non-null or an error once the state resolves, so this always
-        // terminates. 1000 yields is a defensive bound against a state that
-        // never resolves (e.g. a torn-down client the poll failed to clear).
+        // terminates. The yield bound is a defensive guard against a state
+        // that never resolves (e.g. a torn-down client the poll failed to
+        // clear).
         var spins: u32 = 0;
-        while (spins < 1000) : (spins += 1) {
+        while (spins < manual_compact_poll_spins_max) : (spins += 1) {
             if (try self.pollManualCompact()) |info| return info;
             std.Thread.yield() catch {};
         }

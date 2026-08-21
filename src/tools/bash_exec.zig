@@ -1,5 +1,6 @@
 const std = @import("std");
 const os = @import("../os.zig");
+const temp_files = @import("temp_files.zig");
 
 const assert = std.debug.assert;
 
@@ -374,7 +375,7 @@ fn tempSpillPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var random: [16]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-bash-{s}.log", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, temp_files.bash_spill_prefix ++ "{s}.log", .{hex[0..]});
     defer gpa.free(name);
     const dir = try tempDir(gpa);
     defer gpa.free(dir);
@@ -420,6 +421,7 @@ const login_env_dump =
     "printf '\\0__NOVA_LOGIN_ENV__\\0'; " ++
     "for k in $(compgen -e); do case \"$k\" in PWD|OLDPWD) continue ;; esac; printf '%s=%s\\0' \"$k\" \"${!k}\"; done";
 const login_env_bytes_limit: usize = 1024 * 1024;
+const login_env_stderr_limit: usize = 64 * 1024;
 const login_env_timeout_seconds: u32 = 10;
 
 var login_env_cache: ?[]const u8 = null;
@@ -445,7 +447,7 @@ fn captureLoginEnv(io: std.Io) ![]const u8 {
     var result = try std.process.run(gpa, io, .{
         .argv = &.{ bashPath(io), "-lc", login_env_dump },
         .stdout_limit = .limited(login_env_bytes_limit),
-        .stderr_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(login_env_stderr_limit),
         .timeout = timeoutFromSeconds(login_env_timeout_seconds),
     });
     defer gpa.free(result.stdout);
@@ -508,10 +510,11 @@ pub fn pruneStaleTempFiles(io: std.Io, gpa: std.mem.Allocator, max_age_ns: u64) 
 }
 
 /// The dir-parameterized core of `pruneStaleTempFiles`, separated so tests can
-/// target a scratch dir instead of the shared temp dir. Prefix-scoped (matches
-/// only `nova-bash-`/`nova-pwsh-`/`nova-bg_`, not bare `nova-`) so unrelated
-/// temp files are untouched; mtime is compared against the wall clock (`.real`);
-/// every operation is `catch`-tolerant so cleanup can never break startup.
+/// target a scratch dir instead of the shared temp dir. Prefix-scoped via
+/// `temp_files.isPrunable` (the writers' prefixes, never bare `nova-`) so
+/// unrelated temp files are untouched; mtime is compared against the wall clock
+/// (`.real`); every operation is `catch`-tolerant so cleanup can never break
+/// startup.
 fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
@@ -522,10 +525,7 @@ fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     while (iter.next(io) catch null) |entry| {
         if (entry.kind != .file and entry.kind != .unknown) continue;
         const name = entry.name;
-        const match = std.mem.startsWith(u8, name, "nova-bash-") or
-            std.mem.startsWith(u8, name, "nova-pwsh-") or
-            std.mem.startsWith(u8, name, "nova-bg_");
-        if (!match) continue;
+        if (!temp_files.isPrunable(name)) continue;
         const st = dir.statFile(io, name, .{}) catch continue;
         const age_ns = st.mtime.durationTo(now).nanoseconds;
         if (age_ns > 0 and @as(u128, @intCast(age_ns)) > max_age_ns) {

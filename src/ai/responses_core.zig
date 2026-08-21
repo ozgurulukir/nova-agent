@@ -7,6 +7,7 @@ const std = @import("std");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
+const http = @import("../http.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const openai_compatible = @import("openai_compatible.zig");
 const stream_part = @import("stream_part.zig");
@@ -28,9 +29,9 @@ pub const ResponseEventSpec = responses_events.ResponseEventSpec;
 pub const response_event_specs = responses_events.response_event_specs;
 pub const responseEventFromString = responses_events.responseEventFromString;
 
-const redirect_buffer_bytes: u32 = 8192;
-const transfer_buffer_bytes: u32 = 4096;
-const body_buffer_bytes: u32 = 4096;
+const redirect_buffer_bytes = http.redirect_buffer_bytes;
+const transfer_buffer_bytes = http.transfer_buffer_bytes;
+const body_buffer_bytes = http.body_buffer_bytes;
 
 pub const ResponsesConfig = struct {
     pub const HeaderValue = union(enum) {
@@ -76,7 +77,7 @@ pub const Client = struct {
         std.debug.assert(config.model.len > 0);
         const url = try responsesUrl(gpa, config.base_url, responses_config);
         errdefer gpa.free(url);
-        const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{config.api_key});
+        const authorization = try std.fmt.allocPrint(gpa, "{s}{s}", .{ http.bearer_prefix, config.api_key });
         errdefer gpa.free(authorization);
         var owned_config = config;
         owned_config.base_url = "";
@@ -149,7 +150,7 @@ pub const Client = struct {
         var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = .{ .override = self.authorization },
-                .content_type = .{ .override = "application/json" },
+                .content_type = .{ .override = http.content_type_json },
                 .user_agent = if (self.responses_config.user_agent) |value| .{ .override = value } else .default,
             },
             .extra_headers = extra_headers,
@@ -159,7 +160,7 @@ pub const Client = struct {
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
         try writeRequestPayload(&payload.writer, self.config, self.responses_config, messages, self.tools_json);
-        log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, logBytes(payload.written()) });
+        log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, http.logBytesHead(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
         var body_writer = try req.sendBodyUnflushed(&body_buffer);
@@ -177,11 +178,11 @@ pub const Client = struct {
             var error_body: std.Io.Writer.Allocating = .init(self.gpa);
             defer error_body.deinit();
             _ = error_reader.streamRemaining(&error_body.writer) catch 0;
-            log.warn("responses.response.error status={d} body={s}", .{ status_code, logBytes(error_body.written()) });
+            log.warn("responses.response.error status={d} body={s}", .{ status_code, http.logBytesHead(error_body.written()) });
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
-        if (status_code < 200 or status_code >= 300) return error.HttpUnexpectedStatus;
+        if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
@@ -221,14 +222,8 @@ fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype,
     var source: stream_part.Source = .{ .reader = reader };
     while (try source.next(gpa)) |data| {
         defer gpa.free(data);
-        log.info("responses.response.sse data={s}", .{logBytes(data)});
+        log.info("responses.response.sse data={s}", .{http.logBytesHead(data)});
         try state.processJson(gpa, data, observer, call_seq);
     }
     return try state.finish(gpa, call_seq);
-}
-
-fn logBytes(bytes: []const u8) []const u8 {
-    const limit = 12 * 1024;
-    if (bytes.len <= limit) return bytes;
-    return bytes[0..limit];
 }

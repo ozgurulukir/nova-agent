@@ -7,6 +7,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 
 from .catalog import CATALOG, download_model, load_classifier
+from .defaults import DEFAULT_BIND_HOST, DEFAULT_BIND_PORT, DEFAULT_MODEL
 from .models.base import BaseClassifier, ClassifyRequest, ClassifyResponse
 
 
@@ -63,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     serve_parser.add_argument(
         "--model",
         choices=list(CATALOG.keys()),
-        default="modernbert",
-        help="Model preset to serve (default: modernbert)",
+        default=DEFAULT_MODEL,
+        help=f"Model preset to serve (default: {DEFAULT_MODEL})",
     )
     serve_parser.add_argument(
         "--path",
@@ -72,8 +73,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Custom path to an ONNX model directory or .onnx file",
     )
-    serve_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    serve_parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    serve_parser.add_argument("--host", default=DEFAULT_BIND_HOST, help=f"Bind host (default: {DEFAULT_BIND_HOST})")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_BIND_PORT, help=f"Bind port (default: {DEFAULT_BIND_PORT})")
     serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
 
     # Download subcommand
@@ -81,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     download_parser.add_argument(
         "--model",
         choices=[k for k, v in CATALOG.items() if v.repo_id],
-        default="modernbert",
+        default=DEFAULT_MODEL,
         help="Model preset to download",
     )
 

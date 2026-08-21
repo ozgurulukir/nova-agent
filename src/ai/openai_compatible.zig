@@ -3,6 +3,7 @@ const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
 const os = @import("../os.zig");
+const http = @import("../http.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const stream_parser = @import("stream_parser.zig");
@@ -10,12 +11,15 @@ const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
 const tools_mod = @import("../tools.zig");
 
-const redirect_buffer_bytes: u32 = 8192;
-const transfer_buffer_bytes: u32 = 4096;
-const body_buffer_bytes: u32 = 4096;
+const redirect_buffer_bytes = http.redirect_buffer_bytes;
+const transfer_buffer_bytes = http.transfer_buffer_bytes;
+const body_buffer_bytes = http.body_buffer_bytes;
 /// Upper bound on exponential retry backoff, in milliseconds. A server-sent
 /// `Retry-After` header is honored verbatim (not capped here).
 const retry_max_delay_ms: u64 = 8000;
+/// Raw-body fallback cap for `extractErrorMessage` when the error body is not
+/// JSON or carries none of the known message shapes.
+const error_detail_cap_bytes: usize = 600;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -67,7 +71,7 @@ pub const Client = struct {
         // Empty key => anonymous request. Keep `authorization` null so `prompt`
         // omits the header entirely.
         const authorization: ?[]u8 = if (config.api_key.len > 0)
-            try std.fmt.allocPrint(gpa, "Bearer {s}", .{config.api_key})
+            try std.fmt.allocPrint(gpa, "{s}{s}", .{ http.bearer_prefix, config.api_key })
         else
             null;
         errdefer if (authorization) |a| gpa.free(a);
@@ -300,7 +304,7 @@ pub const Client = struct {
         var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
-                .content_type = .{ .override = "application/json" },
+                .content_type = .{ .override = http.content_type_json },
             },
             .extra_headers = extra_headers[0..extra_count],
         }) catch |err| return self.headPhaseFailure(err);
@@ -330,7 +334,7 @@ pub const Client = struct {
         if (status_code >= 400) {
             // Read `Retry-After` before initializing the body reader — the
             // head pointers are invalidated once the body stream starts.
-            if (status_code == 429 or status_code >= 500) {
+            if (isRetryableHeadStatus(status_code)) {
                 retry_after_secs.* = parseRetryAfterSeconds(http_response.head.bytes);
             }
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
@@ -346,7 +350,7 @@ pub const Client = struct {
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
-        if (status_code < 200 or status_code >= 300) return error.HttpUnexpectedStatus;
+        if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
 
         // Socket-level read timeout: prevents indefinite hangs when the
         // server stops mid-stream. Applied after the head is received so
@@ -441,6 +445,13 @@ pub const Client = struct {
     }
 };
 
+/// Head-phase statuses worth retrying: 429 (rate limit) and 5xx (server). The
+/// error returns keep 429 → HttpRateLimited and 5xx → HttpServerError as
+/// distinct errors; this predicate only gates the shared `Retry-After` read.
+fn isRetryableHeadStatus(status: u16) bool {
+    return status == 429 or status >= 500;
+}
+
 /// Extract an integer-seconds `Retry-After` value from a raw HTTP head.
 /// HTTP-date formatted values are out of scope and yield null (gateways
 /// practically send integer seconds). Pure — tested directly.
@@ -468,7 +479,7 @@ fn parseRetryAfterSeconds(head_bytes: []const u8) ?u64 {
 /// tools array past the head — caller frees nothing) or a freshly
 /// allocated slice (caller frees via `gpa` when `result.ptr != bytes.ptr`).
 fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const limit = 12 * 1024;
+    const limit = http.log_head_bytes_max;
     if (bytes.len <= limit) return bytes;
     // Look for the tools array past the head — the common debug target when
     // triaging "the model can't call tools" reports. The tools array is
@@ -476,7 +487,7 @@ fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     // already pushes it past the head.
     if (std.mem.indexOf(u8, bytes, "\"tools\":")) |pos| {
         if (pos >= limit) {
-            const tail_max: usize = 4096;
+            const tail_max: usize = http.log_tail_bytes_max;
             const tail_end = @min(bytes.len, pos + tail_max);
             return std.fmt.allocPrint(gpa, "{s}\n   [...{d} bytes truncated...]\n   {s}", .{
                 bytes[0..limit],
@@ -494,8 +505,7 @@ fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 /// isn't JSON or has none of those. Returned slice is owned by `gpa`.
 fn extractErrorMessage(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
-    const cap = 600;
-    const fallback = trimmed[0..@min(trimmed.len, cap)];
+    const fallback = trimmed[0..@min(trimmed.len, error_detail_cap_bytes)];
 
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch
         return gpa.dupe(u8, if (fallback.len > 0) fallback else "(empty response body)");

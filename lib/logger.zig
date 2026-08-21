@@ -24,7 +24,9 @@ const entry_count_max: u32 = 256;
 const entry_bytes_max: u32 = 16 * 1024;
 
 /// Default log-file rotation cap (10 MB), overridable via `NOVA_LOG_MAX_BYTES`.
-const default_max_bytes: u64 = 10 * 1024 * 1024;
+/// `pub` so the env fallback in `root.resolveMaxBytes` references the same
+/// value instead of re-typing it.
+pub const default_max_bytes: u64 = 10 * 1024 * 1024;
 
 const Entry = struct {
     bytes: [entry_bytes_max]u8 = undefined,

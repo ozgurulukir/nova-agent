@@ -28,6 +28,21 @@ const SplitMode = config_mod.SplitMode;
 const Diagnostic = config_mod.Diagnostic;
 const LoadResult = config_mod.LoadResult;
 
+/// Default `TuiSettings` — the single source for the "still at its default?"
+/// sentinels in `applyTuiOverlay`, `hasNonDefaultTui`, and `writeTui` (same
+/// idiom as `d` in `hasNonDefaultContext`). Field initializers live in
+/// `config.zig`; comparing against `default_tui.<field>` instead of re-typed
+/// literals keeps serialization in lockstep when a default changes.
+const default_tui: TuiSettings = .{};
+
+/// Floor for `overrideContextWindow`/`contextWindow` parses — values below a
+/// real model window are treated as absent rather than clamped.
+const context_window_floor_tokens: u32 = 1024;
+/// Accepted band for `minSplitWidth`; out-of-band values are dropped (the
+/// field keeps its default), matching the toast-setting convention.
+const min_split_width_min: u16 = 80;
+const min_split_width_max: u16 = 500;
+
 const Provider = provider_types.Provider;
 const AdapterKind = provider_types.AdapterKind;
 const Model = provider_types.Model;
@@ -173,22 +188,22 @@ fn applyTuiOverlay(gpa: std.mem.Allocator, target: *Config, updates: TuiSettings
     // Only non-default values override — a default `updates` must leave the
     // target's stored settings intact (unrelated partial config writes route
     // through here with an all-default `tui`).
-    if (!updates.theme_live_preview) target.tui.theme_live_preview = false;
+    if (updates.theme_live_preview != default_tui.theme_live_preview) target.tui.theme_live_preview = updates.theme_live_preview;
     if (updates.custom_themes_dir) |s| {
         if (target.tui.custom_themes_dir) |old| gpa.free(old);
         target.tui.custom_themes_dir = try gpa.dupe(u8, s);
     }
-    if (!updates.fuzzy_highlight) target.tui.fuzzy_highlight = false;
-    if (updates.fuzzy_highlight_style != .accent) target.tui.fuzzy_highlight_style = updates.fuzzy_highlight_style;
+    if (updates.fuzzy_highlight != default_tui.fuzzy_highlight) target.tui.fuzzy_highlight = updates.fuzzy_highlight;
+    if (updates.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) target.tui.fuzzy_highlight_style = updates.fuzzy_highlight_style;
     // Layout + telemetry knobs: only non-default values override.
-    if (updates.split_mode != .dual) target.tui.split_mode = updates.split_mode;
-    if (updates.min_split_width != 140) target.tui.min_split_width = updates.min_split_width;
-    if (!updates.highlight_focused_border) target.tui.highlight_focused_border = false;
-    if (!updates.show_token_velocity) target.tui.show_token_velocity = false;
-    if (!updates.show_context_meter) target.tui.show_context_meter = false;
-    if (updates.velocity_smoothing_alpha != 0.35) target.tui.velocity_smoothing_alpha = updates.velocity_smoothing_alpha;
-    if (updates.context_threshold_warn != 0.70) target.tui.context_threshold_warn = updates.context_threshold_warn;
-    if (updates.context_threshold_alert != 0.85) target.tui.context_threshold_alert = updates.context_threshold_alert;
+    if (updates.split_mode != default_tui.split_mode) target.tui.split_mode = updates.split_mode;
+    if (updates.min_split_width != default_tui.min_split_width) target.tui.min_split_width = updates.min_split_width;
+    if (updates.highlight_focused_border != default_tui.highlight_focused_border) target.tui.highlight_focused_border = updates.highlight_focused_border;
+    if (updates.show_token_velocity != default_tui.show_token_velocity) target.tui.show_token_velocity = updates.show_token_velocity;
+    if (updates.show_context_meter != default_tui.show_context_meter) target.tui.show_context_meter = updates.show_context_meter;
+    if (updates.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) target.tui.velocity_smoothing_alpha = updates.velocity_smoothing_alpha;
+    if (updates.context_threshold_warn != default_tui.context_threshold_warn) target.tui.context_threshold_warn = updates.context_threshold_warn;
+    if (updates.context_threshold_alert != default_tui.context_threshold_alert) target.tui.context_threshold_alert = updates.context_threshold_alert;
 }
 
 /// Merge context settings: non-default values in `updates` override `target`.
@@ -659,7 +674,7 @@ fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) 
 fn parseContext(value: std.json.Value) ContextSettings {
     var ctx: ContextSettings = .{};
     if (u32field(value, "overrideContextWindow")) |v| {
-        if (v >= 1024) ctx.override_context_window = v;
+        if (v >= context_window_floor_tokens) ctx.override_context_window = v;
     }
     if (u32field(value, "maxOutputTokens")) |v| {
         if (v >= 1) ctx.max_output_tokens = v;
@@ -742,7 +757,7 @@ fn parseTui(gpa: std.mem.Allocator, value: std.json.Value) !TuiSettings {
         tui.split_mode = std.meta.stringToEnum(SplitMode, s) orelse .dual;
     }
     if (u32field(value, "minSplitWidth")) |v| {
-        if (v >= 80 and v <= 500) tui.min_split_width = @intCast(v);
+        if (v >= min_split_width_min and v <= min_split_width_max) tui.min_split_width = @intCast(v);
     }
     if (boolField(value, "highlightFocusedBorder")) |b| tui.highlight_focused_border = b;
     if (boolField(value, "showTokenVelocity")) |b| tui.show_token_velocity = b;
@@ -931,7 +946,7 @@ fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]Provide
                 .unset,
         };
         if (u32field(val, "contextWindow")) |v| {
-            if (v >= 1024) model.context_window = v;
+            if (v >= context_window_floor_tokens) model.context_window = v;
         }
         if (u32field(val, "maxOutputTokens")) |v| {
             if (v >= 1) model.max_output_tokens = v;
@@ -1337,69 +1352,69 @@ fn writeToast(writer: *std.Io.Writer, toast: ToastSettings) !void {
 }
 
 fn hasNonDefaultTui(tui: TuiSettings) bool {
-    if (!tui.theme_live_preview) return true;
+    if (tui.theme_live_preview != default_tui.theme_live_preview) return true;
     if (tui.custom_themes_dir != null) return true;
-    if (!tui.fuzzy_highlight) return true;
-    if (tui.fuzzy_highlight_style != .accent) return true;
-    if (tui.split_mode != .dual) return true;
-    if (tui.min_split_width != 140) return true;
-    if (!tui.highlight_focused_border) return true;
-    if (!tui.show_token_velocity) return true;
-    if (!tui.show_context_meter) return true;
-    if (tui.velocity_smoothing_alpha != 0.35) return true;
-    if (tui.context_threshold_warn != 0.70) return true;
-    if (tui.context_threshold_alert != 0.85) return true;
+    if (tui.fuzzy_highlight != default_tui.fuzzy_highlight) return true;
+    if (tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) return true;
+    if (tui.split_mode != default_tui.split_mode) return true;
+    if (tui.min_split_width != default_tui.min_split_width) return true;
+    if (tui.highlight_focused_border != default_tui.highlight_focused_border) return true;
+    if (tui.show_token_velocity != default_tui.show_token_velocity) return true;
+    if (tui.show_context_meter != default_tui.show_context_meter) return true;
+    if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) return true;
+    if (tui.context_threshold_warn != default_tui.context_threshold_warn) return true;
+    if (tui.context_threshold_alert != default_tui.context_threshold_alert) return true;
     return false;
 }
 
 fn writeTui(writer: *std.Io.Writer, tui: TuiSettings) !void {
     try writer.writeByte('{');
     var wrote_any = false;
-    if (!tui.theme_live_preview) {
+    if (tui.theme_live_preview != default_tui.theme_live_preview) {
         try writeKeyNoIndent(writer, "themeLivePreview", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (tui.theme_live_preview) "true" else "false");
     }
     if (tui.custom_themes_dir) |s| {
         try writeKeyNoIndent(writer, "customThemesDir", &wrote_any);
         try std.json.Stringify.value(s, .{}, writer);
     }
-    if (!tui.fuzzy_highlight) {
+    if (tui.fuzzy_highlight != default_tui.fuzzy_highlight) {
         try writeKeyNoIndent(writer, "fuzzyHighlight", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (tui.fuzzy_highlight) "true" else "false");
     }
-    if (tui.fuzzy_highlight_style != .accent) {
+    if (tui.fuzzy_highlight_style != default_tui.fuzzy_highlight_style) {
         try writeKeyNoIndent(writer, "fuzzyHighlightStyle", &wrote_any);
         try std.json.Stringify.value(@tagName(tui.fuzzy_highlight_style), .{}, writer);
     }
-    if (tui.split_mode != .dual) {
+    if (tui.split_mode != default_tui.split_mode) {
         try writeKeyNoIndent(writer, "splitMode", &wrote_any);
         try std.json.Stringify.value(@tagName(tui.split_mode), .{}, writer);
     }
-    if (tui.min_split_width != 140) {
+    if (tui.min_split_width != default_tui.min_split_width) {
         try writeKeyNoIndent(writer, "minSplitWidth", &wrote_any);
         try writer.print("{d}", .{tui.min_split_width});
     }
-    if (!tui.highlight_focused_border) {
+    if (tui.highlight_focused_border != default_tui.highlight_focused_border) {
         try writeKeyNoIndent(writer, "highlightFocusedBorder", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (tui.highlight_focused_border) "true" else "false");
     }
-    if (!tui.show_token_velocity) {
+    if (tui.show_token_velocity != default_tui.show_token_velocity) {
         try writeKeyNoIndent(writer, "showTokenVelocity", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (tui.show_token_velocity) "true" else "false");
     }
-    if (!tui.show_context_meter) {
+    if (tui.show_context_meter != default_tui.show_context_meter) {
         try writeKeyNoIndent(writer, "showContextMeter", &wrote_any);
-        try writer.writeAll("false");
+        try writer.writeAll(if (tui.show_context_meter) "true" else "false");
     }
-    if (tui.velocity_smoothing_alpha != 0.35) {
+    if (tui.velocity_smoothing_alpha != default_tui.velocity_smoothing_alpha) {
         try writeKeyNoIndent(writer, "velocitySmoothingAlpha", &wrote_any);
         try writer.print("{d:.2}", .{tui.velocity_smoothing_alpha});
     }
-    if (tui.context_threshold_warn != 0.70) {
+    if (tui.context_threshold_warn != default_tui.context_threshold_warn) {
         try writeKeyNoIndent(writer, "contextThresholdWarn", &wrote_any);
         try writer.print("{d:.2}", .{tui.context_threshold_warn});
     }
-    if (tui.context_threshold_alert != 0.85) {
+    if (tui.context_threshold_alert != default_tui.context_threshold_alert) {
         try writeKeyNoIndent(writer, "contextThresholdAlert", &wrote_any);
         try writer.print("{d:.2}", .{tui.context_threshold_alert});
     }

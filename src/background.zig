@@ -20,6 +20,7 @@ const std = @import("std");
 
 const bash = @import("tools/bash_exec.zig");
 const pws = @import("tools/pwsh_exec.zig");
+const temp_files = @import("tools/temp_files.zig");
 const os = @import("os.zig");
 const platform = @import("platform");
 const lanes_util = @import("tui/lanes.zig");
@@ -30,6 +31,12 @@ const assert = std.debug.assert;
 /// output always lives in the log file; this is only what the model sees inline.
 const tail_bytes_max: usize = 8 * 1024;
 const read_reserve: usize = 64 * 1024;
+
+/// Output cap for the synchronous `taskkill.exe` drain — the output is
+/// discarded, so this only bounds memory.
+const taskkill_output_limit: usize = 64 * 1024;
+/// Test-only bound for the "poll until the background job lands" loops.
+const test_poll_attempts_max: u32 = 100;
 
 /// Maximum log file size per background job before truncation kicks in (50 MB).
 pub const max_job_log_bytes: u64 = 50 * 1024 * 1024;
@@ -171,7 +178,9 @@ pub const BackgroundManager = struct {
         defer if (label) |p| gpa.free(p);
         label = try std.fmt.allocPrint(gpa, "bg_{d}", .{id});
 
-        const log_name = try std.fmt.allocPrint(gpa, "nova-{s}.log", .{label.?});
+        // Composed from `bg_log_prefix` so the log name and the startup pruner
+        // share one prefix source; `label` stays the job's display name.
+        const log_name = try std.fmt.allocPrint(gpa, temp_files.bg_log_prefix ++ "{d}.log", .{id});
         defer gpa.free(log_name);
 
         var log_path: ?[]u8 = null;
@@ -662,7 +671,7 @@ fn writeBackgroundScript(gpa: std.mem.Allocator, io: std.Io, script: []const u8)
     var random: [16]u8 = undefined;
     io.random(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, "nova-pwsh-bg-{s}.ps1", .{hex[0..]});
+    const name = try std.fmt.allocPrint(gpa, temp_files.pwsh_prefix ++ "bg-{s}.ps1", .{hex[0..]});
     defer gpa.free(name);
     const path = try bash.namedTempPath(gpa, name);
     errdefer gpa.free(path);
@@ -686,8 +695,8 @@ fn runTaskkillWorker(io: std.Io, pid: i64) void {
 
     const result = std.process.run(alloc, io, .{
         .argv = &.{ "taskkill.exe", "/F", "/T", "/PID", pid_arg },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
+        .stdout_limit = .limited(taskkill_output_limit),
+        .stderr_limit = .limited(taskkill_output_limit),
         .timeout = bash.timeoutFromSeconds(5),
     }) catch return;
     alloc.free(result.stdout);
@@ -829,7 +838,7 @@ test "BackgroundManager.start returns and the job completes" {
 
     var finished: []BackgroundManager.Finished = &.{};
     var attempts: u32 = 0;
-    while (attempts < 100) : (attempts += 1) {
+    while (attempts < test_poll_attempts_max) : (attempts += 1) {
         const pending = try manager.takeFinished(gpa);
         if (pending.len > 0) {
             finished = pending;
@@ -877,7 +886,7 @@ test "BackgroundManager.start executes pwsh on Windows" {
 
     var finished: []BackgroundManager.Finished = &.{};
     var attempts: u32 = 0;
-    while (attempts < 100) : (attempts += 1) {
+    while (attempts < test_poll_attempts_max) : (attempts += 1) {
         const pending = try manager.takeFinished(gpa);
         if (pending.len > 0) {
             finished = pending;
@@ -938,7 +947,7 @@ test "BackgroundManager.cancel terminates long-running job" {
 
     var finished: []BackgroundManager.Finished = &.{};
     var attempts: u32 = 0;
-    while (attempts < 100) : (attempts += 1) {
+    while (attempts < test_poll_attempts_max) : (attempts += 1) {
         const pending = try manager.takeFinished(gpa);
         if (pending.len > 0) {
             finished = pending;
@@ -984,7 +993,7 @@ test "BackgroundManager handles instant command exit cleanly" {
 
     var finished: []BackgroundManager.Finished = &.{};
     var attempts: u32 = 0;
-    while (attempts < 100) : (attempts += 1) {
+    while (attempts < test_poll_attempts_max) : (attempts += 1) {
         const pending = try manager.takeFinished(gpa);
         if (pending.len > 0) {
             finished = pending;
