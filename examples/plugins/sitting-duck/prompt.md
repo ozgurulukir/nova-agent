@@ -59,3 +59,6 @@ re-run `ast_outline` before another `ast_get_source`.
   broader `kinds` filter or a wider glob.
 - On a query error the exact SQL sent stays at `.nova/sitting-duck/query.sql`
   for inspection; the error message says so.
+- A "column not found / Candidate bindings" error means the extension schema
+  drifted (a duckdb upgrade can do this) — introspect and adapt:
+  `SELECT column_name FROM (DESCRIBE SELECT * FROM read_ast('some_file.ext'))`.
