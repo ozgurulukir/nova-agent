@@ -97,10 +97,18 @@ through `sanitizePath` (cwd-confinement guard) and are strictly safer.
 ### Shell & Environment (no permission needed)
 - `nova.run_shell(cmd, opts?)` → `{stdout, stderr, code}`
   - Platform-native shell execution: uses `pwsh.exe` on Windows and `/bin/bash` on POSIX.
-  - opts: `cwd` (default: cwd), `timeout` (default: 30s)
-- `nova.run_bash(cmd, opts?)` → `{stdout, stderr, code}`
-  - opts: `cwd` (default: cwd), `timeout` (default: 30s)
-  - Safe execution via Nova's bash_exec — no `os.execute` needed
+  - opts: `cwd` (default: cwd), `timeout` (default: 30s), `stdin` (string written to the child's stdin, then closed)
+- `nova.run_bash(cmd, opts?)` → `{stdout, stderr, code}` — same opts as run_shell
+  - Every command passes the shell safety classifier first: destructive
+    forms return `nil, "UnsafeShellBlocked: ..."` (no approval flow at the
+    bridge — destructive work belongs to the built-in bash tool). Empty
+    commands return `nil, "command argument must not be empty"`. A missing
+    shell binary returns `nil, "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider nova.run_shell"`
+    (or the pwsh variant for `run_shell` on Windows).
+- `nova.shell_quote(s, dialect?)` → quoted `string` or `nil, err`
+  - Quote one argument so interpolated values cannot break out of the command.
+    `"posix"` (default) for run_bash on both platforms; `"native"` for
+    run_shell (PowerShell `''` rule on Windows). ALWAYS quote user input.
 - `nova.get_env(name)` → `string` or `nil`
 - `nova.get_cwd()` → `string`
 - `nova.get_project_root()` → `string` (git repo root or cwd)
@@ -120,7 +128,9 @@ through `sanitizePath` (cwd-confinement guard) and are strictly safer.
   - Confined strictly to plugin directory; cached in `nova_loaded_modules`.
 - `nova.register_tool(spec)` → `true` — register a tool for the AI model
 - `nova.on(event, callback)` → `true` — subscribe to lifecycle event
-  - Events: `turn_started`, `turn_ended`, `tool_call_started`, `tool_call_finished`, `response_received`, `plugin_loaded`, `plugin_unloaded`
+  - Events: `tool_call_started`, `tool_call_finished` (emitted in production);
+    `turn_started`, `turn_ended`, `response_received`, `plugin_loaded`,
+    `plugin_unloaded` (subscribable but not currently emitted)
 - `nova.think(prompt)` → _(stub, not yet implemented)_
 
 ### JSON (no permission needed)
@@ -135,9 +145,15 @@ through `sanitizePath` (cwd-confinement guard) and are strictly safer.
 Use these instead of hand-rolling a JSON parser or shelling out to `jq`. They
 round-trip cleanly for data tables: `json_decode(json_encode(t))` recovers `t`.
 
-### Plugin Config
-- `plugin.get_config()` → table or nil (from `config.json` `plugins.<name>.settings`)
-- `plugin.get_state()` / `plugin.set_state(state)` — persist state across reloads
+### Plugin Config & State
+- `plugin.get_config()` → fresh table per call, or `nil` when unconfigured
+  (from `config.json` `plugins.<name>.settings`; inline-object or escaped-string
+  form; read at App start — `enabled: false` skips loading the plugin).
+  Malformed/non-object settings return `nil, "get_config: settings must be a JSON object"`.
+  `plugin` is a reserved global name.
+- State across reloads uses **top-level Lua globals** `get_state()`/`set_state(state)`
+  (in-memory only, lost on restart). For durable state, write a file sidecar
+  (`.nova/<plugin>/state.json`) — the `todo` example plugin's pattern.
 
 ## Parameter Schema
 
@@ -162,8 +178,9 @@ parameters = {
 7. **Use `plugin.get_config()`** for user-configurable settings
 8. **Test with `test_runner`** — create `test.lua` in your plugin directory
 9. **Prefer dedicated tools over bash** — `delete_path` over `run_bash("rm")`,
-   `find_files` over `run_bash("find")`. Dedicated tools are sandboxed; `run_bash`
-   runs unclassified.
+   `find_files` over `run_bash("find")`. Dedicated tools are cwd-confined via
+   `sanitizePath`; `run_bash` passes the shell-safety classifier (hard-block on
+   unsafe, no approval flow at the bridge).
 10. **Use `nova.json_encode`/`json_decode` for structured persistence.** When a
     plugin needs to store structured data (checklists, configs, records), write
     it as JSON via `nova.write_file(path, nova.json_encode(data, {pretty=true}))`

@@ -109,24 +109,24 @@ Key points:
 - Multiple callbacks can subscribe to the same event
 - Events are dispatched synchronously — keep handlers fast
 
-Available events:
+Available events (only `tool_call_started` and `tool_call_finished` are
+currently emitted in production; the others are subscribable but not
+currently emitted):
 
 | Event | data fields | When it fires |
 |-------|-------------|---------------|
-| `turn_started` | `{}` | Agent turn begins |
-| `turn_ended` | `{}` | Agent turn ends |
+| `turn_started` | `{}` | Agent turn begins *(not currently emitted)* |
+| `turn_ended` | `{}` | Agent turn ends *(not currently emitted)* |
 | `tool_call_started` | `{name, call_id}` | Tool execution starts |
 | `tool_call_finished` | `{name, call_id, success}` | Tool execution completes |
-| `response_received` | `{}` | LLM response received |
-| `plugin_loaded` | `{name}` | Plugin loaded |
-| `plugin_unloaded` | `{name}` | Plugin unloaded |
+| `response_received` | `{}` | LLM response received *(not currently emitted)* |
+| `plugin_loaded` | `{name}` | Plugin loaded *(not currently emitted)* |
+| `plugin_unloaded` | `{name}` | Plugin unloaded *(not currently emitted)* |
 
-## 3. Custom Search — Tool with Config
+## 3. Configurable Tool — authoring pattern
 
-**Location:** `examples/plugins/custom-search/`
-
-Demonstrates reading plugin configuration from `config.json` and using it
-at runtime.
+This is an **authoring pattern**, not a shipped example directory. It shows
+how a plugin reads its configuration and applies defaults at runtime.
 
 ### plugin.lua
 
@@ -150,28 +150,29 @@ local settings = {
 ```
 
 Key points:
-- `plugin.get_config()` returns the plugin's settings from `config.json`
-- Settings are parsed from the `settings` JSON string in the config
-- Default values are applied for missing keys
+- `plugin.get_config()` returns the plugin's settings as a fresh table
+- Both config forms work: an inline JSON object or an escaped JSON string
+- `plugin.get_config()` returns `nil` when unconfigured — apply defaults
+- Settings are read once at App start (restart to apply changes)
 
 ### Configuring the plugin
 
-In `~/.config/nova/config.json` or `.nova/config.json`:
+In `~/.config/nova/config.json` or `.nova/config.json` (inline-object form
+shown; the escaped-string form also works):
 
 ```json
 {
   "plugins": {
-    "custom-search": {
+    "my-search": {
       "enabled": true,
-      "settings": "{\"max_results\":20,\"case_sensitive\":true,\"default_pattern\":\"*.zig\"}"
+      "settings": { "max_results": 20, "case_sensitive": true, "default_pattern": "*.zig" }
     }
   }
 }
 ```
 
-The `settings` field is a JSON string that `plugin.get_config()` parses into
-a Lua table. This keeps plugin configuration opaque to the config system —
-the plugin's Lua code is responsible for parsing and validating its own settings.
+Plugin configuration stays opaque to the config system — the plugin's Lua
+code is responsible for validating its own settings and applying defaults.
 
 ## 4. Read Tool — File Reading with Git Integration
 

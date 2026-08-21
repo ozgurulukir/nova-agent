@@ -254,6 +254,61 @@ test "ToolRegistry: removePluginToolsWithPrefix strips matching tools" {
     try std.testing.expect((try reg.lookup(gpa, "skill")) != null);
 }
 
+test "ToolRegistry: strip-and-rebuild keeps plugin tools unique across re-registration" {
+    // Pins registerPluginTools' re-sync semantics (P8): strip all `lua__`
+    // tools, then append fresh — duplicate names can never reach
+    // buildAllToolsJson (strict providers 400 on duplicate tool names).
+    // registerPluginTools runs at initRuntime today; this pins the
+    // idempotency contract for any future re-registration site.
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    const mk = struct {
+        fn make(gpa_: std.mem.Allocator, reg_: *ToolRegistry, n: []const u8) !void {
+            const name = try gpa_.dupe(u8, n);
+            errdefer gpa_.free(name);
+            const desc = try gpa_.dupe(u8, "d");
+            errdefer gpa_.free(desc);
+            try reg_.addPluginTool(gpa_, .{
+                .name = name,
+                .description = desc,
+                .schema = .{ .properties = &.{} },
+                .run = dummy_run,
+                .display = dummy_display,
+                .userdata = undefined,
+                .userdata_free = dummy_free,
+            });
+        }
+    }.make;
+
+    // Non-lua plugin tools (the MCP path injects those; registerPluginTools
+    // never touches them) are added once, before the re-registration cycles.
+    try mk(gpa, &reg, "mcp__x__c");
+
+    // The registerPluginTools sequence, twice (initial sync + any future
+    // re-sync).
+    for (0..2) |_| {
+        reg.removePluginToolsWithPrefix(gpa, "lua__");
+        try mk(gpa, &reg, "lua__p__a");
+        try mk(gpa, &reg, "lua__p__b");
+    }
+
+    // Each lua__ name appears exactly once; non-lua plugin tools survive.
+    const all = try reg.all(gpa);
+    var lua_a: usize = 0;
+    var lua_b: usize = 0;
+    var mcp_c: usize = 0;
+    for (all) |t| {
+        if (std.mem.eql(u8, t.name, "lua__p__a")) lua_a += 1;
+        if (std.mem.eql(u8, t.name, "lua__p__b")) lua_b += 1;
+        if (std.mem.eql(u8, t.name, "mcp__x__c")) mcp_c += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), lua_a);
+    try std.testing.expectEqual(@as(usize, 1), lua_b);
+    try std.testing.expectEqual(@as(usize, 1), mcp_c);
+}
+
 test "ToolRegistry: all() returns valid slices after multiple calls" {
     // Regression: a refactor that frees a tool's `name`/`description` after
     // addPluginTool corrupts the registry. all() must always return slices

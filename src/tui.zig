@@ -316,6 +316,12 @@ pub const App = struct {
         // App.deinit.
         app.plugin_manager.deinit();
         app.plugin_manager = lua_mod.PluginManager.init(gpa, io, runtime.home_dir, runtime.cwd);
+        // Clone plugin config entries into the manager before loadAll: the
+        // manager outlives cached_config swaps (a session switch frees the old
+        // Config mid-session), so borrowed slices would dangle.
+        app.plugin_manager.syncPluginConfig(app.cached_config.plugins) catch |err| {
+            log.warn("plugin_manager.syncPluginConfig failed: {s}", .{@errorName(err)});
+        };
         const loaded_plugins = app.plugin_manager.loadAll() catch |err| blk: {
             log.warn("plugin_manager.loadAll failed: {s}", .{@errorName(err)});
             break :blk @as(usize, 0);
@@ -1375,11 +1381,13 @@ pub fn openPlugins(app: *App) void {
     app.mode = .plugins;
     app.pickers.plugins.reset();
     if (app.liveRuntime() != null) {
-        // Sync plugin descriptors into the registry and push the
-        // resulting tool set into the live AI client — same path
-        // `openMcp` takes. Ensures the model sees `lua__<plugin>__*`
-        // entries on the next prompt after the overlay opens.
-        provider_model.registerPluginTools(app);
+        // Push the current tool set into the live AI client. Deliberately NO
+        // `registerPluginTools` here: the loaded-plugin set is immutable
+        // mid-session (loadAll runs once at startup), so a re-registration
+        // could only re-append the same tools — and its strip-and-rebuild
+        // frees tool records that worker threads may be dispatching through
+        // the shared registry right now (use-after-free). Registration is an
+        // initRuntime-time operation.
         provider_model.refreshMcpTools(app);
     }
     app.clearInput();

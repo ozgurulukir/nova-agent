@@ -314,17 +314,30 @@ A server is either stdio (`command` + `args`) or remote (`url`), never both. Mis
 
 Each entry in `plugins` is keyed by plugin name (matching the plugin's manifest `name` field):
 
-| Field      | Type      | Description                                                                                             |
-| ---------- | --------- | ------------------------------------------------------------------------------------------------------- |
-| `enabled`  | `boolean` | Whether this plugin is active (default `true`).                                                         |
-| `settings` | `string`  | Plugin-specific settings as a JSON object string (max 65536 chars). The plugin's Lua code parses this.   |
+| Field      | Type                | Description                                                                                              |
+| ---------- | ------------------- | -------------------------------------------------------------------------------------------------------- |
+| `enabled`  | `boolean`           | Whether this plugin is loaded (default `true`). Applied at App start — restart Nova to change it.        |
+| `settings` | `string` or `object`| Plugin-specific settings as a JSON object — either an escaped JSON string or an inline JSON object. The plugin's Lua code reads it via `plugin.get_config()`. |
 
-**Example — configuring the custom-search plugin:**
+**Example — inline-object form (preferred for readability):**
 
 ```json
 {
   "plugins": {
-    "custom-search": {
+    "my-search": {
+      "enabled": true,
+      "settings": { "max_results": 20, "case_sensitive": true, "default_pattern": "*.zig" }
+    }
+  }
+}
+```
+
+**Example — escaped-string form (equivalent):**
+
+```json
+{
+  "plugins": {
+    "my-search": {
       "enabled": true,
       "settings": "{\"max_results\":20,\"case_sensitive\":true,\"default_pattern\":\"*.zig\"}"
     }
@@ -332,7 +345,12 @@ Each entry in `plugins` is keyed by plugin name (matching the plugin's manifest 
 }
 ```
 
-Settings are opaque to the config system — the plugin's Lua code is responsible for parsing and validating its own settings via `plugin.get_config()`. See `docs/plugins/` for the full plugin development guide.
+Both forms reach the plugin identically. Settings are opaque to the config
+system — the plugin's Lua code is responsible for validating its own settings
+via `plugin.get_config()`, which returns a fresh table per call (or `nil`
+when unconfigured). `enabled: false` skips loading the plugin entirely.
+Plugin config is read once at App start; there is no hot reload — restart
+Nova to apply changes. See `docs/plugins/` for the full plugin development guide.
 
 > [!NOTE]
 > **Typed Model Selection**: The in-memory `Config` struct carries a `model_selection: ?ModelSelection` typed view. `ModelSelection` is `union(enum) { builtin, custom }` — builtin providers carry `provider: Provider` + `provider_name`; custom providers carry `provider_name`, `base_url`, `api_key`. Optional settings (`use_responses_endpoint`, `system_prompt`, `bash_classifier_url`) live on both variants. Callers use typed accessors (`provider()`, `providerName()`, `model()`, `baseUrl()`, `apiKey()`, `useResponsesEndpoint()`, `systemPrompt()`, `bashClassifierUrl()`) so builtin/custom differences are hidden. Reasoning effort is **not** a selection-level boolean — it lives on the model (`Model.reasoning: ReasoningSetting`), populated from `providers.<name>.models.<id>.reasoningEffort`. The `strict_outputs` setting is **not** model-scoped — it stays on `Config` (API-level) and is read directly where the client is attached. `parseObject` only populates `model_selection` when all required fields are present — since `api_key` is never serialized to config.json (it lives in `auth.json`), disk-loaded configs **never** have `model_selection`. All rehydration paths fall back to the legacy fields (`provider`, `model`, `base_url`, `provider_name`), which ARE populated from `defaultModel` and `hydrateActiveModel`.

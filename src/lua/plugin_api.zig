@@ -33,6 +33,7 @@ const State = @import("state.zig").State;
 const bridge = @import("bridge.zig");
 const bash_exec = @import("../tools/bash_exec.zig");
 const pwsh_exec = @import("../tools/pwsh_exec.zig");
+const bash_safety = @import("../tools/bash_safety.zig");
 const sandbox_mod = @import("sandbox.zig");
 
 /// Maximum file size for read_file (1 MB).
@@ -1070,6 +1071,127 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Best-effort plugin directory for the shell-block audit log; empty when the
+/// Lua state carries no plugin (bridge unit tests). Borrowed from the Lua GC —
+/// consumed synchronously by the log call before returning.
+fn pluginDirBestEffort(L: *c.lua_State) []const u8 {
+    _ = c.lua_getfield(L, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+    if (c.lua_isnil(L, -1)) {
+        c.lua_pop(L, 1);
+        return "";
+    }
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L, -1, &len);
+    const dir = if (ptr) |p| p[0..len] else "";
+    c.lua_pop(L, 1);
+    return dir;
+}
+
+/// The exec backend a plugin shell call routes to: `run_bash` always uses
+/// bash (git-bash on Windows); `run_shell` uses the native shell (pwsh on
+/// Windows, bash on POSIX).
+const ShellBackend = enum { bash, pwsh };
+
+/// Map a backend spawn failure to an actionable Lua-facing message. Only
+/// `error.FileNotFound` (the backend binary is missing) is remapped — every
+/// other error name (Timeout, StreamTooLong, …) is already meaningful to
+/// plugin authors.
+fn shellBackendErrorMessage(err: anyerror, backend: ShellBackend) []const u8 {
+    if (err == error.FileNotFound) {
+        return switch (backend) {
+            .bash => "ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider nova.run_shell",
+            .pwsh => "ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)",
+        };
+    }
+    return @errorName(err);
+}
+
+/// Quote one argument for a shell command line. `pwsh_rules` selects the
+/// PowerShell single-quote rule (`'` doubled) over the POSIX rule (`'\''`);
+/// both wrap the argument in single quotes so no expansion can occur.
+/// Exact-size allocation with a final length assert: the size is computed
+/// upfront, so a mismatch means an arithmetic bug, not a runtime condition.
+fn quoteShellArg(gpa: std.mem.Allocator, s: []const u8, pwsh_rules: bool) std.mem.Allocator.Error![]u8 {
+    var quotes: usize = 0;
+    for (s) |ch| {
+        if (ch == '\'') quotes += 1;
+    }
+    const extra: usize = if (pwsh_rules) quotes else quotes * 3; // `''` vs `'\''`
+    const out = try gpa.alloc(u8, s.len + 2 + extra);
+    var i: usize = 0;
+    out[i] = '\'';
+    i += 1;
+    for (s) |ch| {
+        out[i] = ch;
+        i += 1;
+        if (ch == '\'') {
+            if (pwsh_rules) {
+                out[i] = '\'';
+                i += 1;
+            } else {
+                out[i] = '\\';
+                out[i + 1] = '\'';
+                out[i + 2] = '\'';
+                i += 3;
+            }
+        }
+    }
+    out[i] = '\'';
+    i += 1;
+    std.debug.assert(i == out.len);
+    return out;
+}
+
+/// ── nova.shell_quote(s, dialect?) ────────────────────────────────────
+///
+/// Quote one argument for a shell command line. Dialects:
+///   "posix"  (default) — for run_bash on every platform (git-bash on
+///             Windows is a POSIX shell): wrap in '...' escaping ' as '\''.
+///   "native" — for run_shell's interpreter: identical to posix on POSIX;
+///             on Windows PowerShell escapes ' as ''.
+/// Returns the quoted string, or nil + an error for an unknown dialect.
+/// Quoting is what keeps the *intended* command equal to the *classified*
+/// command (the safety gate classifies the final string) — always quote
+/// interpolated values instead of concatenating raw strings.
+pub fn shellQuote(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+
+    const s = bridge.pullValue(&state, []const u8, 1) orelse {
+        state.pushNil();
+        state.pushString("string argument is required");
+        return 2;
+    };
+
+    var pwsh_rules = false;
+    if (state.getTop() >= 2 and !state.isNil(2)) {
+        const dialect = bridge.pullValue(&state, []const u8, 2) orelse {
+            state.pushNil();
+            state.pushString("shell_quote: dialect must be \"posix\" or \"native\"");
+            return 2;
+        };
+        if (std.mem.eql(u8, dialect, "posix")) {
+            // POSIX quoting is the default.
+        } else if (std.mem.eql(u8, dialect, "native")) {
+            pwsh_rules = os.is_windows;
+        } else {
+            state.pushNil();
+            state.pushString("shell_quote: dialect must be \"posix\" or \"native\"");
+            return 2;
+        }
+    }
+
+    const gpa = std.heap.page_allocator;
+    const quoted = quoteShellArg(gpa, s, pwsh_rules) catch {
+        state.pushNil();
+        state.pushString("out of memory");
+        return 2;
+    };
+    defer gpa.free(quoted);
+    state.pushString(quoted); // copies into the Lua GC
+    return 1;
+}
+
 /// ── nova.run_bash(cmd, opts?) ────────────────────────────────────────
 ///
 /// Runs a shell command and returns a table with:
@@ -1078,9 +1200,10 @@ pub fn fileInfo(L: ?*c.lua_State) callconv(.c) c_int {
 /// Optional `opts` table fields:
 ///   cwd     (string) — working directory (default: project root)
 ///   timeout (number) — timeout in seconds (default: 30)
+///   stdin   (string) — bytes written to the child's stdin, then closed
 ///
 /// Returns nil + error message on failure.
-fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
+fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
     const L_ptr = L orelse return 0;
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
@@ -1091,11 +1214,26 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
         return 2;
     };
 
+    // Empty commands are rejected before anything else: `bash_safety.classify`
+    // and both exec backends assert `command.len > 0`, and asserts are UB in
+    // ReleaseFast — the guard must fire before either can see the empty slice.
+    if (cmd.len == 0) {
+        state.pushNil();
+        state.pushString("command argument must not be empty");
+        return 2;
+    }
+
     var cwd: ?[]const u8 = null;
     var timeout_seconds: u32 = bash_exec.timeout_seconds_default;
+    // Borrowed from the Lua GC (the opts table at index 2 pins the string for
+    // the whole C call); safe without a copy because both exec backends join
+    // their stdin writer thread before returning — the bytes are consumed
+    // before the Lua stack can unwind.
+    var stdin_bytes: ?[]const u8 = null;
 
     if (state.getTop() >= 2 and state.isTable(2)) {
         if (bridge.getTableString(&state, 2, "cwd")) |v| cwd = v;
+        if (bridge.getTableString(&state, 2, "stdin")) |v| stdin_bytes = v;
         if (bridge.getTableInteger(&state, 2, "timeout")) |v| timeout_seconds = @min(@max(@as(u32, @intCast(@max(v, 1))), 1), bash_exec.timeout_seconds_max);
     }
 
@@ -1121,14 +1259,34 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
     };
     defer std.heap.page_allocator.free(resolved_cwd);
 
+    // P5: gate plugin shell execution through the same classifier as the
+    // builtin tool. Hard-block on `.unsafe` — there is no interactive
+    // approval at the Lua C boundary (no observer handle, worker thread), so
+    // the channel for destructive work remains the model-facing builtin bash
+    // tool with its full approval flow. `.safe`/`.unavailable` pass through,
+    // exact parity with the builtin gate (executor_safety).
+    const verdict = bash_safety.classify(std.heap.page_allocator, io, bridge.bash_classifier_url_slot, resolved_cwd, cmd);
+    if (verdict == .unsafe) {
+        const backend_name = if (backend == .pwsh) "pwsh" else "bash";
+        std.log.warn("plugin.shell.blocked plugin_dir={s} backend={s} cmd=\"{s}\"", .{
+            pluginDirBestEffort(L_ptr),
+            backend_name,
+            cmd[0..@min(cmd.len, 80)],
+        });
+        state.pushNil();
+        state.pushString("UnsafeShellBlocked: command rejected by Nova's shell safety classifier; use the built-in bash tool for destructive commands");
+        return 2;
+    }
+
     if (backend == .pwsh) {
         var result = pwsh_exec.runWithOptions(std.heap.page_allocator, io, .{
             .cwd = resolved_cwd,
             .command = cmd,
+            .stdin = stdin_bytes,
             .timeout = pwsh_exec.timeoutFromSeconds(timeout_seconds),
         }) catch |err| {
             state.pushNil();
-            state.pushString(@errorName(err));
+            state.pushString(shellBackendErrorMessage(err, backend));
             return 2;
         };
         defer result.deinit(std.heap.page_allocator);
@@ -1145,10 +1303,11 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
         var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{
             .cwd = resolved_cwd,
             .command = cmd,
+            .stdin = stdin_bytes,
             .timeout = bash_exec.timeoutFromSeconds(timeout_seconds),
         }) catch |err| {
             state.pushNil();
-            state.pushString(@errorName(err));
+            state.pushString(shellBackendErrorMessage(err, backend));
             return 2;
         };
         defer result.deinit(std.heap.page_allocator);
@@ -1172,6 +1331,7 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: enum { bash, pwsh }) c_int {
 /// Optional `opts` table fields:
 ///   cwd     (string) — working directory (default: project root)
 ///   timeout (number) — timeout in seconds (default: 30)
+///   stdin   (string) — bytes written to the child's stdin, then closed
 ///
 /// Returns nil + error message on failure.
 pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1181,7 +1341,8 @@ pub fn runBash(L: ?*c.lua_State) callconv(.c) c_int {
 /// ── nova.run_shell(cmd, opts?) ───────────────────────────────────────
 ///
 /// Runs a shell command using the host platform's native shell:
-/// PowerShell (`pwsh.exe`) on Windows, bash on POSIX.
+/// PowerShell (`pwsh.exe`) on Windows, bash on POSIX. Accepts the same
+/// `opts` as run_bash (cwd / timeout / stdin).
 /// Returns a table with:
 ///   { stdout, stderr, code }
 pub fn runShell(L: ?*c.lua_State) callconv(.c) c_int {
@@ -1328,7 +1489,7 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     // inside the path are neutralized by the `'` → `'\''` transform.
     var cmd: []u8 = undefined;
     if (path) |p| {
-        const quoted = shellQuote(std.heap.page_allocator, p) catch {
+        const quoted = quoteShellArg(std.heap.page_allocator, p, false) catch {
             state.pushNil();
             state.pushString("out of memory");
             return 2;
@@ -1950,6 +2111,53 @@ fn pushJsonToLua(L: *c.lua_State, gpa: std.mem.Allocator, json: []const u8) !voi
     try pushJsonValue(L, gpa, parsed.value);
 }
 
+/// ── plugin.get_config() ──────────────────────────────────────────────
+///
+/// Returns the plugin's configured settings as a fresh table, or nil when the
+/// plugin has no config entry or no settings. The settings JSON string is
+/// stored in the registry (`sandbox.settings_registry_key`) by the manager at
+/// load time; re-parsing per call yields a fresh table, so plugin-side
+/// mutation cannot corrupt the stored view. Malformed or non-object settings
+/// return `nil, "get_config: settings must be a JSON object"`.
+pub fn pluginGetConfig(L: ?*c.lua_State) callconv(.c) c_int {
+    const L_ptr = L orelse return 0;
+    var state = State{ .handle = L_ptr };
+
+    // Absent slot → unconfigured → plain nil.
+    _ = c.lua_getfield(L_ptr, c.LUA_REGISTRYINDEX, sandbox_mod.settings_registry_key);
+    if (c.lua_isnil(L_ptr, -1)) {
+        c.lua_pop(L_ptr, 1);
+        state.pushNil();
+        return 1;
+    }
+    var len: usize = 0;
+    const ptr = c.lua_tolstring(L_ptr, -1, &len);
+    const json = if (ptr) |p| p[0..len] else "";
+    c.lua_pop(L_ptr, 1);
+
+    // Parse first, push second: the object-vs-non-object verdict must be known
+    // before anything lands on the stack (a JSON array also decodes to a Lua
+    // table, so a post-push type check cannot distinguish it from an object).
+    const gpa = std.heap.page_allocator;
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch {
+        state.pushNil();
+        state.pushString("get_config: settings must be a JSON object");
+        return 2;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        state.pushNil();
+        state.pushString("get_config: settings must be a JSON object");
+        return 2;
+    }
+    pushJsonValue(L_ptr, gpa, parsed.value) catch {
+        state.pushNil();
+        state.pushString("get_config: out of memory");
+        return 2;
+    };
+    return 1;
+}
+
 // ── nova.json_decode / nova.json_encode ──────────────────────────────
 //
 // Plugins had no way to parse or emit JSON: incoming tool params are
@@ -2556,32 +2764,6 @@ fn findGitRoot(io: std.Io, cwd: []const u8) ![]u8 {
     }
 
     return error.GitRootNotFound;
-}
-
-/// Single-quote-escape `arg` so it can be embedded as a single shell argument
-/// without being interpreted. Wraps the result in `'...'` and rewrites every
-/// embedded `'` as `'\''` — the standard idiom that closes the quote, emits a
-/// literal quote, and reopens. A malicious `path = "x'; rm -rf ~; #"` becomes
-/// `'x'\''; rm -rf ~; #'`, which the shell sees as one inert argument.
-/// Caller owns the returned slice.
-fn shellQuote(gpa: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]u8 {
-    // Worst case: every byte is a quote, each expanding to 4 bytes (`'\''`),
-    // plus the two wrapping quotes.
-    const max_len = arg.len * 4 + 2;
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(gpa, max_len);
-    errdefer out.deinit(gpa);
-
-    try out.append(gpa, '\'');
-    for (arg) |byte| {
-        if (byte == '\'') {
-            try out.appendSlice(gpa, "'\\''");
-        } else {
-            try out.append(gpa, byte);
-        }
-    }
-    try out.append(gpa, '\'');
-    return out.toOwnedSlice(gpa);
 }
 
 /// Test whether `name` matches the user-supplied `file_pattern`.
@@ -3419,21 +3601,21 @@ fn fileExists(gpa: std.mem.Allocator, io: std.Io, absolute_path: []const u8) boo
 
 test "shellQuote: plain argument is wrapped in single quotes" {
     const gpa = std.testing.allocator;
-    const quoted = try shellQuote(gpa, "src/main.zig");
+    const quoted = try quoteShellArg(gpa, "src/main.zig", false);
     defer gpa.free(quoted);
     try std.testing.expectEqualStrings("'src/main.zig'", quoted);
 }
 
 test "shellQuote: embedded quote is escaped (injection vector neutralized)" {
     const gpa = std.testing.allocator;
-    const quoted = try shellQuote(gpa, "x'; rm -rf ~; #");
+    const quoted = try quoteShellArg(gpa, "x'; rm -rf ~; #", false);
     defer gpa.free(quoted);
     try std.testing.expectEqualStrings("'x'\\''; rm -rf ~; #'", quoted);
 }
 
 test "shellQuote: empty argument becomes two quotes" {
     const gpa = std.testing.allocator;
-    const quoted = try shellQuote(gpa, "");
+    const quoted = try quoteShellArg(gpa, "", false);
     defer gpa.free(quoted);
     try std.testing.expectEqualStrings("''", quoted);
 }
@@ -3491,7 +3673,7 @@ test "gitDiff: injection payload stays a literal pathspec (shellQuote path)" {
     ignoreRun(gpa, io, "/tmp", "rm -f pwned_nova_diff");
     // The quote-break-out payload, funneled through `shellQuote` exactly as
     // `gitDiff` does, must become one inert pathspec.
-    const quoted = try shellQuote(gpa, "x'; touch " ++ marker ++ "; #");
+    const quoted = try quoteShellArg(gpa, "x'; touch " ++ marker ++ "; #", false);
     defer gpa.free(quoted);
     const cmd = try std.fmt.allocPrint(gpa, "git diff -- {s}", .{quoted});
     defer gpa.free(cmd);
@@ -3567,6 +3749,189 @@ test "runBash clamps a negative timeout without panicking" {
         \\local r = nova.run_bash("true", { timeout = -1 })
         \\assert(type(r) == "table", "clamped run_bash returns a table")
         \\assert(r.code == 0, "true exits 0")
+        \\return "OK"
+    );
+}
+
+test "runBash pipes opts.stdin to the child (P4)" {
+    if (os.is_windows) return error.SkipZigTest;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local r = nova.run_bash("cat", { stdin = "hello stdin" })
+        \\assert(type(r) == "table", "stdin run returns a table")
+        \\assert(r.stdout == "hello stdin", "stdout echoes stdin: " .. tostring(r.stdout))
+        \\assert(r.code == 0, "cat exits 0")
+        \\
+        \\-- No stdin: the child's stdin is simply absent/closed.
+        \\local r2 = nova.run_bash("printf ok")
+        \\assert(r2.stdout == "ok", "plain run unaffected")
+        \\return "OK"
+    );
+}
+
+// ── shell safety gate (P5) ───────────────────────────────────────────
+
+test "runBash blocks unsafe commands via the local matcher (P5)" {
+    // No classifier URL configured (null slot): the always-armed local
+    // matcher must still block destructive commands.
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    bridge.bash_classifier_url_slot = null;
+    try expectLuaOk(&L,
+        \\local r, err = nova.run_bash("rm -rf /")
+        \\assert(r == nil, "unsafe command returns nil")
+        \\assert(string.find(err, "UnsafeShellBlocked", 1, true) ~= nil, "error carries UnsafeShellBlocked: " .. tostring(err))
+        \\return "OK"
+    );
+}
+
+test "runBash safety gate holds with a configured-but-unreachable classifier (P5)" {
+    // classify falls back to the local matcher on fetch failure, so an
+    // unreachable URL blocks locally-matched destructive commands just the
+    // same; safe commands are unaffected with the slot set. NOTE: the local
+    // matcher covers root-target deletion forms (`rm -rf /`-class), not every
+    // destructive spelling — the remote classifier covers the full surface.
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    const prev = bridge.bash_classifier_url_slot;
+    defer bridge.bash_classifier_url_slot = prev;
+    bridge.bash_classifier_url_slot = "http://127.0.0.1:1/classify";
+    if (os.is_windows) return error.SkipZigTest;
+
+    try expectLuaOk(&L,
+        \\local r, err = nova.run_bash("rm -rf /")
+        \\assert(r == nil, "locally-matched unsafe command still blocked with a down classifier")
+        \\assert(string.find(err, "UnsafeShellBlocked", 1, true) ~= nil, "got: " .. tostring(err))
+        \\local ok = nova.run_bash("printf fine")
+        \\assert(type(ok) == "table" and ok.stdout == "fine", "safe command passes")
+        \\return "OK"
+    );
+}
+
+test "runBash and run_shell reject an empty command before any spawn (P5)" {
+    // The guard is backend-independent and fires before classify and before
+    // either backend's command.len > 0 assert.
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\local r1, e1 = nova.run_bash("")
+        \\assert(r1 == nil, "empty command returns nil")
+        \\assert(e1 == "command argument must not be empty", "got: " .. tostring(e1))
+        \\local r2, e2 = nova.run_shell("")
+        \\assert(r2 == nil and e2 == "command argument must not be empty", "run_shell guards too")
+        \\return "OK"
+    );
+}
+
+// ── shell_quote + ShellUnavailable mapping (P7) ──────────────────────
+
+test "quoteShellArg posix and pwsh rules" {
+    const gpa = std.testing.allocator;
+
+    // POSIX: wrap in '...', escape ' as '\''.
+    {
+        const q = try quoteShellArg(gpa, "a'b", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a'\\''b'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("''", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "plain", false);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'plain'", q);
+    }
+
+    // pwsh: wrap in '...', double ' as ''.
+    {
+        const q = try quoteShellArg(gpa, "a'b", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'a''b'", q);
+    }
+    {
+        const q = try quoteShellArg(gpa, "plain", true);
+        defer gpa.free(q);
+        try std.testing.expectEqualStrings("'plain'", q);
+    }
+}
+
+test "quoteShellArg posix output survives a real shell round-trip" {
+    if (os.is_windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const original = "it's a $HOME `test` \"double\"";
+
+    const q = try quoteShellArg(gpa, original, false);
+    defer gpa.free(q);
+    const command = try std.fmt.allocPrint(gpa, "printf %s {s}", .{q});
+    defer gpa.free(command);
+    var r = try bash_exec.runWithOptions(gpa, std.testing.io, .{ .cwd = "/tmp", .command = command });
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings(original, r.stdout);
+    try std.testing.expect(r.code == 0);
+}
+
+test "shellBackendErrorMessage maps only FileNotFound" {
+    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .bash), "ShellUnavailable: bash not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shellBackendErrorMessage(error.FileNotFound, .pwsh), "ShellUnavailable: pwsh not found") != null);
+    try std.testing.expectEqualStrings("Timeout", shellBackendErrorMessage(error.Timeout, .bash));
+    try std.testing.expectEqualStrings("StreamTooLong", shellBackendErrorMessage(error.StreamTooLong, .pwsh));
+}
+
+test "nova.shell_quote dialects and error contract (P7)" {
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\assert(nova.shell_quote("a'b") == "'a'\\''b'", "default is posix")
+        \\assert(nova.shell_quote("a'b", "posix") == "'a'\\''b'")
+        \\assert(nova.shell_quote("") == "''", "empty string quotes to ''")
+        \\assert(nova.shell_quote(nil, "posix") == nil, "missing string arg: nil+err")
+        \\
+        \\-- On POSIX, native == posix; the pwsh doubling rule is only
+        \\-- observable on Windows (covered by a Windows-gated test).
+        \\local native = nova.shell_quote("x y", "native")
+        \\assert(native == "'x y'", "native == posix on POSIX")
+        \\
+        \\local v, err = nova.shell_quote("x", "bogus")
+        \\assert(v == nil, "unknown dialect yields nil")
+        \\assert(err == "shell_quote: dialect must be \"posix\" or \"native\"", "got: " .. tostring(err))
+        \\return "OK"
+    );
+}
+
+test "nova.shell_quote native dispatches to pwsh rules on Windows (P7)" {
+    if (!os.is_windows) return error.SkipZigTest;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, std.testing.io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    try expectLuaOk(&L,
+        \\assert(nova.shell_quote("a'b", "native") == "'a''b'", "pwsh doubles quotes")
         \\return "OK"
     );
 }
@@ -3938,6 +4303,89 @@ test "plugin_api: nova.git_add and selective nova.git_commit validate arguments"
         \\assert(ok2 == nil, "git_commit without message should fail")
         \\assert(string.find(err2, "commit message argument is required") ~= nil, "unexpected error: " .. tostring(err2))
         \\
+        \\return "OK"
+    );
+}
+
+// ── plugin.get_config (P1) ───────────────────────────────────────────
+
+/// Seed the settings registry slot exactly the way `PluginManager.loadOne`
+/// does: `lua_pushlstring` (copies into the Lua GC) + `lua_setfield`.
+fn seedSettingsSlot(L: *State, json: []const u8) void {
+    _ = c.lua_pushlstring(L.handle, json.ptr, json.len);
+    _ = c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, sandbox_mod.settings_registry_key);
+}
+
+test "plugin.get_config decodes object settings into a fresh table" {
+    const io = std.testing.io;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    seedSettingsSlot(&L, "{\"theme\":\"dark\",\"retries\":3}");
+
+    try expectLuaOk(&L,
+        \\local cfg = plugin.get_config()
+        \\assert(type(cfg) == "table", "settings decode to a table")
+        \\assert(cfg.theme == "dark", "string field readable")
+        \\assert(cfg.retries == 3, "number field readable")
+        \\cfg.theme = "mutated"
+        \\local cfg2 = plugin.get_config()
+        \\assert(cfg2.theme == "dark", "fresh table per call: mutation does not leak")
+        \\return "OK"
+    );
+}
+
+test "plugin.get_config returns nil when unconfigured" {
+    const io = std.testing.io;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+    // No settings slot seeded — the unconfigured default.
+    try expectLuaOk(&L,
+        \\assert(plugin.get_config() == nil, "unconfigured plugin gets nil")
+        \\return "OK"
+    );
+}
+
+test "plugin.get_config rejects malformed and non-object settings" {
+    const io = std.testing.io;
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    seedSettingsSlot(&L, "not json at all");
+    try expectLuaOk(&L,
+        \\local v, err = plugin.get_config()
+        \\assert(v == nil, "malformed settings yield nil")
+        \\assert(err == "get_config: settings must be a JSON object", "got: " .. tostring(err))
+        \\return "OK"
+    );
+
+    // A JSON scalar also decodes to a Lua value — the object check must
+    // reject it before the push.
+    seedSettingsSlot(&L, "42");
+    try expectLuaOk(&L,
+        \\local v, err = plugin.get_config()
+        \\assert(v == nil, "scalar settings yield nil")
+        \\assert(err == "get_config: settings must be a JSON object", "got: " .. tostring(err))
+        \\return "OK"
+    );
+
+    // A JSON array decodes to a Lua table — it must be rejected too.
+    seedSettingsSlot(&L, "[1,2]");
+    try expectLuaOk(&L,
+        \\local v, err = plugin.get_config()
+        \\assert(v == nil, "array settings yield nil")
+        \\assert(err == "get_config: settings must be a JSON object", "got: " .. tostring(err))
         \\return "OK"
     );
 }

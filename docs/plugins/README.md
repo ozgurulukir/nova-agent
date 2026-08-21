@@ -134,8 +134,10 @@ Each subdirectory containing a `plugin.lua` file is treated as a plugin.
 All filesystem functions validate paths through `sanitizePath`: paths are
 resolved against the project root and **rejected if they escape it**. This
 makes the dedicated path ops (`mkdir`/`copy_path`/`move_path`/`delete_path`)
-strictly safer than `nova.run_bash("rm -rf ...")`, which runs unclassified and
-unguarded in the plugin sandbox. Prefer the dedicated tools for file
+safer and more precise than shell-outs: `nova.run_bash` commands pass through
+the shell safety classifier (destructive forms are hard-blocked with
+`UnsafeShellBlocked` — see the API reference), but the dedicated tools carry
+no shell-quoting or classification burden at all. Prefer them for file
 operations.
 
 `nova.find_files` supports glob patterns: `**` (spans directories), `*`
@@ -146,7 +148,9 @@ matches every `.zig` file at any depth. gitignore is NOT honored.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Shell command execution |
+| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution, gated by the shell safety classifier |
+| `nova.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (pwsh on Windows, bash on POSIX), same gate |
+| `nova.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, `"native"`) | `string` or `nil, err` | Quote one argument for a shell command line — use it for every interpolated value |
 | `nova.get_env(name)` | `name` | `string` or `nil` | Environment variable |
 | `nova.get_cwd()` | — | `string` | Current working directory |
 | `nova.get_project_root()` | — | `string` | Git repo root or cwd |
@@ -186,16 +190,19 @@ key shape — a table with non-integer or sparse keys serializes as an object.
 `nova.on(event_name, callback)` subscribes to a lifecycle event. The callback
 receives a `data` table whose shape depends on the event. Events are emitted by
 the agent loop at tool-call boundaries and delivered to every active plugin.
+Only `tool_call_started` and `tool_call_finished` are currently emitted in
+production; the other five are subscribable but not currently emitted (kept
+for forward compatibility).
 
 | Event | `data` shape | When it fires |
 |-------|--------------|---------------|
-| `turn_started` | `{}` | A new agent turn starts |
-| `turn_ended` | `{}` | An agent turn ends |
+| `turn_started` | `{}` | A new agent turn starts *(not currently emitted)* |
+| `turn_ended` | `{}` | An agent turn ends *(not currently emitted)* |
 | `tool_call_started` | `{ name, call_id }` | A tool call begins |
 | `tool_call_finished` | `{ name, call_id, success }` | A tool call completes |
-| `response_received` | `{}` | A response was received from the LLM |
-| `plugin_loaded` | `{ name }` | A plugin was loaded |
-| `plugin_unloaded` | `{ name }` | A plugin was unloaded |
+| `response_received` | `{}` | A response was received from the LLM *(not currently emitted)* |
+| `plugin_loaded` | `{ name }` | A plugin was loaded *(not currently emitted)* |
+| `plugin_unloaded` | `{ name }` | A plugin was unloaded *(not currently emitted)* |
 
 ```lua
 nova.on("tool_call_finished", function(data)
@@ -227,10 +234,18 @@ function set_state(state)
 end
 ```
 
-> **Note:** There is no `plugin.get_config()` bridge. Plugin settings from
-> `config.json` are not currently injected into the Lua state. If your plugin
-> needs configuration, read it yourself from a known file path via
-> `nova.read_file`.
+This state is in-memory only and is lost on restart. For durable state, write
+a file sidecar (`.nova/<plugin>/state.json` via `nova.write_file` +
+`nova.json_encode`) — the pattern the `todo` example plugin uses.
+
+### Plugin configuration
+
+`plugin.get_config()` returns your plugin's `config.json` settings as a table
+(or `nil` when unconfigured). `plugin` is a reserved global name. Settings are
+read once at App start — set `"enabled": false` in config.json to skip loading
+a plugin entirely; either way, restart Nova to apply config changes. See the
+API reference for the full contract and `docs/CONFIG.md` for both settings
+forms (escaped JSON string or inline object).
 
 ## Permissions
 
