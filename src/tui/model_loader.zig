@@ -4,7 +4,6 @@ const log = std.log.scoped(.tui);
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
-const openai_compatible_models_mod = @import("../ai/openai_compatible_models.zig");
 const symbols = @import("../symbols.zig");
 
 /// Bir modelin provenance'ı + bağlantı bilgisi. Entry ile birlikte dolaşır;
@@ -166,8 +165,6 @@ const LoadCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
-    include_locals: bool,
-    codex_signed_in: bool,
 };
 
 /// Worker entry point for one provider. Isolated so a slow/unreachable host
@@ -176,7 +173,7 @@ const LoadCtx = struct {
 fn loadOneProvider(ctx: *LoadCtx) Result {
     const gpa = ctx.gpa;
     var partial: Result = .{ .gpa = gpa };
-    loadAndRecordCtx(gpa, ctx.io, ctx.configured, ctx.include_locals, ctx.codex_signed_in, &partial) catch |err| {
+    loadAndRecordCtx(gpa, ctx.io, ctx.configured, &partial) catch |err| {
         log.warn("model load {s}: failed: {s}", .{ ctx.configured.provider.label(), @errorName(err) });
         partial.outcomes.append(gpa, .{ .provider = ctx.configured.provider, .ok = false }) catch {};
     };
@@ -188,34 +185,40 @@ fn loadOneProvider(ctx: *LoadCtx) Result {
 /// the sum — a single unreachable host no longer stalls the whole catalogue.
 /// Each worker's `listModels` carries its own 10s timeout internally, so a
 /// hung endpoint is cancelled and recorded as failed while the others load.
+/// Providers are processed in batches of 16 (concurrency cap) so any number of
+/// configured providers loads without silent truncation.
 fn loadConnectedParallel(job: *Job, result: *Result) !void {
     if (job.configured.len == 0) return;
     var futures: [16]?std.Io.Future(Result) = .{null} ** 16;
     var ctxs: [16]LoadCtx = undefined;
-    const n = @min(job.configured.len, futures.len);
-    for (job.configured[0..n], 0..) |configured, i| {
-        ctxs[i] = .{
-            .gpa = job.gpa,
-            .io = job.io,
-            .configured = configured,
-            .include_locals = job.include_locals,
-            .codex_signed_in = job.codex_signed_in,
-        };
-        futures[i] = job.io.concurrent(loadOneProvider, .{&ctxs[i]}) catch |err| blk: {
-            log.warn("model load {s}: spawn failed: {s}", .{ configured.provider.label(), @errorName(err) });
-            break :blk @as(?std.Io.Future(Result), null);
-        };
-    }
-    for (0..n) |i| {
-        if (futures[i]) |*f| {
-            var partial = f.await(job.io);
-            mergeResult(result, &partial);
-            partial.deinit(job.gpa);
-        } else {
-            // Spawn failed: record the outcome so the badge reflects it.
-            try result.outcomes.append(job.gpa, .{ .provider = job.configured[i].provider, .ok = false });
+    var start: usize = 0;
+    while (start < job.configured.len) : (start += futures.len) {
+        const end = @min(start + futures.len, job.configured.len);
+        for (job.configured[start..end], start..) |configured, i| {
+            ctxs[i] = .{
+                .gpa = job.gpa,
+                .io = job.io,
+                .configured = configured,
+            };
+            futures[i] = job.io.concurrent(loadOneProvider, .{&ctxs[i]}) catch |err| blk: {
+                log.warn("model load {s}: spawn failed: {s}", .{ configured.provider.label(), @errorName(err) });
+                break :blk @as(?std.Io.Future(Result), null);
+            };
+        }
+        for (start..end) |i| {
+            if (futures[i - start]) |*f| {
+                var partial = f.await(job.io);
+                mergeResult(result, &partial);
+                partial.deinit(job.gpa);
+            } else {
+                // Spawn failed: record the outcome so the badge reflects it.
+                try result.outcomes.append(job.gpa, .{ .provider = job.configured[i].provider, .ok = false });
+            }
         }
     }
+    // Locals (Ollama/llama.cpp) and Codex are shared across all providers and
+    // must be loaded exactly once — not N times (once per worker above).
+    loadSharedExtras(job.gpa, job.io, job.include_locals, job.codex_signed_in, result);
 }
 
 /// Move a partial result's models/sources/outcomes into the aggregate.
@@ -230,7 +233,7 @@ fn mergeResult(agg: *Result, partial: *Result) void {
 /// neither aborts the others nor vanishes without explanation. Only an
 /// allocation failure recording the outcome propagates.
 fn loadAndRecord(job: *Job, configured: Configured, result: *Result) !void {
-    try loadAndRecordCtx(job.gpa, job.io, configured, job.include_locals, job.codex_signed_in, result);
+    try loadAndRecordCtx(job.gpa, job.io, configured, result);
 }
 
 /// Context-parameterized variant used by both the sequential `single_provider`
@@ -239,12 +242,10 @@ fn loadAndRecordCtx(
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
-    include_locals: bool,
-    codex_signed_in: bool,
     result: *Result,
 ) !void {
     const before = result.models.items.len;
-    if (loadConfiguredCtx(gpa, io, configured, include_locals, codex_signed_in, result)) |_| {
+    if (loadConfiguredCtx(gpa, io, configured, result)) |_| {
         const added = result.models.items.len - before;
         try result.outcomes.append(gpa, .{ .provider = configured.provider, .ok = added > 0 });
     } else |err| {
@@ -254,15 +255,13 @@ fn loadAndRecordCtx(
 }
 
 fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
-    try loadConfiguredCtx(job.gpa, job.io, configured, job.include_locals, job.codex_signed_in, result);
+    try loadConfiguredCtx(job.gpa, job.io, configured, result);
 }
 
 fn loadConfiguredCtx(
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
-    include_locals: bool,
-    codex_signed_in: bool,
     result: *Result,
 ) !void {
     // base_url may be "" when synthesized from session metadata or legacy
@@ -271,7 +270,7 @@ fn loadConfiguredCtx(
         configured.base_url
     else
         configured.provider.defaultBaseUrl() orelse return;
-    const fetched = try openai_compatible_models_mod.listModelsWithTimeout(gpa, io, base_url, configured.api_key, 10_000);
+    const fetched = try openai_compatible_mod.listModelsWithTimeout(gpa, io, base_url, configured.api_key, 10_000);
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);
@@ -292,11 +291,18 @@ fn loadConfiguredCtx(
             configured.auth_key_id,
         ) });
     }
+}
+
+/// Load the shared local (Ollama / llama.cpp) and Codex providers exactly
+/// once for the whole catalogue, not per-configured-provider. In the parallel
+/// `connected_provider` path each provider runs in its own worker, so calling
+/// these inside `loadConfiguredCtx` would fetch + duplicate them N times.
+fn loadSharedExtras(gpa: std.mem.Allocator, io: std.Io, include_locals: bool, codex_signed_in: bool, result: *Result) void {
     if (include_locals) {
         loadLocalCtx(gpa, io, .ollama, result) catch {};
         loadLocalCtx(gpa, io, .llama_cpp, result) catch {};
     }
-    if (codex_signed_in) try loadStatic(gpa, result);
+    if (codex_signed_in) loadStatic(gpa, result) catch {};
 }
 
 fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
@@ -306,7 +312,7 @@ fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
 fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provider, result: *Result) !void {
     const base_url = provider.defaultBaseUrl() orelse return;
     const api_key = providerLocalApiKey(provider);
-    const fetched = try openai_compatible_models_mod.listModelsWithTimeout(gpa, io, base_url, api_key, 10_000);
+    const fetched = try openai_compatible_mod.listModelsWithTimeout(gpa, io, base_url, api_key, 10_000);
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);

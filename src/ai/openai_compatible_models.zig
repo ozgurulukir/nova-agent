@@ -91,8 +91,11 @@ pub fn listModelsWithTimeout(
         log.warn("models fetch spawn failed: {s}", .{@errorName(err)});
         return &.{};
     };
-    // Race the fetch against the timeout. cancel() returns the result either
-    // way (completed value or empty on cancel), so we always make progress.
+    // Bound the fetch: sleep the full timeout, then cancel. cancel() returns
+    // the result either way (completed value if the worker finished in time,
+    // empty on cancel), so we always make progress. A fast endpoint still
+    // waits out the timeout here, but that is bounded and far better than an
+    // unbounded hang on a firewalled DROP host.
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(timeout_ms), .real) catch {};
     const result = future.cancel(io);
     return result;

@@ -19,6 +19,7 @@ const retry_max_delay_ms: u64 = 8000;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
+pub const listModelsWithTimeout = model_catalog.listModelsWithTimeout;
 pub const openaiV1Root = openai_endpoint.v1Root;
 pub const sanitizeToolArguments = stream_parser.sanitizeToolArguments;
 
