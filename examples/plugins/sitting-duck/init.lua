@@ -462,6 +462,15 @@ local function run_query(sql)
         .. " (duckdb binary changed?). The bootstrap marker was cleared —"
         .. " call this tool again to re-install the extension."
     end
+    -- Extension-less globs match files no grammar claims (.txt, .png, …)
+    -- and read_ast fails file detection at BIND time — ignore_errors does
+    -- not cover it. Point the model at the fix instead of the raw error.
+    if tostring(res.stderr or ""):find("Could not detect language", 1, true) then
+      return nil, "Error: read_ast could not detect a language for a file"
+        .. " matched by the glob — narrow it to source extensions (e.g."
+        .. " 'src/**/*.zig' instead of 'src/**'). Detail:"
+        .. " " .. stderr_tail(res.stderr, 2)
+    end
     return nil, "Error: duckdb query failed: " .. stderr_tail(res.stderr, 3)
       .. " — the exact script sent is at " .. QUERY_PATH
   end
@@ -526,7 +535,15 @@ local function shape_pattern(rows, pattern)
       end
     end
     table.sort(caps)
-    local cap_str = (#caps > 0) and (" " .. table.concat(caps, " ")) or ""
+    local cap_str
+    if #caps > 0 then
+      cap_str = " " .. table.concat(caps, " ")
+    else
+      -- Anonymous-only patterns carry no capture names; the matched root's
+      -- peek (first line) identifies the hit instead.
+      local first = tostring(r.peek or ""):match("^[^\r\n]*") or ""
+      cap_str = (first ~= "") and (" peek: " .. truncate_cell(first, 80)) or ""
+    end
     table.insert(out, string.format("%s:L%d-%d%s node_id: %s",
       tostring(r.file_path or "?"),
       tonumber(r.start_line) or 0, tonumber(r.end_line) or 0, cap_str,

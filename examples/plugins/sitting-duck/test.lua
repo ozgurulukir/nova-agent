@@ -151,6 +151,9 @@ local ROWS_JSON = '[{"node_id":1,"type":"function_definition","file_path":"src/a
 local MATCH_JSON = '[{"node_id":107,"file_path":"src/skill.zig","start_line":18,"end_line":25,'
   .. '"peek":"fn deinit(self: *Self) void {","captures":{"FN":[{"capture":"FN","node_id":107,'
   .. '"type":"function_declaration","name":"deinit","peek":"fn deinit","start_line":18,"end_line":25}]}}]'
+-- Anonymous-only patterns return rows with captures = null (verified live).
+local ANON_JSON = '[{"node_id":107,"file_path":"src/skill.zig","start_line":18,"end_line":25,'
+  .. '"peek":"pub fn deinit(self: *Self) void {","captures":null}]'
 local VERSION = "v1.4.3 abc123"
 local READY = '[{"status":"ready"}]'
 
@@ -436,6 +439,22 @@ test.describe("sql pins", function()
     test.assert.is_true(sql_log[2]:find("LIKE '%class%'", 1, true) ~= nil)
     test.assert.is_true(sql_log[2]:find("%function%", 1, true) == nil)
   end)
+
+  test.it("language-detect failure hints to narrow the glob", function()
+    fresh()
+    seed_marker(VERSION)
+    table.insert(version_q, { code = 0, stdout = VERSION })
+    table.insert(query_q, {
+      code = 1,
+      stderr = "IO Error: Failed to initialize file processing:"
+        .. ' {"exception_type":"Binder","exception_message":"Could not detect'
+        .. ' language for file: src/assets/blackhole/frame_000.txt"}',
+    })
+    local out = outline({ glob = "src/**" })
+    test.assert.is_true(out:find("narrow it to source extensions", 1, true) ~= nil)
+    test.assert.is_true(out:find("src/**/*.zig", 1, true) ~= nil)
+    test.assert.is_true(out:find("frame_000.txt", 1, true) ~= nil)
+  end)
 end)
 
 -- ── ast_find_pattern ────────────────────────────────────────────────
@@ -500,6 +519,18 @@ test.describe("find_pattern", function()
     })
     test.assert.is_true(out:find("src/skill.zig:L18-25", 1, true) ~= nil)
     test.assert.is_true(out:find("FN=deinit (function_declaration)", 1, true) ~= nil)
+    test.assert.is_true(out:find("node_id: 107", 1, true) ~= nil)
+  end)
+
+  test.it("anonymous-only matches fall back to the root peek", function()
+    fresh()
+    seed_marker(VERSION)
+    table.insert(version_q, { code = 0, stdout = VERSION })
+    table.insert(query_q, { code = 0, stdout = ANON_JSON })
+    local out = registered.ast_find_pattern.handler({
+      pattern = "fn __(__) void {}", glob = "src/**/*.zig",
+    })
+    test.assert.is_true(out:find("peek: pub fn deinit", 1, true) ~= nil)
     test.assert.is_true(out:find("node_id: 107", 1, true) ~= nil)
   end)
 end)
@@ -666,7 +697,7 @@ test.describe("ast_query guards", function()
     test.assert.is_true(out:find("read-only", 1, true) ~= nil)
     test.assert.is_true(out:find("SELECT or WITH", 1, true) ~= nil)
     local ok = registered.ast_query.handler({
-      sql = "  select type, count(*) from read_ast('src/**') limit 5;",
+      sql = "  select type, count(*) from read_ast('src/**/*.zig') limit 5;",
     })
     test.assert.is_true(ok:find("Error", 1, true) == nil)
   end)
@@ -747,7 +778,7 @@ test.describe("ast_query guards", function()
     table.remove(query_q, 1)
     table.insert(query_q, { code = 0, stdout = '[{"file_path":"src/a.zig","types":["function_definition","method"]}]' })
     local out = registered.ast_query.handler({
-      sql = "SELECT file_path, list(type) AS types FROM read_ast('src/**') GROUP BY file_path LIMIT 5;",
+      sql = "SELECT file_path, list(type) AS types FROM read_ast('src/**/*.zig') GROUP BY file_path LIMIT 5;",
     })
     test.assert.is_true(out:find("types=[", 1, true) ~= nil)
     test.assert.is_true(out:find("function_definition", 1, true) ~= nil)
