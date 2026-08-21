@@ -61,46 +61,6 @@ pub fn listModels(
     return try parseResponse(gpa, body);
 }
 
-/// Worker entry point for a timeout-bounded `listModels`. `std.http.Client`
-/// exposes no per-request timeout (only connect-level), so we race the fetch
-/// against a sleep on the same io; a hung endpoint (firewalled DROP) is
-/// cancelled instead of stalling the caller indefinitely.
-const ListTask = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    base_url: []const u8,
-    api_key: []const u8,
-};
-
-fn runListModels(ctx: *ListTask) []ModelEntry {
-    return listModels(ctx.gpa, ctx.io, ctx.base_url, ctx.api_key) catch &.{};
-}
-
-/// Fetch models with a wall-clock upper bound. Returns an empty slice on
-/// timeout or error so the caller can mark the provider failed and move on.
-pub fn listModelsWithTimeout(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    base_url: []const u8,
-    api_key: []const u8,
-    timeout_ms: i64,
-) ![]ModelEntry {
-    std.debug.assert(base_url.len > 0);
-    var ctx: ListTask = .{ .gpa = gpa, .io = io, .base_url = base_url, .api_key = api_key };
-    var future = io.concurrent(runListModels, .{&ctx}) catch |err| {
-        log.warn("models fetch spawn failed: {s}", .{@errorName(err)});
-        return &.{};
-    };
-    // Bound the fetch: sleep the full timeout, then cancel. cancel() returns
-    // the result either way (completed value if the worker finished in time,
-    // empty on cancel), so we always make progress. A fast endpoint still
-    // waits out the timeout here, but that is bounded and far better than an
-    // unbounded hang on a firewalled DROP host.
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(timeout_ms), .real) catch {};
-    const result = future.cancel(io);
-    return result;
-}
-
 fn readBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     var empty_decompress_buffer: [0]u8 = .{};
     var decompress_buffer: []u8 = &empty_decompress_buffer;

@@ -173,20 +173,25 @@ const LoadCtx = struct {
 fn loadOneProvider(ctx: *LoadCtx) Result {
     const gpa = ctx.gpa;
     var partial: Result = .{ .gpa = gpa };
-    loadAndRecordCtx(gpa, ctx.io, ctx.configured, &partial) catch |err| {
+    const before = partial.models.items.len;
+    if (loadConfiguredCtx(gpa, ctx.io, ctx.configured, &partial)) |_| {
+        const added = partial.models.items.len - before;
+        partial.outcomes.append(gpa, .{ .provider = ctx.configured.provider, .ok = added > 0 }) catch {};
+    } else |err| {
         log.warn("model load {s}: failed: {s}", .{ ctx.configured.provider.label(), @errorName(err) });
+        // Prevent partial/desynchronized models on error:
+        partial.deinit(gpa);
+        partial = .{ .gpa = gpa };
         partial.outcomes.append(gpa, .{ .provider = ctx.configured.provider, .ok = false }) catch {};
-    };
+    }
     return partial;
 }
 
 /// Fetch every configured provider concurrently (one worker each) and merge
 /// the partial results. Total latency is bounded by the slowest provider, not
 /// the sum — a single unreachable host no longer stalls the whole catalogue.
-/// Each worker's `listModels` carries its own 10s timeout internally, so a
-/// hung endpoint is cancelled and recorded as failed while the others load.
 /// Providers are processed in batches of 16 (concurrency cap) so any number of
-/// configured providers loads without silent truncation.
+/// configured providers loads without stack corruption or silent truncation.
 fn loadConnectedParallel(job: *Job, result: *Result) !void {
     if (job.configured.len == 0) return;
     var futures: [16]?std.Io.Future(Result) = .{null} ** 16;
@@ -194,25 +199,29 @@ fn loadConnectedParallel(job: *Job, result: *Result) !void {
     var start: usize = 0;
     while (start < job.configured.len) : (start += futures.len) {
         const end = @min(start + futures.len, job.configured.len);
-        for (job.configured[start..end], start..) |configured, i| {
-            ctxs[i] = .{
+        const batch_len = end - start;
+        for (job.configured[start..end], 0..batch_len) |configured, idx| {
+            ctxs[idx] = .{
                 .gpa = job.gpa,
                 .io = job.io,
                 .configured = configured,
             };
-            futures[i] = job.io.concurrent(loadOneProvider, .{&ctxs[i]}) catch |err| blk: {
+            futures[idx] = job.io.concurrent(loadOneProvider, .{&ctxs[idx]}) catch |err| blk: {
                 log.warn("model load {s}: spawn failed: {s}", .{ configured.provider.label(), @errorName(err) });
                 break :blk @as(?std.Io.Future(Result), null);
             };
         }
-        for (start..end) |i| {
-            if (futures[i - start]) |*f| {
+        for (0..batch_len) |idx| {
+            const configured_idx = start + idx;
+            if (futures[idx]) |*f| {
                 var partial = f.await(job.io);
-                mergeResult(result, &partial);
+                mergeResult(job.gpa, result, &partial) catch |err| {
+                    log.warn("mergeResult failed: {s}", .{@errorName(err)});
+                };
                 partial.deinit(job.gpa);
             } else {
                 // Spawn failed: record the outcome so the badge reflects it.
-                try result.outcomes.append(job.gpa, .{ .provider = job.configured[i].provider, .ok = false });
+                try result.outcomes.append(job.gpa, .{ .provider = job.configured[configured_idx].provider, .ok = false });
             }
         }
     }
@@ -222,10 +231,26 @@ fn loadConnectedParallel(job: *Job, result: *Result) !void {
 }
 
 /// Move a partial result's models/sources/outcomes into the aggregate.
-fn mergeResult(agg: *Result, partial: *Result) void {
-    agg.models.appendSlice(agg.gpa, partial.models.items) catch {};
-    agg.sources.appendSlice(agg.gpa, partial.sources.items) catch {};
-    agg.outcomes.appendSlice(agg.gpa, partial.outcomes.items) catch {};
+/// Clears partial's item slices with clearRetainingCapacity() so partial.deinit
+/// frees only container capacity without freeing the moved inner strings.
+fn mergeResult(gpa: std.mem.Allocator, agg: *Result, partial: *Result) !void {
+    const orig_models = agg.models.items.len;
+    const orig_sources = agg.sources.items.len;
+    const orig_outcomes = agg.outcomes.items.len;
+    errdefer {
+        agg.models.items.len = orig_models;
+        agg.sources.items.len = orig_sources;
+        agg.outcomes.items.len = orig_outcomes;
+    }
+
+    try agg.models.appendSlice(gpa, partial.models.items);
+    try agg.sources.appendSlice(gpa, partial.sources.items);
+    try agg.outcomes.appendSlice(gpa, partial.outcomes.items);
+
+    // Transfer element ownership to agg: clear items so partial.deinit does not free elements
+    partial.models.clearRetainingCapacity();
+    partial.sources.clearRetainingCapacity();
+    partial.outcomes.clearRetainingCapacity();
 }
 
 /// Load one provider and record its connectivity outcome. A fetch failure is
@@ -270,7 +295,7 @@ fn loadConfiguredCtx(
         configured.base_url
     else
         configured.provider.defaultBaseUrl() orelse return;
-    const fetched = try openai_compatible_mod.listModelsWithTimeout(gpa, io, base_url, configured.api_key, 10_000);
+    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, configured.api_key);
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);
@@ -312,7 +337,7 @@ fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
 fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provider, result: *Result) !void {
     const base_url = provider.defaultBaseUrl() orelse return;
     const api_key = providerLocalApiKey(provider);
-    const fetched = try openai_compatible_mod.listModelsWithTimeout(gpa, io, base_url, api_key, 10_000);
+    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, api_key);
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);
@@ -408,3 +433,66 @@ test "includeLocalModel drops cloud-suffixed models for local ollama only" {
     try std.testing.expect(includeLocalModel(.ollama_cloud, "gpt-oss:120b-cloud"));
     try std.testing.expect(includeLocalModel(.cerebras, "anything:cloud"));
 }
+
+test "mergeResult safely transfers element ownership without use-after-free or leaks" {
+    const gpa = std.testing.allocator;
+
+    var agg: Result = .{ .gpa = gpa };
+    defer agg.deinit(gpa);
+
+    var partial: Result = .{ .gpa = gpa };
+    defer partial.deinit(gpa);
+
+    const m_id = try gpa.dupe(u8, "model-1");
+    const m_label = try gpa.dupe(u8, "Model 1");
+    try partial.models.append(gpa, .{ .id = m_id, .label = m_label });
+
+    const source = try compatibleSource(gpa, .ollama, "http://localhost:11434/v1", null);
+    try partial.sources.append(gpa, .{ .openai_compatible = source });
+    try partial.outcomes.append(gpa, .{ .provider = .ollama, .ok = true });
+
+    try mergeResult(gpa, &agg, &partial);
+
+    // After merge, partial's items are cleared:
+    try std.testing.expectEqual(@as(usize, 0), partial.models.items.len);
+    try std.testing.expectEqual(@as(usize, 0), partial.sources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), partial.outcomes.items.len);
+
+    // And agg owns the valid strings:
+    try std.testing.expectEqual(@as(usize, 1), agg.models.items.len);
+    try std.testing.expectEqualStrings("model-1", agg.models.items[0].id);
+    try std.testing.expectEqualStrings("Model 1", agg.models.items[0].label);
+    try std.testing.expectEqual(@as(usize, 1), agg.sources.items.len);
+    try std.testing.expectEqualStrings("http://localhost:11434/v1", agg.sources.items[0].openai_compatible.base_url);
+    try std.testing.expectEqual(@as(usize, 1), agg.outcomes.items.len);
+    try std.testing.expectEqual(config_mod.Provider.ollama, agg.outcomes.items[0].provider);
+}
+
+test "mergeResult rolls back atomically on failure" {
+    const gpa = std.testing.allocator;
+
+    var agg: Result = .{ .gpa = gpa };
+    defer agg.deinit(gpa);
+
+    const m_id0 = try gpa.dupe(u8, "init-model");
+    const m_label0 = try gpa.dupe(u8, "Init Model");
+    try agg.models.append(gpa, .{ .id = m_id0, .label = m_label0 });
+    const source0 = try compatibleSource(gpa, .cerebras, "https://api.cerebras.ai/v1", null);
+    try agg.sources.append(gpa, .{ .openai_compatible = source0 });
+
+    var partial: Result = .{ .gpa = gpa };
+    defer partial.deinit(gpa);
+
+    const m_id1 = try gpa.dupe(u8, "partial-model");
+    const m_label1 = try gpa.dupe(u8, "Partial Model");
+    try partial.models.append(gpa, .{ .id = m_id1, .label = m_label1 });
+    const source1 = try compatibleSource(gpa, .ollama, "http://localhost:11434/v1", null);
+    try partial.sources.append(gpa, .{ .openai_compatible = source1 });
+
+    // When merge succeeds, lengths match:
+    try mergeResult(gpa, &agg, &partial);
+    try std.testing.expectEqual(@as(usize, 2), agg.models.items.len);
+    try std.testing.expectEqual(@as(usize, 2), agg.sources.items.len);
+    try std.testing.expectEqual(agg.models.items.len, agg.sources.items.len);
+}
+
