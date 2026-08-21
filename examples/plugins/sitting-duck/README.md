@@ -20,12 +20,24 @@ They are exposed to the model as `lua__sitting-duck__<tool>`.
 
 - **Nova 0.5.0+** — uses the `plugin.get_config()` / `nova.shell_quote()`
   bridge surface.
-- **duckdb CLI** — found via `plugins.sitting-duck.settings.duckdb_path` →
+- **duckdb CLI** — the plugin never installs this itself; pick one:
+
+  ```bash
+  curl https://install.duckdb.org | sh   # official script (Linux/macOS)
+  brew install duckdb                    # Homebrew
+  ```
+
+  or download the single binary from <https://duckdb.org/install/>. The
+  plugin finds it via `plugins.sitting-duck.settings.duckdb_path` →
   `NOVA_SITTING_DUCK_BIN` env var → `duckdb` on `PATH`, in that order.
 - **Internet on first use** — the `sitting_duck` community extension is
-  `INSTALL`ed automatically on the first tool call (up to a few minutes on a
-  slow link; success is cached in `.nova/sitting-duck/state.json` and
-  re-verified once per session, so a duckdb upgrade triggers a re-install).
+  `INSTALL`ed automatically by the plugin on the first tool call, through
+  duckdb's own community-extension mechanism — no manual step (and no reason
+  to pre-install: `INSTALL` is idempotent, so doing it yourself only skips
+  the one-time download). Success is cached in
+  `.nova/sitting-duck/state.json` and re-verified once per session, so a
+  duckdb upgrade triggers a re-install (the extension is built per DuckDB
+  release).
 - **Linux-first.** Windows runs the plugin through git-bash and is untested.
 
 ## Install
