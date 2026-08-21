@@ -5,6 +5,7 @@ const std = @import("std");
 const log = std.log.scoped(.mcp);
 const config_mod = @import("../config/config.zig");
 const os = @import("../os.zig");
+const http = @import("../http.zig");
 const tools_common = @import("../tools/common.zig");
 const transport = @import("transport.zig");
 const schema_mod = @import("schema.zig");
@@ -16,6 +17,15 @@ const http_body_buffer_bytes = 8 * 1024;
 const http_redirect_buffer_bytes = 16 * 1024;
 const http_transfer_buffer_bytes = 64 * 1024;
 const http_response_bytes_max = 64 * 1024 * 1024;
+
+// MCP protocol version strings (spec-mandated — the server echoes one back
+// during `initialize` negotiation, so these values can never change).
+const protocol_version_stdio = "2024-11-05";
+const protocol_version_streamable_http = "2025-03-26";
+
+/// The Streamable HTTP `Accept` value: either a single JSON body or an SSE
+/// stream (MCP spec contract).
+const accept_streamable_http = http.content_type_json ++ ", " ++ http.media_type_event_stream;
 
 /// A zeroed `std.process.Child` placeholder. On Windows the `thread_handle`
 /// field is a non-nullable HANDLE, so `std.mem.zeroes` cannot be used; a
@@ -584,7 +594,7 @@ pub const McpClient = struct {
         const extra_headers = try self.buildExtraHeaders(self.gpa);
         defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
-            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .headers = .{ .content_type = .{ .override = http.content_type_json } },
             .extra_headers = extra_headers,
         });
         defer req.deinit();
@@ -597,7 +607,7 @@ pub const McpClient = struct {
         const status_code: u16 = @intFromEnum(response.head.status);
         if (status_code == 404) return error.McpSessionExpired;
         if (status_code == 401 or status_code == 403) return error.McpUnauthorized;
-        if (status_code < 200 or status_code >= 300) return error.McpHttpRequestFailed;
+        if (!http.isSuccess(status_code)) return error.McpHttpRequestFailed;
 
         // Capture session id + content type BEFORE the body reader invalidates
         // the head's borrowed pointers.
@@ -641,7 +651,7 @@ pub const McpClient = struct {
         const extra_headers = try self.buildExtraHeaders(self.gpa);
         defer self.gpa.free(extra_headers);
         var req = try client.request(.POST, try std.Uri.parse(url), .{
-            .headers = .{ .content_type = .{ .override = "application/json" } },
+            .headers = .{ .content_type = .{ .override = http.content_type_json } },
             .extra_headers = extra_headers,
         });
         defer req.deinit();
@@ -669,7 +679,7 @@ pub const McpClient = struct {
         const count = 1 + custom.len + (if (self.session_id != null) @as(usize, 1) else 0);
         const headers = try gpa.alloc(std.http.Header, count);
         var i: usize = 0;
-        headers[i] = .{ .name = "Accept", .value = "application/json, text/event-stream" };
+        headers[i] = .{ .name = "Accept", .value = accept_streamable_http };
         i += 1;
         if (self.session_id) |sid| {
             headers[i] = .{ .name = "Mcp-Session-Id", .value = sid };
@@ -706,8 +716,8 @@ pub const McpClient = struct {
         // Streamable HTTP requires protocol 2025-03-26+; stdio keeps the
         // original version so existing local servers are unaffected.
         const protocol_version: []const u8 = switch (self.transport) {
-            .stdio => "2024-11-05",
-            .sse => "2025-03-26",
+            .stdio => protocol_version_stdio,
+            .sse => protocol_version_streamable_http,
         };
         const params = try std.fmt.allocPrint(self.gpa,
             \\{{"protocolVersion":"{s}","capabilities":{{}},"clientInfo":{{"name":"nova","version":"1.0"}}}}
@@ -905,7 +915,7 @@ fn writeBody(req: *std.http.Client.Request, body: []const u8) !void {
 /// stream) rather than a single `application/json` body.
 fn isEventStream(head: std.http.Client.Response.Head) bool {
     const content_type = head.content_type orelse return false;
-    return std.mem.indexOf(u8, content_type, "text/event-stream") != null;
+    return std.mem.indexOf(u8, content_type, http.media_type_event_stream) != null;
 }
 
 /// Read a single `application/json` response body, honouring content-encoding

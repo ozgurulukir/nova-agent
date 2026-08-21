@@ -220,7 +220,8 @@ fn resolveStderrLevel(env: anytype) ?std.log.Level {
 }
 
 /// P2: parse `NOVA_LOG_MAX_BYTES` (decimal). Defaults to the logger's built-in
-/// 10 MB cap. Bad input falls back to the default rather than disabling
+/// cap (`logger.default_max_bytes`) so the env fallback and the API default can
+/// never diverge. Bad input falls back to the default rather than disabling
 /// rotation silently.
 fn resolveMaxBytes(env: anytype) u64 {
     if (env.get("NOVA_LOG_MAX_BYTES")) |raw| {
@@ -228,7 +229,7 @@ fn resolveMaxBytes(env: anytype) u64 {
             if (n > 0) return n;
         } else |_| {}
     }
-    return 10 * 1024 * 1024;
+    return logger.default_max_bytes;
 }
 
 fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error![]u8 {
@@ -302,4 +303,13 @@ test {
     _ = @import("ai/stream_part.zig");
     _ = @import("tools/executor_safety.zig");
     _ = @import("tools/executor_validation.zig");
+    // Temp-file prefix SSOT between the spill/script writers and the startup
+    // pruner; referenced explicitly so its lockstep test runs.
+    _ = @import("tools/temp_files.zig");
+    // Shared HTTP plumbing (buffers, media types, status predicates);
+    // referenced explicitly so its inline tests run.
+    _ = @import("http.zig");
+    // Idle-lane notice SSOT shared by mode/turn lifecycle; referenced
+    // explicitly so its byte-pinning test runs.
+    _ = @import("tui/lanes.zig");
 }

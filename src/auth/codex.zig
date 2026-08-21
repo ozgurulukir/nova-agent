@@ -8,6 +8,7 @@ const std = @import("std");
 const log = std.log.scoped(.auth);
 
 const os = @import("../os.zig");
+const http = @import("../http.zig");
 const symbols = @import("../symbols.zig");
 const auth = @import("store.zig");
 
@@ -27,7 +28,10 @@ const auth_host = "127.0.0.1";
 const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 const authorize_url = "https://auth.openai.com/oauth/authorize";
 const token_url = "https://auth.openai.com/oauth/token";
-const redirect_uri = "http://localhost:1455/auth/callback";
+/// The redirect URI is registered with the OAuth app — its host is
+/// deliberately `localhost` (not the `auth_host` the listener binds) and its
+/// port must stay in lockstep with `auth_port`, hence the composition.
+const redirect_uri = std.fmt.comptimePrint("http://localhost:{d}/auth/callback", .{auth_port});
 const scope = "openid profile email offline_access";
 const jwt_claim_path = "https://api.openai.com/auth";
 
@@ -232,20 +236,25 @@ fn tokenRequest(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Credentia
     var req = try client.request(.POST, try std.Uri.parse(token_url), .{ .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } } });
     defer req.deinit();
     req.transfer_encoding = .{ .content_length = body.len };
-    var buffer: [4096]u8 = undefined;
+    var buffer: [http.body_buffer_bytes]u8 = undefined;
     var body_writer = try req.sendBodyUnflushed(&buffer);
     try body_writer.writer.writeAll(body);
     try body_writer.end();
     try req.connection.?.flush();
-    var redirect_buffer: [8192]u8 = undefined;
+    var redirect_buffer: [http.redirect_buffer_bytes]u8 = undefined;
     var response = try req.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
     const bytes = try readResponseBody(gpa, &response);
     defer gpa.free(bytes);
     log.info("codex.token.response status={d}", .{status});
-    if (status < 200 or status >= 300) return error.TokenRequestFailed;
+    if (!http.isSuccess(status)) return error.TokenRequestFailed;
     return try parseTokenResponse(gpa, io, bytes);
 }
+
+/// Token responses are larger than the shared 4 KB transfer buffer used by
+/// the AI clients, so this deliberately keeps its own 8 KB size instead of
+/// aliasing `http.transfer_buffer_bytes`.
+const token_transfer_buffer_bytes: usize = 8192;
 
 fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response) ![]u8 {
     var empty_decompress_buffer: [0]u8 = .{};
@@ -264,7 +273,7 @@ fn readResponseBody(gpa: std.mem.Allocator, response: *std.http.Client.Response)
         .compress => return error.UnsupportedCompressionMethod,
     }
     defer if (decompress_buffer_owned) gpa.free(decompress_buffer);
-    var transfer_buffer: [8192]u8 = undefined;
+    var transfer_buffer: [token_transfer_buffer_bytes]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     var out: std.Io.Writer.Allocating = .init(gpa);

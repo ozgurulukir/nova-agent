@@ -17,6 +17,7 @@
 //! OpenAI Codex OAuth provider (id == "openai").
 
 const std = @import("std");
+const http = @import("../http.zig");
 const log = std.log.scoped(.models);
 
 const cache_subdir = "models.dev";
@@ -28,8 +29,8 @@ const cache_ttl_ms: i64 = 24 * 60 * 60 * 1000;
 
 /// HTTP fetch buffers. models.dev sits behind Cloudflare, which serves the
 /// registry gzip-compressed — the body must be decompressed before parsing.
-const redirect_buffer_bytes: u32 = 8192;
-const transfer_buffer_bytes: u32 = 4096;
+const redirect_buffer_bytes = http.redirect_buffer_bytes;
+const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const response_bytes_max: u32 = 4 * 1024 * 1024;
 
 pub const Adapter = enum {
@@ -568,7 +569,7 @@ fn fetchApiJson(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
-    if (status < 200 or status >= 300) return error.HttpError;
+    if (!http.isSuccess(status)) return error.HttpError;
 
     // Cloudflare serves the registry gzip-compressed; honour the response's
     // content-encoding instead of reading raw (compressed) bytes. Without

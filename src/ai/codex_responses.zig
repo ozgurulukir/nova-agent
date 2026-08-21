@@ -3,11 +3,18 @@ const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
 const core = @import("responses_core.zig");
+const http = @import("../http.zig");
 const websocket = @import("websocket");
 const tools_mod = @import("../tools.zig");
 const tools_common = @import("../tools/common.zig");
 
-const default_codex_endpoint = "https://chatgpt.com/backend-api";
+/// `pub` so `runtime.zig`'s codex client attachments reference the one
+/// endpoint instead of re-typing it.
+pub const default_codex_endpoint = "https://chatgpt.com/backend-api";
+/// Client name sent as the HTTP `User-Agent` (`codex_responses_config`) and
+/// the websocket handshake headers. The `originator` header below carries the
+/// same name as a separate literal — change them together.
+const codex_user_agent = "nova";
 const websocket_idle_timeout_seconds: u32 = 90;
 const websocket_handshake_timeout_ms: u32 = 10_000;
 const websocket_message_bytes_max: usize = 8 * 1024 * 1024;
@@ -18,14 +25,14 @@ const codex_responses_config: core.ResponsesConfig = .{
     .base_url_mode = .raw,
     .endpoint_path = "/codex/responses",
     .headers = &.{
-        .{ .name = "accept", .value = .{ .literal = "text/event-stream" } },
+        .{ .name = "accept", .value = .{ .literal = http.media_type_event_stream } },
         .{ .name = "chatgpt-account-id", .value = .account_id },
         .{ .name = "originator", .value = .{ .literal = "nova" } },
         .{ .name = "OpenAI-Beta", .value = .{ .literal = "responses=experimental" } },
         .{ .name = "session_id", .value = .session_id },
         .{ .name = "x-client-request-id", .value = .session_id },
     },
-    .user_agent = "nova",
+    .user_agent = codex_user_agent,
     .text_verbosity = "low",
     .parallel_tool_calls = true,
     .log_name = "codex",
@@ -113,7 +120,7 @@ pub const Client = struct {
         defer payload.deinit();
         try core.writeRequestPayload(&payload.writer, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
         try body.writer.writeAll(payload.written()[1..]);
-        log.info("codex.websocket.request.body {s}", .{logBytes(body.written())});
+        log.info("codex.websocket.request.body {s}", .{http.logBytesHead(body.written())});
         try client.writeText(body.written());
 
         var state: core.StreamState = .{};
@@ -126,7 +133,7 @@ pub const Client = struct {
             watchdog.armSeconds(websocket_idle_timeout_seconds);
             switch (message.type) {
                 .text => {
-                    log.info("codex.websocket.response.frame {s}", .{logBytes(message.data)});
+                    log.info("codex.websocket.response.frame {s}", .{http.logBytesHead(message.data)});
                     try state.processJson(gpa, message.data, observer, &self.core_client.call_seq);
                 },
                 .binary => return error.UnsupportedWebSocketFrame,
@@ -322,7 +329,7 @@ fn buildHandshakeHeaders(
 ) ![]u8 {
     return try std.fmt.allocPrint(
         gpa,
-        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: nova\r\nchatgpt-account-id: {s}\r\noriginator: nova\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
+        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: nova\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
         .{
             host_header,
             authorization,
@@ -331,12 +338,6 @@ fn buildHandshakeHeaders(
             config.session_id,
         },
     );
-}
-
-fn logBytes(bytes: []const u8) []const u8 {
-    const limit = 12 * 1024;
-    if (bytes.len <= limit) return bytes;
-    return bytes[0..limit];
 }
 
 test "codex websocket endpoint parses https url" {

@@ -45,6 +45,33 @@ pub fn lastPathSegment(path: []const u8) []const u8 {
     return path[start..end];
 }
 
+/// Idle-lane refusal notice shared by `beginSubmit` (turn_lifecycle) and
+/// `refuseOnIdleLane` (mode_lifecycle). The exact bytes are pinned by the
+/// test below — transcript output depends on them.
+pub const idle_lane_notice_template = "Lane {s} is idle — no agent is attached. From the driver, `lane enter {s}` to work here, or `lane spawn` to start a worker in it.\n";
+/// Fallback for callers whose formatting buffer the id does not fit.
+pub const idle_lane_notice_fallback = "This lane is idle — no agent is attached. From the driver, use `lane enter` or `lane spawn`.\n";
+
+/// Display id for an idle-lane notice: the focused lane's worktree name, or
+/// `"this lane"` when the focused lane is the primary (no dedicated worktree).
+pub fn idleLaneId(lane: *Thread) []const u8 {
+    if (workingLaneOf(lane)) |working| return lastPathSegment(working.path);
+    return "this lane";
+}
+
+test "idle-lane notice template bytes are pinned" {
+    var buffer: [256]u8 = undefined;
+    const notice = try std.fmt.bufPrint(
+        &buffer,
+        idle_lane_notice_template,
+        .{ "alpha", "alpha" },
+    );
+    try std.testing.expectEqualStrings(
+        "Lane alpha is idle — no agent is attached. From the driver, `lane enter alpha` to work here, or `lane spawn` to start a worker in it.\n",
+        notice,
+    );
+}
+
 /// True when two filesystem paths point to the same location, tolerant of
 /// mixed `/` and `\` separators, redundant slashes, trailing slashes, and
 /// case-insensitivity on Windows. Allocator-free.

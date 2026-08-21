@@ -16,6 +16,14 @@ const SplitMode = config_mod.SplitMode;
 
 pub const loading_status_rows: u16 = 2;
 
+/// Rows reserved around the content: top border + bottom border + one
+/// hint/diff-counts row.
+const root_chrome_rows: u16 = 3;
+/// The input widget never shrinks below this, even on a tiny terminal.
+const input_height_floor: u16 = 6;
+/// Panel (diff viewer) height cap when visible.
+const panel_height_max: u16 = 7;
+
 /// A single split pane's geometry and the lane it projects. Row/col are
 /// relative to the transcript area (whose top-left is the root origin).
 pub const ColumnRect = struct {
@@ -96,13 +104,13 @@ pub fn rootLayout(max_height: u16, panel_visible: bool, input_text_rows: u16, lo
     // the wrapped input text, and — when a steered message is queued — the extra
     // line the InputWidget draws above the border for it. Omitting the queued row
     // here starves the InputWidget so it silently drops the hint + diff counts.
-    const desired: u16 = 3 + input_text_rows + @intFromBool(queued_visible);
-    const max_allowed: u16 = @max(@as(u16, 6), max_height -| 3);
+    const desired: u16 = root_chrome_rows + input_text_rows + @intFromBool(queued_visible);
+    const max_allowed: u16 = @max(input_height_floor, max_height -| root_chrome_rows);
     const input_height: u16 = @min(max_height, @min(desired, max_allowed));
     const above_input_height: u16 = max_height - input_height;
     const loading_height: u16 = if (loading_visible) @min(loading_status_rows, above_input_height) else 0;
     const transcript_height: u16 = above_input_height - loading_height;
-    const panel_height: u16 = if (panel_visible) @min(transcript_height, 7) else 0;
+    const panel_height: u16 = if (panel_visible) @min(transcript_height, panel_height_max) else 0;
     return .{
         .input_height = input_height,
         .loading_height = loading_height,

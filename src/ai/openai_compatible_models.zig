@@ -1,10 +1,11 @@
 const std = @import("std");
 const log = std.log.scoped(.ai);
 
+const http = @import("../http.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 
-const redirect_buffer_bytes: u32 = 8192;
-const transfer_buffer_bytes: u32 = 4096;
+const redirect_buffer_bytes = http.redirect_buffer_bytes;
+const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const response_bytes_max: u32 = 1 * 1024 * 1024;
 const model_count_max: u32 = 512;
 
@@ -31,7 +32,7 @@ pub fn listModels(
     defer gpa.free(url);
 
     const authorization: ?[]u8 = if (api_key.len > 0)
-        try std.fmt.allocPrint(gpa, "Bearer {s}", .{api_key})
+        try std.fmt.allocPrint(gpa, "{s}{s}", .{ http.bearer_prefix, api_key })
     else
         null;
     defer if (authorization) |a| gpa.free(a);
@@ -50,8 +51,8 @@ pub fn listModels(
     var response = try request.receiveHead(&redirect_buffer);
     const status: u16 = @intFromEnum(response.head.status);
     log.info("openai_compatible.models.response.head status={d}", .{status});
-    if (status < 200) return error.HttpUnexpectedStatus;
-    if (status >= 300) {
+    if (!http.isSuccess(status)) {
+        if (status < 200) return error.HttpUnexpectedStatus;
         if (status >= 500) return error.HttpServerError;
         return error.HttpClientError;
     }

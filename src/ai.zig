@@ -149,6 +149,12 @@ pub const WireDialect = enum {
     }
 };
 
+/// Mirrored defaults for `Config` fields that `runtime.zig` re-supplies via
+/// `orelse` fallbacks — one source so the fallbacks can never drift from the
+/// field defaults below.
+pub const default_request_timeout_seconds: u32 = 300;
+pub const default_max_parallel_tool_calls: u32 = 16;
+
 pub const Config = struct {
     base_url: []const u8,
     api_key: []const u8,
@@ -164,10 +170,10 @@ pub const Config = struct {
     /// Upper bound on parallel tool calls the stream parser will accept.
     /// Providers that exceed this get a logged error instead of silent
     /// truncation. Hard array capacity is 64; this is the runtime gate.
-    max_parallel_tool_calls: u32 = 16,
+    max_parallel_tool_calls: u32 = default_max_parallel_tool_calls,
     /// Socket-level read timeout in seconds for streaming responses.
     /// Prevents indefinite hangs when the server stops mid-stream.
-    request_timeout_seconds: u32 = 300,
+    request_timeout_seconds: u32 = default_request_timeout_seconds,
     /// Structured-outputs mode. `true` only works against the OpenAI API;
     /// gateways (OpenRouter/Ollama/vLLM/Together) reject or silently break
     /// strict schemas, which disables function-calling — the model then
