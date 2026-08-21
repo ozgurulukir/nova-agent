@@ -91,7 +91,11 @@ pub const Content = struct {
     fn draw(ptr: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
         const self: *Content = @ptrCast(@alignCast(ptr));
         const p = tui_style.activePalette();
-        if (self.loading) return self.drawStatus(ctx, "Loading models…", p.panel_header);
+        // Only mask the list when it is actually empty. The disk cache restores
+        // instantly on open, so a populated list must remain visible while the
+        // background revalidate runs — otherwise the cache is wasted behind a
+        // full-screen "Loading…" overlay (regression from d745095).
+        if (self.loading and self.models.len == 0) return self.drawStatus(ctx, "Loading models…", p.panel_header);
         if (self.error_message) |msg| return self.drawStatus(ctx, msg, p.tool_failed);
         if (self.models.len == 0) return self.drawEmpty(ctx);
         const built = try self.modelWidgets(ctx);

@@ -450,6 +450,7 @@ const OverlayInner = struct {
         const dialect = if (app.liveRuntime()) |rt| rt.wire_dialect else ai.WireDialect.minimal;
         const wire_param: []const u8 = if (dialect.usesEnableThinking()) "enable_thinking" else "reasoning_effort";
         const provider = if (status) |s| s.provider else "unknown provider";
-        return std.fmt.allocPrint(arena, "  Scope: {s}  │  Ctrl+S to change      →  {s}:\"{s}\" ({s})", .{ scope_text, wire_param, effort_label, provider });
+        const refresh = if (app.pickers.models.load == .loading) "  ⟳ refreshing…" else "";
+        return std.fmt.allocPrint(arena, "  Scope: {s}  │  Ctrl+S to change      →  {s}:\"{s}\" ({s}){s}", .{ scope_text, wire_param, effort_label, provider, refresh });
     }
 };
