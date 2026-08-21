@@ -235,7 +235,12 @@ nova.register_tool({
     command = { type = "string", description = "Build command to run" },
   },
   handler = function(params)
-    local result = nova.run_bash(params.command, { timeout = 60 })
+    local result, err = nova.run_bash(params.command, { timeout = 60 })
+    -- nil means the safety classifier blocked the command, the command was
+    -- empty, or the shell binary is missing — err carries the reason.
+    if result == nil then
+      return "Error: " .. (err or "command failed")
+    end
     if result.code == 0 then
       return "Build succeeded:\n" .. result.stdout
     else
@@ -254,7 +259,13 @@ nova.register_tool({
   handler = function(params)
     local ok = nova.write_file(params.path, params.content)
     if not ok then return "Error: could not write" end
-    local result = nova.run_bash("git add " .. params.path, {})
+    -- Quote the interpolated path. (nova.git_add(params.path) avoids the
+    -- shell entirely — prefer a dedicated bridge when one covers the case.)
+    local quoted = nova.shell_quote(params.path)
+    local result, err = nova.run_bash("git add " .. quoted, {})
+    if result == nil then
+      return string.format("Wrote %s but git add failed: %s", params.path, err or "blocked")
+    end
     if result.code == 0 then
       return string.format("Wrote and staged %s", params.path)
     end

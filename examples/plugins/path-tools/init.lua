@@ -2,7 +2,9 @@
 -- Registers create_directory / copy_path / move_path / delete_path. Every
 -- operation goes through Nova's sandboxed path validator (sanitizePath), so
 -- traversal outside the project root is rejected. Prefer these over bash
--- cp/mv/rm/mkdir — they are classified and guarded; `nova.run_bash` is not.
+-- cp/mv/rm/mkdir: `nova.run_bash` commands do pass the shell-safety
+-- classifier, but that gate only blocks destructive patterns — it does not
+-- confine paths, so a plain `cp` can still write outside the project root.
 
 -- ── create_directory ────────────────────────────────────────────────
 

@@ -34,6 +34,18 @@ nova = {
     last_bash = { cmd = cmd, opts = opts }
     return bash_reply
   end,
+  -- Mirrors the bridge contract: "posix" wraps in '...' escaping ' as '\'' ;
+  -- "native" applies the PowerShell '' rule on Windows only (on POSIX the two
+  -- dialects are identical). The plugin picks the dialect to match the runner,
+  -- so with both runners stubbed here it asks for "native".
+  shell_quote = function(s, dialect)
+    local is_win = type(package) == "table" and type(package.config) == "string"
+      and package.config:sub(1, 1) == "\\"
+    if dialect == "native" and is_win then
+      return "'" .. tostring(s):gsub("'", "''") .. "'"
+    end
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  end,
   search_files = function(root, pattern, opts)
     last_search = { root = root, pattern = pattern, opts = opts }
     return search_reply

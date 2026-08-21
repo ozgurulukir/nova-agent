@@ -4,45 +4,27 @@
 -- substring search (the default) uses Nova's built-in search_files — self-
 -- contained, no external binary; regex search (regex=true) shells out to
 -- ripgrep, because search_files is substring-only and Lua patterns are not
--- PCRE (no alternation). Scope differs by backend: ripgrep honors .gitignore;
--- the native walker skips dotfiles but scans gitignored dirs (vendor/,
--- zig-cache/).
-
-local is_windows = false
-if type(package) == "table" and type(package.config) == "string" then
-  is_windows = (package.config:sub(1, 1) == "\\")
-elseif type(nova) == "table" and type(nova.get_env) == "function" then
-  is_windows = (nova.get_env("OS") == "Windows_NT")
-end
-
--- Shell single-quote escaping:
--- On Windows (PowerShell): wrap in '...' and escape embedded ' as ''
--- On POSIX (Bash): wrap in '...' and escape embedded ' as '\''
-local function shell_quote(s)
-  local str = tostring(s)
-  if is_windows then
-    return "'" .. str:gsub("'", "''") .. "'"
-  else
-    return "'" .. str:gsub("'", "'\\''") .. "'"
-  end
-end
+-- PCRE (no alternation). Quoting for the rg line goes through
+-- `nova.shell_quote` with a dialect matched to the runner (see the grep
+-- handler). Scope differs by backend: ripgrep honors .gitignore; the native
+-- walker skips dotfiles but scans gitignored dirs (vendor/, zig-cache/).
 
 -- Build the rg invocation as a single shell command string with every dynamic
--- value quoted (regex mode only). rg exit codes the handler relies on:
--- 0 = matches, 1 = no matches, 2 = error (e.g. bad regex); shell returns 127
--- when rg itself is missing.
-local function build_rg_command(pattern, root, include, case_sensitive)
+-- value quoted via the supplied `quote` function (regex mode only). rg exit
+-- codes the handler relies on: 0 = matches, 1 = no matches, 2 = error (e.g.
+-- bad regex); shell returns 127 when rg itself is missing.
+local function build_rg_command(pattern, root, include, case_sensitive, quote)
   local argv = { "rg", "--line-number", "--no-heading", "--color", "never" }
   if not case_sensitive then
     table.insert(argv, "-i")
   end
   if include and include ~= "" then
     table.insert(argv, "--glob")
-    table.insert(argv, shell_quote(include))
+    table.insert(argv, quote(include))
   end
   table.insert(argv, "-e")
-  table.insert(argv, shell_quote(pattern))
-  table.insert(argv, shell_quote(root))
+  table.insert(argv, quote(pattern))
+  table.insert(argv, quote(root))
   return table.concat(argv, " ")
 end
 
@@ -241,12 +223,17 @@ nova.register_tool({
       return native_substring_search(params, root, case_sensitive, max_results, file_restriction)
     end
 
-    -- Regex: ripgrep via bash (search_files is substring-only; Lua patterns
+    -- Regex: ripgrep via shell (search_files is substring-only; Lua patterns
     -- are not PCRE). Quoting in build_rg_command keeps `|`, spaces, etc. from
-    -- being parsed by the shell.
-    local cmd = build_rg_command(params.pattern, root, params.include, case_sensitive)
-    -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
+    -- being parsed by the shell. The dialect must match the runner that will
+    -- interpret the line: "native" for run_shell (PowerShell '' rule on
+    -- Windows), "posix" for a run_bash fallback (git-bash is POSIX even on
+    -- Windows). On POSIX both dialects are identical.
     local shell_runner = nova.run_shell or nova.run_bash
+    local dialect = (shell_runner == nova.run_shell) and "native" or "posix"
+    local quote = function(s) return nova.shell_quote(s, dialect) end
+    local cmd = build_rg_command(params.pattern, root, params.include, case_sensitive, quote)
+    -- rg over large repos can exceed the 30 s default; give it a 60 s budget.
     local bash_result = shell_runner(cmd, { cwd = root, timeout = 60 })
 
     if bash_result == nil then
