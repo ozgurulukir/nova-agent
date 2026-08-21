@@ -28,10 +28,15 @@ pub const PluginConfig = struct {
     }
 
     pub fn clone(self: PluginConfig, gpa: std.mem.Allocator) !PluginConfig {
-        return .{
+        var out: PluginConfig = .{
             .name = try gpa.dupe(u8, self.name),
             .enabled = self.enabled,
-            .settings = if (self.settings.len > 0) try gpa.dupe(u8, self.settings) else "",
         };
+        // A failing settings dupe must not leak the already-duped name —
+        // `PluginManager.syncPluginConfig` loops this over N entries, so the
+        // partial-clone leak would multiply.
+        errdefer gpa.free(out.name);
+        out.settings = if (self.settings.len > 0) try gpa.dupe(u8, self.settings) else "";
+        return out;
     }
 };

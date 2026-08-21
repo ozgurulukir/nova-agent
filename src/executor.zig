@@ -237,6 +237,16 @@ pub const ExecutorService = struct {
         calls: []const ai.ToolCall,
         observer: anytype,
     ) ![]ToolResult {
+        // Shell-safety classifier URL for plugin `nova.run_bash`/`run_shell`
+        // calls: set for the WHOLE batch, not just `produceOutput` — the
+        // observers below fire plugin event callbacks (emitEvent → Lua) after
+        // produceOutput's slots are unwound, and a handler shelling out there
+        // must classify with the same remote classifier as the builtin tool.
+        // Null (headless/tests) keeps the always-armed local matcher.
+        const prev_classifier_url = lua_mod.bridge.bash_classifier_url_slot;
+        lua_mod.bridge.bash_classifier_url_slot = self.bash_classifier_url;
+        defer lua_mod.bridge.bash_classifier_url_slot = prev_classifier_url;
+
         const results = try self.gpa.alloc(ToolResult, calls.len);
         var initialized: usize = 0;
         errdefer {
@@ -457,9 +467,12 @@ pub const ExecutorService = struct {
             lua_mod.registry_bridge.plugin_manager_slot = self.plugin_manager;
             const prev_cwd = lua_mod.bridge.plugin_cwd_slot;
             lua_mod.bridge.plugin_cwd_slot = self.cwd;
+            const prev_classifier_url = lua_mod.bridge.bash_classifier_url_slot;
+            lua_mod.bridge.bash_classifier_url_slot = self.bash_classifier_url;
             defer {
                 lua_mod.registry_bridge.plugin_manager_slot = prev;
                 lua_mod.bridge.plugin_cwd_slot = prev_cwd;
+                lua_mod.bridge.bash_classifier_url_slot = prev_classifier_url;
             }
             const slice = try r.all(self.gpa);
             return tools.runWith(slice, self.gpa, self.io, self.cwd, call.name, call.arguments);

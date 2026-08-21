@@ -881,6 +881,18 @@ fn parsePlugins(gpa: std.mem.Allocator, value: std.json.Value) ![]PluginConfig {
 
         if (stringField(val, "settings")) |s| {
             plugin.settings = try gpa.dupe(u8, s);
+        } else if (val.object.get("settings")) |sv| {
+            // Inline-object settings are normalized to the canonical JSON
+            // string here so both config forms reach the plugin bridge
+            // identically (`plugin.get_config()` parses the string). Arrays
+            // and other types stay parse-ignored: get_config demands an
+            // object, so accepting them would be a half-contract.
+            if (sv == .object) {
+                var buf: std.Io.Writer.Allocating = .init(gpa);
+                defer buf.deinit();
+                try std.json.Stringify.value(sv, .{}, &buf.writer);
+                plugin.settings = try buf.toOwnedSlice();
+            }
         }
 
         try plugins.append(gpa, plugin);
@@ -3163,4 +3175,46 @@ test "parseTui drops out-of-range layout + telemetry values" {
     try std.testing.expectEqual(@as(f64, 0.35), tui.velocity_smoothing_alpha); // 2.0 > 1.0 dropped
     try std.testing.expectEqual(@as(f64, 0.70), tui.context_threshold_warn); // 0.05 < 0.1 dropped
     try std.testing.expectEqual(@as(f64, 0.85), tui.context_threshold_alert); // 1.0 > 0.99 dropped
+}
+
+test "parsePlugins normalizes inline-object settings to canonical JSON" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"my-plugin":{"enabled":true,"settings":{"duckdb_path":"/opt/duckdb","retries":3}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const plugins = try parsePlugins(gpa, parsed.value);
+    defer {
+        for (plugins) |*p| p.deinit(gpa);
+        gpa.free(plugins);
+    }
+    try std.testing.expectEqual(@as(usize, 1), plugins.len);
+    try std.testing.expectEqualStrings("my-plugin", plugins[0].name);
+    try std.testing.expect(plugins[0].enabled);
+    // Canonical compact JSON string, key order preserved from the source map.
+    try std.testing.expectEqualStrings("{\"duckdb_path\":\"/opt/duckdb\",\"retries\":3}", plugins[0].settings);
+}
+
+test "parsePlugins keeps string settings and ignores non-object forms" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"str-form":{"settings":"{\"x\":1}"},"arr":{"settings":[1,2]},"num":{"settings":42},"none":{}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    const plugins = try parsePlugins(gpa, parsed.value);
+    defer {
+        for (plugins) |*p| p.deinit(gpa);
+        gpa.free(plugins);
+    }
+    try std.testing.expectEqual(@as(usize, 4), plugins.len);
+    for (plugins) |*p| {
+        if (std.mem.eql(u8, p.name, "str-form")) {
+            try std.testing.expectEqualStrings("{\"x\":1}", p.settings);
+        } else {
+            // Array/number settings are parse-ignored; absent stays empty.
+            try std.testing.expectEqual(@as(usize, 0), p.settings.len);
+        }
+    }
 }

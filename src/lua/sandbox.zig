@@ -129,12 +129,35 @@ pub fn createSandboxedStateWithIo(permissions: Permissions, io: ?std.Io) error{ 
         registerPluginApi(L);
     }
 
+    // The `plugin` table needs no Io and must exist in full-access states
+    // too (embedded plugins, the Lua test runner), which skip the restricted
+    // environment below — hence unconditional registration.
+    registerPluginTable(L);
+
     if (!permissions.full_access) {
         createRestrictedEnvironment(L, permissions);
         try setupInstructionHook(L, permissions);
     }
 
     return State{ .handle = L };
+}
+
+/// Registry key under which `PluginManager.loadOne` stores a plugin's
+/// pre-encoded JSON settings string. `lua_pushlstring` copies the bytes into
+/// the Lua GC, so the manager keeps no ownership of the stored value; the
+/// string is re-parsed per `plugin.get_config()` call, yielding a fresh table
+/// whose mutation cannot corrupt the stored settings.
+pub const settings_registry_key = "nova_plugin_settings";
+
+/// Register the `plugin` global table (`plugin.get_config`). Like `nova`, it is
+/// set on the real _G AND copied into the restricted environment — full-access
+/// states never swap _G, so a copy-only registration would hide the table from
+/// embedded plugins and the Lua test runner.
+fn registerPluginTable(L: *c.lua_State) void {
+    c.lua_newtable(L);
+    c.lua_pushcfunction(L, plugin_api.pluginGetConfig);
+    _ = c.lua_setfield(L, -2, "get_config");
+    c.lua_setglobal(L, "plugin");
 }
 
 /// Register Nova plugin API functions into the `nova` global table.
@@ -171,6 +194,7 @@ fn registerPluginApi(L: *c.lua_State) void {
         .{ .name = "on", .func = plugin_api.onEvent },
         .{ .name = "json_decode", .func = plugin_api.jsonDecode },
         .{ .name = "json_encode", .func = plugin_api.jsonEncode },
+        .{ .name = "shell_quote", .func = plugin_api.shellQuote },
         .{ .name = "git_status", .func = plugin_api.gitStatus },
         .{ .name = "git_diff", .func = plugin_api.gitDiff },
         .{ .name = "git_log", .func = plugin_api.gitLog },
@@ -229,6 +253,8 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
 
     // Copy the Nova plugin API table so plugins can call nova.register_tool, etc.
     copyGlobal(L, env_index, "nova");
+    // And the plugin table (plugin.get_config) beside it.
+    copyGlobal(L, env_index, "plugin");
 
     // Safe os subset
     c.lua_newtable(L);
@@ -554,5 +580,45 @@ test "sandbox: timeout_ms is enforced (T2)" {
     const err = L.getErrorMessage();
     try std.testing.expect(err != null);
     try std.testing.expect(std.mem.indexOf(u8, err.?, "timeout") != null);
+    L.pop(1);
+}
+
+// ── plugin table (P1: plugin.get_config) ─────────────────────────────
+
+test "sandbox: plugin table present with get_config in the restricted env" {
+    var L = try createSandboxedState(.{});
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return type(plugin) == 'table' and type(plugin.get_config) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: plugin.get_config returns nil without a settings slot" {
+    var L = try createSandboxedState(.{});
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return plugin.get_config() == nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: plugin table visible in full-access states" {
+    // Full-access states skip createRestrictedEnvironment entirely; the table
+    // must still be reachable (embedded plugins, the Lua test runner).
+    var L = try createSandboxedState(.{ .full_access = true });
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return type(plugin.get_config) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }

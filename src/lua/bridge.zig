@@ -15,6 +15,14 @@ const State = @import("state.zig").State;
 /// imports this leaf module — placing it here avoids an import cycle.
 pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 
+/// Thread-local carrying the remote shell-safety classifier URL to the Lua C
+/// boundary, so `nova.run_bash`/`nova.run_shell` gate plugin shell execution
+/// through the same classifier as the builtin tool (`bash_safety.classify`).
+/// Set by the executor around the whole `runAll` (covers observer-driven
+/// plugin event callbacks) and re-asserted around each plugin dispatch. Lives
+/// here beside `plugin_cwd_slot` for the same import-cycle reason.
+pub threadlocal var bash_classifier_url_slot: ?[]const u8 = null;
+
 /// Returns true if T is an array of u8 (e.g. [5:0]u8).
 fn isArrayOfU8(comptime T: type) bool {
     const info = @typeInfo(T);

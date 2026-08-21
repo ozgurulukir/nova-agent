@@ -14,6 +14,7 @@ const sandbox = @import("sandbox.zig");
 const plugin_api = @import("plugin_api.zig");
 const events = @import("events.zig");
 const Manifest = @import("manifest.zig").Manifest;
+const plugin_config = @import("../config/plugin.zig");
 
 /// A loaded plugin instance with its manifest and sandboxed Lua state.
 pub const PluginInstance = struct {
@@ -48,6 +49,11 @@ pub const PluginManager = struct {
     plugins: std.StringHashMapUnmanaged(*PluginInstance),
     /// Whether the manager has been initialized
     initialized: bool,
+    /// Cloned per-plugin config entries (enabled/settings), synced from the
+    /// App config before `loadAll`. Clones, not borrows: the manager outlives
+    /// mid-session `Config` swaps (a session switch frees the old config while
+    /// the manager lives on), so borrowed slices would dangle.
+    plugin_configs: std.ArrayListUnmanaged(plugin_config.PluginConfig) = .empty,
 
     const Self = @This();
 
@@ -97,13 +103,51 @@ pub const PluginManager = struct {
             self.allocator.destroy(plugin);
         }
         self.plugins.deinit(self.allocator);
+        for (self.plugin_configs.items) |*pc| pc.deinit(self.allocator);
+        self.plugin_configs.deinit(self.allocator);
         if (self.global_dir.len > 0) self.allocator.free(self.global_dir);
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
+    }
+
+    /// Clone the per-plugin config entries (enabled/settings) into the manager.
+    /// Expected before `loadAll`; safe to call again later (replaces the
+    /// previous set). Clones rather than borrows: the caller's `Config` may be
+    /// freed mid-session (session switch) while the manager lives on.
+    pub fn syncPluginConfig(self: *Self, plugins: []const plugin_config.PluginConfig) !void {
+        var next: std.ArrayListUnmanaged(plugin_config.PluginConfig) = .empty;
+        errdefer {
+            for (next.items) |*pc| pc.deinit(self.allocator);
+            next.deinit(self.allocator);
+        }
+        for (plugins) |pc| {
+            var cloned = try pc.clone(self.allocator);
+            next.append(self.allocator, cloned) catch |err| {
+                cloned.deinit(self.allocator);
+                return err;
+            };
+        }
+        // Build-then-swap: an error above leaves the previous set intact.
+        for (self.plugin_configs.items) |*pc| pc.deinit(self.allocator);
+        self.plugin_configs.deinit(self.allocator);
+        self.plugin_configs = next;
+    }
+
+    /// The config entry for `name`, or null when the plugin is unconfigured
+    /// (unconfigured means default-enabled with no settings).
+    fn configFor(self: *const Self, name: []const u8) ?*const plugin_config.PluginConfig {
+        for (self.plugin_configs.items) |*pc| {
+            if (std.mem.eql(u8, pc.name, name)) return pc;
+        }
+        return null;
     }
 
     /// Discover and load all plugins from both directories.
     /// Project plugins override global plugins with the same name.
     /// Returns the number of plugins loaded, or an error if loading fails.
+    ///
+    /// `syncPluginConfig` is expected to have run first: `enabled` and
+    /// settings are read once at load time and are never re-evaluated on a
+    /// mid-session config reload — restart the App to apply config changes.
     pub fn loadAll(self: *Self) !usize {
         if (self.initialized) return self.plugins.count();
         self.initialized = true;
@@ -127,6 +171,18 @@ pub const PluginManager = struct {
         // Read and parse the manifest
         var manifest = try self.readManifest(dir_path);
         errdefer manifest.deinit(self.allocator);
+
+        // Disabled plugins never load. Bails BEFORE the duplicate/override
+        // teardown below so a disabled project copy cannot unload the active
+        // global instance. NOTE: `error.PluginDisabled` also means call-time
+        // refusal on an inactive plugin (`callTool`) — same name, two
+        // lifecycle stages; the errdefer above frees the manifest here.
+        if (self.configFor(manifest.name)) |pc| {
+            if (!pc.enabled) {
+                log.info("plugin.disabled name={s} path={s}", .{ manifest.name, dir_path });
+                return error.PluginDisabled;
+            }
+        }
 
         // Check for duplicate
         if (self.plugins.get(manifest.name)) |existing| {
@@ -153,6 +209,16 @@ pub const PluginManager = struct {
         // Store the plugin root directory in the registry so nova.require knows its base path
         _ = c.lua_pushlstring(L.handle, dir_path.ptr, dir_path.len);
         c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, "nova_plugin_dir");
+
+        // Store the plugin's settings JSON (if any) before init.lua runs so
+        // load-time code can already call plugin.get_config(). lua_pushlstring
+        // copies into the Lua GC — the manager keeps no ownership of the copy.
+        if (self.configFor(manifest.name)) |pc| {
+            if (pc.settings.len > 0) {
+                _ = c.lua_pushlstring(L.handle, pc.settings.ptr, pc.settings.len);
+                _ = c.lua_setfield(L.handle, c.LUA_REGISTRYINDEX, sandbox.settings_registry_key);
+            }
+        }
 
         // Load the plugin's init.lua
         const init_path = try std.fs.path.join(self.allocator, &.{ dir_path, "init.lua" });
@@ -350,6 +416,11 @@ pub const PluginManager = struct {
             if (!self.fileExists(manifest_path)) continue;
 
             _ = self.loadOne(plugin_dir, is_embedded) catch |err| {
+                if (err == error.PluginDisabled) {
+                    // A disabled plugin is a skip, not a load failure.
+                    log.info("plugin.load.skipped_disabled path={s}", .{plugin_dir});
+                    continue;
+                }
                 log.warn("plugin.load.failed path={s} reason={s}", .{ plugin_dir, @errorName(err) });
                 continue;
             };
@@ -530,6 +601,135 @@ test "plugin manager: end-to-end loadOne with register_tool" {
 
     const tool_count = plugin_api.countTools(instance.state.handle);
     try testing.expectEqual(@as(u32, 1), tool_count);
+}
+
+// ── plugin config: enabled + settings (P1/P2) ───────────────────────
+
+/// Write a minimal plugin fixture (plugin.lua + init.lua) under `abs_root/name`.
+fn writeFixturePlugin(abs_root: []const u8, name: []const u8, init_lua: []const u8) !void {
+    const path = try std.fs.path.join(std.testing.allocator, &.{ abs_root, name });
+    defer std.testing.allocator.free(path);
+    std.Io.Dir.cwd().createDirPath(std.testing.io, path) catch {};
+
+    var d = try std.Io.Dir.openDir(.cwd(), std.testing.io, path, .{});
+    defer d.close(std.testing.io);
+
+    const manifest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "return {{ name = \"{s}\", version = \"1.0.0\", description = \"{s}\" }}",
+        .{ name, name },
+    );
+    defer std.testing.allocator.free(manifest);
+    try d.writeFile(std.testing.io, .{ .sub_path = "plugin.lua", .data = manifest });
+    try d.writeFile(std.testing.io, .{ .sub_path = "init.lua", .data = init_lua });
+}
+
+test "plugin manager: syncPluginConfig skips disabled plugins (P2)" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // The fixture mirrors the production layout: <home>/.config/nova/plugins,
+    // because PluginManager.init derives global_dir from home_dir.
+    const root = "/tmp/nova_test_plugin_cfg/.config/nova/plugins";
+    std.Io.Dir.cwd().createDirPath(testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, "/tmp/nova_test_plugin_cfg") catch {};
+
+    try writeFixturePlugin(root, "on_plugin",
+        \\unconfigured = (plugin.get_config() == nil)
+        \\nova.register_tool({
+        \\  name = "t",
+        \\  description = "t",
+        \\  parameters = {},
+        \\  handler = function() return "on" end,
+        \\})
+    );
+    try writeFixturePlugin(root, "off_plugin",
+        \\nova.register_tool({
+        \\  name = "t",
+        \\  description = "t",
+        \\  parameters = {},
+        \\  handler = function() return "off" end,
+        \\})
+    );
+
+    var manager = PluginManager.init(gpa, testing.io, "/tmp/nova_test_plugin_cfg", "");
+    defer manager.deinit();
+
+    // Owned input entry, freed right after sync to prove the manager holds
+    // clones (borrowed slices would double-free under the test allocator).
+    var entry: plugin_config.PluginConfig = .{
+        .name = try gpa.dupe(u8, "off_plugin"),
+        .enabled = false,
+    };
+    try manager.syncPluginConfig(&.{entry});
+    entry.deinit(gpa);
+
+    // loadOne refuses the disabled plugin before any teardown/registration.
+    const off_dir = try std.fs.path.join(gpa, &.{ root, "off_plugin" });
+    defer gpa.free(off_dir);
+    try testing.expectError(error.PluginDisabled, manager.loadOne(off_dir, false));
+
+    // The directory walk skips it at info level and loads only on_plugin,
+    // which is unconfigured (no config entry → default enabled, nil config).
+    try testing.expectEqual(@as(usize, 1), try manager.loadAll());
+    try testing.expect(manager.get("on_plugin") != null);
+    try testing.expect(manager.get("off_plugin") == null);
+
+    const on = manager.get("on_plugin").?;
+    _ = c.lua_getglobal(on.state.handle, "unconfigured");
+    try testing.expect(c.lua_toboolean(on.state.handle, -1) != 0);
+    c.lua_pop(on.state.handle, 1);
+}
+
+test "plugin manager: settings reach init.lua and tool handlers via get_config (P1+P2)" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root = "/tmp/nova_test_plugin_settings";
+    std.Io.Dir.cwd().createDirPath(testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
+
+    try writeFixturePlugin(root, "cfg_plugin",
+        \\local cfg = plugin.get_config()
+        \\load_time_theme = cfg and cfg.theme or "unset"
+        \\nova.register_tool({
+        \\  name = "theme_tool",
+        \\  description = "returns configured theme",
+        \\  parameters = {},
+        \\  handler = function()
+        \\    local c = plugin.get_config()
+        \\    return (c and c.theme) or "unset"
+        \\  end,
+        \\})
+    );
+
+    var manager = PluginManager.init(gpa, testing.io, "", "");
+    defer manager.deinit();
+
+    var entry: plugin_config.PluginConfig = .{
+        .name = try gpa.dupe(u8, "cfg_plugin"),
+        .settings = try gpa.dupe(u8, "{\"theme\":\"dark\"}"),
+    };
+    try manager.syncPluginConfig(&.{entry});
+    entry.deinit(gpa);
+
+    const plugin_dir = try std.fs.path.join(gpa, &.{ root, "cfg_plugin" });
+    defer gpa.free(plugin_dir);
+    const instance = try manager.loadOne(plugin_dir, false);
+    try testing.expectEqualStrings("cfg_plugin", instance.manifest.name);
+
+    // The registry slot is set before init.lua runs — the load-time read saw it.
+    _ = c.lua_getglobal(instance.state.handle, "load_time_theme");
+    var len: usize = 0;
+    const p = c.lua_tolstring(instance.state.handle, -1, &len);
+    const got = if (p) |q| q[0..len] else "";
+    try testing.expectEqualStrings("dark", got);
+    c.lua_pop(instance.state.handle, 1);
+
+    // And the per-call read inside a tool handler returns the same value.
+    const out = try manager.callTool("cfg_plugin", "theme_tool", "{}");
+    defer gpa.free(out);
+    try testing.expectEqualStrings("dark", out);
 }
 
 // Load every shipped example plugin and confirm each registered at least one

@@ -1561,11 +1561,16 @@ pub fn injectToolsInto(self: *App, runtime: *runtime_mod.AgentRuntime) void {
 }
 
 /// Walk every loaded Lua plugin, materialize a `Tool` for each registered
-/// handler, and append them to `self.tool_registry`. Called from
-/// `initRuntime` after `plugin_manager.loadAll` and again whenever a
-/// plugin is (re)loaded at runtime. The AI client picks them up on its
-/// next `updateMcpTools` call (driven by `attachXxxClient` or
-/// `refreshMcpTools`).
+/// handler, and re-sync them onto `self.tool_registry`. Called from
+/// `initRuntime` after `plugin_manager.loadAll`. A re-sync, not an append:
+/// all `lua__`-prefixed tools are stripped first, so repeated calls never
+/// duplicate tool names (strict providers reject duplicate names in the
+/// `tools` array with a 400) and tools from uninstalled/disabled plugins
+/// don't linger forever. The strip mutates the shared registry — only call
+/// this when no worker thread can be dispatching through it (startup, or a
+/// future quiescent reload point); `openPlugins` must NOT call it. The AI
+/// client picks the fresh set up on its next `updateMcpTools` call (driven
+/// by `attachXxxClient` or `refreshMcpTools`).
 pub fn registerPluginTools(self: *App) void {
     const lua_mod = @import("../lua/root.zig");
     const descriptors = lua_mod.registry_bridge.buildPluginToolDescriptors(self.gpa, &self.plugin_manager) catch |err| {
@@ -1586,6 +1591,12 @@ pub fn registerPluginTools(self: *App) void {
         // whose ownership stays with the caller.
         self.gpa.free(descriptors);
     }
+    // Strip the previous plugin tool generation AFTER a successful descriptor
+    // build: a build failure above early-returns and keeps the previous
+    // (stale but valid) tool set instead of leaving the registry empty. The
+    // strip primitive is idempotent, so the first call on an empty registry
+    // (initRuntime) is a no-op.
+    self.tool_registry.removePluginToolsWithPrefix(self.gpa, "lua__");
     for (descriptors) |t| {
         self.tool_registry.addPluginTool(self.gpa, t) catch |err| {
             log.warn("registerPluginTools: addPluginTool failed: {s}", .{@errorName(err)});

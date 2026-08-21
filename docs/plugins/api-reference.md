@@ -49,45 +49,42 @@ Subscribe to a lifecycle event.
 
 **Events:**
 
+Only `tool_call_started` and `tool_call_finished` are currently emitted in
+production (by the agent around each tool dispatch). The other five are
+subscribable but not currently emitted — they stay in the allow-list for
+forward compatibility.
+
 | Event | Data Fields | Description |
 |-------|-------------|-------------|
-| `turn_started` | `{}` | A new agent turn has started. |
-| `turn_ended` | `{}` | An agent turn has ended. |
+| `turn_started` | `{}` | A new agent turn has started. *(not currently emitted)* |
+| `turn_ended` | `{}` | An agent turn has ended. *(not currently emitted)* |
 | `tool_call_started` | `{name, call_id}` | A tool execution began. |
 | `tool_call_finished` | `{name, call_id, success}` | A tool execution completed. |
-| `response_received` | `{}` | A response was received from the LLM. |
-| `plugin_loaded` | `{name}` | A plugin was loaded. |
-| `plugin_unloaded` | `{name}` | A plugin was unloaded. |
-
----
-
-### `nova.unsubscribe(event_name, callback)`
-
-Unsubscribe a callback from an event. Both `event_name` and the exact callback
-function reference must match.
-
-**Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `event_name` | string | The event to unsubscribe from. |
-| `callback` | function | The callback function to remove. |
-
-**Returns:** `true` if the callback was found and removed, `false` otherwise.
+| `response_received` | `{}` | A response was received from the LLM. *(not currently emitted)* |
+| `plugin_loaded` | `{name}` | A plugin was loaded. *(not currently emitted)* |
+| `plugin_unloaded` | `{name}` | A plugin was unloaded. *(not currently emitted)* |
 
 ---
 
 ## `plugin` Global Table
 
-The `plugin` table provides access to plugin-specific functionality.
+The `plugin` table provides access to plugin-specific functionality. `plugin`
+is a reserved global name for plugins — do not use it as a variable.
 
 ### `plugin.get_config()`
 
-Returns the plugin's configuration from `config.json`, or `nil` if no
-configuration is set.
+Returns the plugin's configured settings as a **fresh table on every call**,
+or `nil` when the plugin has no config entry or no settings.
 
-**Returns:** A Lua table parsed from the `settings` JSON string in the
-plugin's config entry, or `nil`.
+- Settings come from the plugin's `config.json` entry and are read once at
+  App start (restart Nova to apply config changes). Both settings forms work
+  (see `docs/CONFIG.md`): an escaped JSON string, or an inline JSON object.
+- `plugins.<name>.enabled: false` means the plugin is never loaded at all —
+  `get_config()` is moot for it.
+- Malformed or non-object settings (e.g. a JSON array) return
+  `nil, "get_config: settings must be a JSON object"`.
+- Mutation is safe: each call re-parses the stored settings, so changing the
+  returned table never corrupts the stored view (but also never persists).
 
 **Example config.json:**
 
@@ -96,7 +93,7 @@ plugin's config entry, or `nil`.
   "plugins": {
     "my-plugin": {
       "enabled": true,
-      "settings": "{\"theme\":\"dark\",\"max_results\":20}"
+      "settings": { "theme": "dark", "max_results": 20 }
     }
   }
 }
@@ -106,29 +103,17 @@ plugin's config entry, or `nil`.
 
 ```lua
 local config = plugin.get_config()
-local theme = config.theme or "light"
+local theme = config and config.theme or "light"
 ```
 
----
+### Plugin state (no `plugin.get_state`/`set_state` bridges)
 
-### `plugin.get_state()`
-
-Called by Nova to retrieve the plugin's persistent state before a reload.
-The plugin should return a string (JSON recommended).
-
-**Returns:** A string representing the plugin's state, or `nil` if no state.
-
----
-
-### `plugin.set_state(state)`
-
-Called by Nova to restore the plugin's persistent state after a reload.
-
-**Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `state` | string | The state string previously returned by `get_state()`. |
+There is no `plugin.get_state()`/`plugin.set_state()` bridge. The reload flow
+calls the plugin's **top-level Lua globals** `get_state()`/`set_state(state)`
+(`PluginManager.reload`), and that state is in-memory only — it is lost when
+Nova restarts. For durable state, write a file sidecar under the project
+(e.g. `.nova/<plugin>/state.json` via `nova.write_file`/`nova.json_encode`)
+— this is the blessed pattern; the `todo` example plugin uses it.
 
 ---
 
@@ -187,11 +172,50 @@ Run all registered test suites. Returns `true` if all tests pass.
 
 | Function | Parameters | Returns | Description |
 |----------|-----------|---------|-------------|
-| `nova.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) |
-| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout` | `{stdout, stderr, code}` | Bash command execution |
+| `nova.run_shell(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Platform-native shell (`pwsh.exe` on Windows, `bash` on POSIX) |
+| `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution (git-bash on Windows) |
+| `nova.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, or `"native"`) | quoted `string` or `nil, err` | Quote one argument for a shell command line (see below) |
 | `nova.get_env(name)` | `name` | `string` or `nil` | Environment variable |
 | `nova.get_cwd()` | — | `string` | Current working directory |
 | `nova.get_project_root()` | — | `string` | Git repo root or cwd |
+
+**`opts.stdin`** (string): bytes written to the child's stdin, then closed —
+e.g. `nova.run_bash("cat", { stdin = "hello" })` returns
+`{ stdout = "hello", code = 0 }`.
+
+**Shell safety gate.** Every `run_bash`/`run_shell` command is classified by
+the same shell-safety checker as the built-in `bash` tool *before* it runs.
+A rejected command returns
+`nil, "UnsafeShellBlocked: command rejected by Nova's shell safety classifier; use the built-in bash tool for destructive commands"`.
+There is no approval flow at the plugin bridge — the channel for destructive
+work is the model-facing built-in `bash` tool, where the user can approve.
+When no remote classifier is reachable (or none is configured), an always-armed
+local pattern matcher still blocks obviously destructive forms (`rm -rf /`-
+class, fork bombs, and their PowerShell spellings); plugin shell calls made
+outside tool dispatch (e.g. during `init.lua` load, where no executor context
+exists) are classified by that local backstop only. An empty command string
+returns `nil, "command argument must not be empty"` before anything spawns.
+If the shell binary itself is missing, the call returns one of
+`"ShellUnavailable: bash not found (install Git Bash on Windows, or ensure bash is on PATH); consider nova.run_shell"`
+or
+`"ShellUnavailable: pwsh not found (install PowerShell 7, or ensure powershell.exe is on PATH)"`.
+
+**`nova.shell_quote(s, dialect?)`** quotes one argument so it reaches the
+shell as a single inert word — this is the injection defense on the plugin
+path, and it keeps the *intended* command equal to the *classified* command.
+Always quote interpolated values instead of concatenating raw strings:
+
+- `"posix"` (default): wrap in `'...'`, escape embedded `'` as `'\''` —
+  correct for `run_bash` on both platforms (git-bash on Windows is a POSIX
+  shell).
+- `"native"`: the `run_shell` interpreter's rule — identical to posix on
+  POSIX; on Windows (PowerShell) escape `'` as `''`.
+- Any other dialect returns `nil, "shell_quote: dialect must be \"posix\" or \"native\""`.
+
+```lua
+local q = nova.shell_quote(user_input)
+local r = nova.run_bash("grep -c " .. q .. " src/*.zig")
+```
 
 ### Git
 
@@ -223,3 +247,32 @@ Run all registered test suites. Returns `true` if all tests pass.
 These bridges let plugins parse and emit structured data without hand-rolling a
 parser or shelling out to `jq`. `json_decode` reuses Nova's `std.json` parser;
 `json_encode` traverses the Lua value and infers array vs object from key shape.
+
+---
+
+## Platform Support Matrix
+
+Windows runtime support is in progress (tracked in issues #26–#29); the matrix
+below reflects the current state of the bridge.
+
+| Bridge | POSIX | Windows |
+|--------|-------|---------|
+| `nova.run_bash` | bash | git-bash candidates (`bash.exe` next to git, then `bash` on PATH); if none is found → `ShellUnavailable: bash not found …` |
+| `nova.run_shell` | bash | `pwsh.exe`, falling back to `powershell.exe`; stdin is delivered via `$input`; if neither is found → `ShellUnavailable: pwsh not found …` |
+| `nova.shell_quote` | `"posix"` and `"native"` behave identically | `"posix"` for `run_bash` (git-bash is POSIX); `"native"` applies the PowerShell `''` rule for `run_shell` |
+| Path confinement (`opts.cwd`, path bridges) | cwd-confinement + symlink realpath re-check | cwd-confinement (lexical verdict; the realpath re-check is POSIX-only) |
+| Shell safety gate | local matcher always armed; remote classifier when configured | same, and pwsh destructive patterns (`Remove-Item -Recurse -Force …`) are covered by the local matcher too |
+
+Note for command authors: flags like `-init /dev/null` must be spelled with
+`NUL` on Windows (`-init NUL`) — `/dev/null` does not exist there.
+
+---
+
+## Testing Plugins
+
+See `docs/plugins/README.md` for the `test.lua` convention and
+`zig build test-plugin`. When writing Zig-side tests for bridge behavior,
+platform-specific paths are gated with `if (os.is_windows) return error.SkipZigTest;`
+(the established convention in `src/lua/plugin_api.zig`); Lua-side `test.lua`
+files should stick to portable constructs (no real process spawns) so the
+same suite runs on every platform.
