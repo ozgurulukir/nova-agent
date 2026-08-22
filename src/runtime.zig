@@ -264,6 +264,11 @@ pub const AgentRuntime = struct {
         errdefer target.agent.deinit();
         target.agent.skills = target.skills;
         target.agent.compaction_settings = config.context.compaction;
+        // Resolved per-agent budget knobs (non-optional on the agent so the
+        // run loop never branches on config optionality). Lane worker and
+        // resume runtimes all construct through here, so they inherit.
+        if (config.context.tool_call_limit_per_turn) |v| target.agent.tool_call_limit_per_turn = v;
+        if (config.context.soft_stop_on_tool_call_limit) |b| target.agent.soft_stop_on_tool_call_limit = b;
         if (config.model_selection) |ms| {
             if (ms.bashClassifierUrl()) |url| {
                 target.agent.bash_classifier_url = try gpa.dupe(u8, url);

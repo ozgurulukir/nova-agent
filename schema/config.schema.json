@@ -262,6 +262,18 @@
           "default": false,
           "description": "Disable provider prompt-caching fields entirely, in both the chat-completions and Responses API clients. For OpenRouter this suppresses top-level cache_control (auto breakpoint) and native session_id (sticky routing); for OpenAI it suppresses prompt_cache_key. Use for providers/models that reject these fields with HTTP 400 (some OpenRouter :free / gateway-fronted models)."
         },
+        "toolCallLimitPerTurn": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100,
+          "description": "Upper bound on LLM-to-tool iterations (one assistant batch of tool calls = one iteration) within a single turn. A runaway model loop terminates the turn instead of spinning forever. Out-of-range values are dropped and the default is used. The legacy snake_case spelling tool_call_limit_per_turn is parsed for compat but not schema-valid."
+        },
+        "softStopOnToolCallLimit": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, reaching toolCallLimitPerTurn does not fail the turn: the loop exits cleanly, queued user messages are delivered, a continuation hint is left in history, and the TUI renders a resumable notice. When false, the turn ends with a ToolCallLimit failure as in previous releases."
+        },
         "compaction": { "$ref": "#/$defs/CompactionSettings" }
       },
       "additionalProperties": false

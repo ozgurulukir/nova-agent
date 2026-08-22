@@ -38,6 +38,11 @@ const default_tui: TuiSettings = .{};
 /// Floor for `overrideContextWindow`/`contextWindow` parses — values below a
 /// real model window are treated as absent rather than clamped.
 const context_window_floor_tokens: u32 = 1024;
+/// Accepted band for `toolCallLimitPerTurn`. The default lives in
+/// `config.zig` (`default_tool_call_limit_per_turn`); out-of-band values are
+/// dropped (the field stays null → default), matching sibling knobs.
+const tool_call_limit_min: u32 = 1;
+const tool_call_limit_max: u32 = 1000;
 /// Accepted band for `minSplitWidth`; out-of-band values are dropped (the
 /// field keeps its default), matching the toast-setting convention.
 const min_split_width_min: u16 = 80;
@@ -214,6 +219,8 @@ fn applyContextOverlay(target: *ContextSettings, updates: ContextSettings) void 
     if (updates.request_timeout_seconds != null) target.request_timeout_seconds = updates.request_timeout_seconds;
     if (updates.max_concurrent_requests != null) target.max_concurrent_requests = updates.max_concurrent_requests;
     if (updates.disable_prompt_cache != null) target.disable_prompt_cache = updates.disable_prompt_cache;
+    if (updates.tool_call_limit_per_turn != null) target.tool_call_limit_per_turn = updates.tool_call_limit_per_turn;
+    if (updates.soft_stop_on_tool_call_limit != null) target.soft_stop_on_tool_call_limit = updates.soft_stop_on_tool_call_limit;
     const d: CompactionSettings = .{};
     if (updates.compaction.auto != d.auto) target.compaction.auto = updates.compaction.auto;
     if (updates.compaction.threshold != d.threshold) target.compaction.threshold = updates.compaction.threshold;
@@ -669,6 +676,16 @@ fn boolFieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) 
     return null;
 }
 
+/// `u32field` with camelCase primary and snake_case fallback. Out-of-u32-range
+/// values yield null exactly like `u32field` — the lower/upper-bound checks
+/// stay at the call site so per-field bands are explicit.
+fn u32fieldCompat(value: std.json.Value, camel: []const u8, snake: []const u8) ?u32 {
+    if (fieldCompat(value.object, camel, snake)) |field| {
+        if (field == .integer) return std.math.cast(u32, field.integer);
+    }
+    return null;
+}
+
 /// Parse the `"context"` object into `ContextSettings`. Pure — no
 /// allocation (all fields are scalars).
 fn parseContext(value: std.json.Value) ContextSettings {
@@ -690,6 +707,12 @@ fn parseContext(value: std.json.Value) ContextSettings {
     }
     if (boolFieldCompat(value, "disablePromptCache", "disable_prompt_cache")) |b| {
         ctx.disable_prompt_cache = b;
+    }
+    if (u32fieldCompat(value, "toolCallLimitPerTurn", "tool_call_limit_per_turn")) |v| {
+        if (v >= tool_call_limit_min and v <= tool_call_limit_max) ctx.tool_call_limit_per_turn = v;
+    }
+    if (boolFieldCompat(value, "softStopOnToolCallLimit", "soft_stop_on_tool_call_limit")) |b| {
+        ctx.soft_stop_on_tool_call_limit = b;
     }
     if (value.object.get("compaction")) |comp_val| {
         if (comp_val == .object) ctx.compaction = parseCompaction(comp_val);
@@ -1429,6 +1452,8 @@ fn hasNonDefaultContext(ctx: ContextSettings) bool {
     if (ctx.request_timeout_seconds != null) return true;
     if (ctx.max_concurrent_requests != null) return true;
     if (ctx.disable_prompt_cache != null) return true;
+    if (ctx.tool_call_limit_per_turn != null) return true;
+    if (ctx.soft_stop_on_tool_call_limit != null) return true;
     if (ctx.compaction.auto != d.compaction.auto) return true;
     if (ctx.compaction.threshold != d.compaction.threshold) return true;
     if (ctx.compaction.keep_recent_tokens != d.compaction.keep_recent_tokens) return true;
@@ -1462,6 +1487,14 @@ fn writeContext(writer: *std.Io.Writer, ctx: ContextSettings) !void {
     }
     if (ctx.disable_prompt_cache) |b| {
         try writeKeyNoIndent(writer, "disablePromptCache", &wrote_any);
+        try writer.writeAll(if (b) "true" else "false");
+    }
+    if (ctx.tool_call_limit_per_turn) |v| {
+        try writeKeyNoIndent(writer, "toolCallLimitPerTurn", &wrote_any);
+        try writer.print("{d}", .{v});
+    }
+    if (ctx.soft_stop_on_tool_call_limit) |b| {
+        try writeKeyNoIndent(writer, "softStopOnToolCallLimit", &wrote_any);
         try writer.writeAll(if (b) "true" else "false");
     }
     // Compaction: always written when context is present.
@@ -1762,6 +1795,52 @@ test "parseContext drops integer fields outside u32 range instead of truncating"
     try std.testing.expectEqual(@as(?u32, null), ctx.request_timeout_seconds);
     // An in-range value is still applied.
     try std.testing.expectEqual(@as(?u32, 8), ctx.max_parallel_tool_calls);
+}
+
+test "parseContext accepts tool budget keys in both cases, drops out-of-range" {
+    const json =
+        \\{"toolCallLimitPerTurn":250,"softStopOnToolCallLimit":false}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const ctx = parseContext(parsed.value);
+    try std.testing.expectEqual(@as(?u32, 250), ctx.tool_call_limit_per_turn);
+    try std.testing.expectEqual(@as(?bool, false), ctx.soft_stop_on_tool_call_limit);
+
+    // snake_case aliases parse to the same fields.
+    const snake_json =
+        \\{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":true}
+    ;
+    const snake_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, snake_json, .{});
+    defer snake_parsed.deinit();
+    const snake_ctx = parseContext(snake_parsed.value);
+    try std.testing.expectEqual(@as(?u32, 40), snake_ctx.tool_call_limit_per_turn);
+    try std.testing.expectEqual(@as(?bool, true), snake_ctx.soft_stop_on_tool_call_limit);
+
+    // Out-of-band values are dropped (stay null → defaults), never clamped.
+    const bad_json =
+        \\{"toolCallLimitPerTurn":1001,"softStopOnToolCallLimit":true}
+    ;
+    const bad_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bad_json, .{});
+    defer bad_parsed.deinit();
+    const bad_ctx = parseContext(bad_parsed.value);
+    try std.testing.expectEqual(@as(?u32, null), bad_ctx.tool_call_limit_per_turn);
+    try std.testing.expectEqual(@as(?bool, true), bad_ctx.soft_stop_on_tool_call_limit);
+
+    const zero_json =
+        \\{"toolCallLimitPerTurn":0}
+    ;
+    const zero_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, zero_json, .{});
+    defer zero_parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parseContext(zero_parsed.value).tool_call_limit_per_turn);
+
+    // A value beyond u32 (a config typo) is dropped, not truncated.
+    const huge_json =
+        \\{"toolCallLimitPerTurn":9999999999}
+    ;
+    const huge_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, huge_json, .{});
+    defer huge_parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parseContext(huge_parsed.value).tool_call_limit_per_turn);
 }
 
 test "parseCompaction drops integer fields outside u32 range instead of truncating" {
@@ -2902,6 +2981,49 @@ test "serialize then parse roundtrips disablePromptCache" {
     var snake_rt = try mergeLayers(gpa, &.{snake_parsed});
     defer snake_rt.deinit(gpa);
     try std.testing.expectEqual(@as(?bool, true), snake_rt.context.disable_prompt_cache);
+}
+
+test "serialize then parse roundtrips tool budget keys" {
+    const gpa = std.testing.allocator;
+    var original: Config = .{
+        .provider_name = try gpa.dupe(u8, "ollama"),
+        .base_url = try gpa.dupe(u8, "http://localhost:11434/v1"),
+        .model = .{ .id = try gpa.dupe(u8, "llama3.1:8b") },
+        .context = .{ .tool_call_limit_per_turn = 40, .soft_stop_on_tool_call_limit = false },
+    };
+    defer original.deinit(gpa);
+
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, original);
+
+    // Serialized form carries the camelCase keys (writeKeyNoIndent = no space
+    // after the colon).
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"toolCallLimitPerTurn\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"softStopOnToolCallLimit\":false") != null);
+
+    var sink: std.ArrayList(Diagnostic) = .empty;
+    defer sink.deinit(gpa);
+    var parsed = try parseFile(gpa, "<test>", buf.written(), &sink);
+    defer parsed.deinit(gpa);
+    var roundtrip = try mergeLayers(gpa, &.{parsed});
+    defer roundtrip.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 40), roundtrip.context.tool_call_limit_per_turn);
+    try std.testing.expectEqual(@as(?bool, false), roundtrip.context.soft_stop_on_tool_call_limit);
+
+    // snake_case form parses to the same values (compat reader).
+    const snake_json =
+        \\{"version":"2.0.0","provider":"ollama","baseUrl":"http://localhost:11434/v1",
+        \\ "model":{"id":"llama3.1:8b"},
+        \\ "context":{"tool_call_limit_per_turn":40,"soft_stop_on_tool_call_limit":false}}
+    ;
+    var snake_parsed = try parseFile(gpa, "<snake>", snake_json, &sink);
+    defer snake_parsed.deinit(gpa);
+    var snake_rt = try mergeLayers(gpa, &.{snake_parsed});
+    defer snake_rt.deinit(gpa);
+    try std.testing.expectEqual(@as(?u32, 40), snake_rt.context.tool_call_limit_per_turn);
+    try std.testing.expectEqual(@as(?bool, false), snake_rt.context.soft_stop_on_tool_call_limit);
 }
 
 test "parseProviderConfig accepts baseURL (camelCase)" {
