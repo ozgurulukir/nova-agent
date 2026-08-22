@@ -69,9 +69,12 @@ pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {
         gpa.free(out);
     }
     for (static_models) |model| {
+        const id = try gpa.dupe(u8, model.id);
+        errdefer gpa.free(id);
+        const label = try gpa.dupe(u8, model.label);
         out[initialized] = .{
-            .id = try gpa.dupe(u8, model.id),
-            .label = try gpa.dupe(u8, model.label),
+            .id = id,
+            .label = label,
         };
         initialized += 1;
     }
@@ -426,11 +429,35 @@ test "static models match openai codex catalog" {
     }
     try std.testing.expectEqual(@as(usize, 6), loaded.len);
     try std.testing.expectEqualStrings("gpt-5.2", loaded[0].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.2", loaded[0].label);
     try std.testing.expectEqualStrings("gpt-5.3-codex", loaded[1].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex", loaded[1].label);
     try std.testing.expectEqualStrings("gpt-5.3-codex-spark", loaded[2].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex Spark", loaded[2].label);
     try std.testing.expectEqualStrings("gpt-5.4", loaded[3].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4", loaded[3].label);
     try std.testing.expectEqualStrings("gpt-5.4-mini", loaded[4].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4 mini", loaded[4].label);
     try std.testing.expectEqualStrings("gpt-5.5", loaded[5].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.5", loaded[5].label);
+}
+
+test "loadStaticModels handles allocation failures gracefully" {
+    const gpa = std.testing.allocator;
+    var succeeded = false;
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = i });
+        if (loadStaticModels(failing.allocator())) |models| {
+            for (models) |*model| model.deinit(failing.allocator());
+            failing.allocator().free(models);
+            succeeded = true;
+            break;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    try std.testing.expect(succeeded);
 }
 
 test "sign out removes missing auth file without error" {
