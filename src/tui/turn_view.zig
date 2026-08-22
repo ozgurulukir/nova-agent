@@ -70,6 +70,7 @@ pub const TurnView = struct {
             .turn_finished => return try self.applyTurnFinished(gpa, transcript),
             .history_compacted => |info| return try self.applyHistoryCompacted(gpa, transcript, info),
             .compaction_notice => |notice| return try self.applyCompactionNotice(gpa, transcript, notice),
+            .tool_budget_exhausted => |limit| return try self.applyToolBudgetExhausted(gpa, transcript, limit),
         }
     }
 
@@ -203,6 +204,25 @@ pub const TurnView = struct {
             .waiting => "waiting for background summary before continuing…",
         };
         _ = try transcript.append(gpa, .notice, "compaction", text);
+        return true;
+    }
+
+    /// Amber attention row (`.notice`, not `.info`): the budget stop needs the
+    /// user to act (send a message to resume), unlike routine compaction info.
+    fn applyToolBudgetExhausted(
+        self: *TurnView,
+        gpa: std.mem.Allocator,
+        transcript: *transcript_mod.Transcript,
+        limit: u32,
+    ) !bool {
+        _ = self;
+        var buffer: [128]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &buffer,
+            "tool-call budget reached ({d} calls) — turn stopped early; send a message to continue",
+            .{limit},
+        ) catch "tool-call budget reached — turn stopped early; send a message to continue";
+        _ = try transcript.append(gpa, .notice, "budget", text);
         return true;
     }
 
@@ -718,4 +738,23 @@ test "history compacted appends a white info notice, not a red error" {
     // Neutral `.info` (white), distinct from `.notice` (red error).
     try std.testing.expectEqual(transcript_mod.MessageKind.info, transcript.messages.items[0].mirror().kind);
     try std.testing.expectEqualStrings("compacted context ~90000 -> ~20000 tokens", transcript.messages.items[0].mirror().body);
+}
+
+test "tool budget exhausted appends a budget notice row carrying the limit" {
+    const gpa = std.testing.allocator;
+    var transcript: transcript_mod.Transcript = .{};
+    defer transcript.deinit(gpa);
+    var turn_view: TurnView = .{};
+    defer turn_view.deinit(gpa);
+
+    try std.testing.expect(try turn_view.apply(gpa, &transcript, .{ .tool_budget_exhausted = 40 }));
+    try std.testing.expectEqual(@as(usize, 1), transcript.messages.items.len);
+    // Amber attention row (`.notice`) — the stop needs user action, unlike
+    // the neutral compaction `.info`.
+    try std.testing.expectEqual(transcript_mod.MessageKind.notice, transcript.messages.items[0].mirror().kind);
+    try std.testing.expectEqualStrings("budget", transcript.messages.items[0].mirror().title);
+    try std.testing.expectEqualStrings(
+        "tool-call budget reached (40 calls) — turn stopped early; send a message to continue",
+        transcript.messages.items[0].mirror().body,
+    );
 }

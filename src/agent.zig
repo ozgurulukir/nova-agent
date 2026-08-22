@@ -35,9 +35,16 @@ const Compactor = agent_compactor.Compactor;
 /// path backs off (emitting one notice); the manual `/compact` command is
 /// never gated (TD-6).
 pub const compaction_failure_limit: u32 = 3;
-/// Upper bound on tool-call iterations in one `run` — a runaway model loop
-/// terminates with an error instead of spinning the turn forever.
-const tool_call_limit_per_turn: u32 = 100;
+/// Trailing machine-authored continuation hint left in history after a soft
+/// budget stop. Role `.user` (not `.system`) because `SessionWriter.append`
+/// skips system messages — `.user` survives `/resume`, branch switches, and
+/// compaction reprojection, and Qwen's single-leading-system normalization
+/// never touches it. Static text: the event carries the limit for the human;
+/// the model does not need the number.
+const tool_budget_continuation_hint =
+    "[nova] This turn stopped early because the per-turn tool-call budget was reached. " ++
+    "Work done so far is intact. When the user asks to continue, briefly summarize " ++
+    "completed steps, then pick up exactly where the work left off.";
 /// Byte threshold at which a pending buffer flushes mid-stream. ~2s of text
 /// at 100 tok/s, ~0.4s at 500 tok/s. A config knob adds surface area for
 /// little gain; a comptime constant is simpler.
@@ -128,6 +135,17 @@ pub const Agent = struct {
     /// `config.context.compaction`; defaults match the old hardcoded
     /// constants so agents created without a config still compact.
     compaction_settings: config_mod.CompactionSettings = .{},
+    /// Per-turn bound on LLM→tool iterations (one assistant batch of tool
+    /// calls = one iteration). Set by the runtime from
+    /// `config.context.tool_call_limit_per_turn`; the default matches
+    /// `config_mod.default_tool_call_limit_per_turn` so agents created
+    /// without a config (tests) stay bounded.
+    tool_call_limit_per_turn: u32 = config_mod.default_tool_call_limit_per_turn,
+    /// When true, exhausting `tool_call_limit_per_turn` ends the turn
+    /// gracefully (drain + hint + typed event) instead of failing with
+    /// `error.ToolCallLimit`. Default true; `false` restores the historical
+    /// hard-failure contract byte-for-byte.
+    soft_stop_on_tool_call_limit: bool = true,
     /// Process-wide cap on concurrent LLM requests to the provider, shared by
     /// every lane's agent. Borrowed from the App (never freed here); null in
     /// headless/tests = no gate. Acquired around each `client.prompt` so at
@@ -402,6 +420,11 @@ pub const Agent = struct {
         /// is a bare enum so no allocation is involved — the renderer owns the
         /// message text (TD-6, TD-2 event plumbing).
         compaction_notice: CompactionNotice,
+        /// The per-turn tool-call budget ran out and the turn soft-stopped.
+        /// Payload is the configured limit; a bare u32 like
+        /// `queued_messages_flushed` so the event is allocation-free — the
+        /// renderer owns the human-facing text.
+        tool_budget_exhausted: u32,
 
         /// The fixed notice kinds `maybeCompact` can emit while it degrades
         /// gracefully instead of looping into provider overflow errors.
@@ -449,7 +472,7 @@ pub const Agent = struct {
                     gpa.free(tool.display_body);
                     if (tool.stderr) |stderr| gpa.free(stderr);
                 },
-                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice => {},
+                .turn_started, .delta_end, .tool_batch_finished, .queued_messages_flushed, .turn_finished, .history_compacted, .compaction_notice, .tool_budget_exhausted => {},
             }
             self.* = undefined;
         }
@@ -491,7 +514,7 @@ pub const Agent = struct {
         const l: L = listener;
         try l.emit(.turn_started);
         var calls: u32 = 0;
-        while (calls < tool_call_limit_per_turn) : (calls += 1) {
+        while (calls < self.tool_call_limit_per_turn) : (calls += 1) {
             self.maybeCompact(l);
             var stream_context: StreamContext(L) = .{
                 .agent = self,
@@ -587,7 +610,24 @@ pub const Agent = struct {
             while ((try self.drainQueuedUserMessage(true)) > 0) steered += 1;
             if (steered > 0) try l.emit(.{ .queued_messages_flushed = steered });
         }
+        // Budget exhausted: soft stop ends the turn gracefully (drain + hint +
+        // event); hard stop keeps the historical error contract byte-for-byte.
+        if (self.soft_stop_on_tool_call_limit) return self.softStopOnBudget(l, calls);
         return error.ToolCallLimit;
+    }
+
+    /// Graceful budget exhaustion: deliver everything the user queued mid-run
+    /// (a queued "continue" must land in history, not be cleared at turn
+    /// end), leave the continuation hint as the trailing message, and report
+    /// the stop through the event stream. Always terminates the run — no
+    /// auto-resume, so the budget stays a per-run bound (TD-6: continuation
+    /// is the user's next submit).
+    fn softStopOnBudget(self: *Agent, listener: anytype, calls: u32) !void {
+        log.warn("tool-call budget exhausted after {d} iterations (limit {d}); soft-stopping turn", .{ calls, self.tool_call_limit_per_turn });
+        const drained = try self.drainAllQueuedToHistory();
+        if (drained > 0) try listener.emit(.{ .queued_messages_flushed = drained });
+        try self.addUser(tool_budget_continuation_hint);
+        try listener.emit(.{ .tool_budget_exhausted = self.tool_call_limit_per_turn });
     }
 
     /// Hand the batch of tool_calls to the ExecutorService, bridge its
@@ -1986,6 +2026,68 @@ test "drain all queued moves the whole queue to history in FIFO order" {
     try std.testing.expectEqualStrings("a", agent.messages()[0].text());
     try std.testing.expectEqualStrings("c", agent.messages()[2].text());
     try std.testing.expectEqual(@as(u32, 0), agent.message_queue.len());
+}
+
+const BudgetSeen = struct {
+    events: std.ArrayList(Agent.Event) = .empty,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.events.items) |*event| event.deinit(allocator);
+        self.events.deinit(allocator);
+    }
+
+    fn onEvent(ctx: *@This(), event: Agent.Event) !void {
+        try ctx.events.append(std.testing.allocator, event);
+    }
+};
+
+test "softStopOnBudget drains queue, appends hint, emits events" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    agent.tool_call_limit_per_turn = 7;
+
+    try agent.enqueueUser("first");
+    try agent.enqueueUser("second");
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
+
+    try agent.softStopOnBudget(listener, 7);
+
+    // Everything queued landed in history in FIFO order, and the trailing
+    // continuation hint is the last message — a `.user` machine message so
+    // it persists (`SessionWriter.append` skips `.system`).
+    try std.testing.expectEqual(@as(usize, 3), agent.messages().len);
+    try std.testing.expectEqualStrings("first", agent.messages()[0].text());
+    try std.testing.expectEqualStrings("second", agent.messages()[1].text());
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[2].text(), "[nova] This turn stopped"));
+    try std.testing.expect(agent.messages()[2].role() == .user);
+    try std.testing.expect(!agent.hasQueuedMessages());
+
+    // Flush first (so the transcript shows the delivered user rows), then the
+    // terminal budget event carrying the configured limit.
+    try std.testing.expectEqual(@as(usize, 2), seen.events.items.len);
+    try std.testing.expectEqual(@as(u32, 2), seen.events.items[0].queued_messages_flushed);
+    try std.testing.expectEqual(@as(u32, 7), seen.events.items[1].tool_budget_exhausted);
+}
+
+test "softStopOnBudget with empty queue emits only the budget event" {
+    const gpa = std.testing.allocator;
+    var agent = Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+
+    var seen: BudgetSeen = .{};
+    defer seen.deinit(gpa);
+    const listener = Agent.Listener(BudgetSeen){ .ctx = &seen, .on_event = BudgetSeen.onEvent };
+
+    try agent.softStopOnBudget(listener, agent.tool_call_limit_per_turn);
+
+    try std.testing.expectEqual(@as(usize, 1), agent.messages().len);
+    try std.testing.expect(std.mem.startsWith(u8, agent.messages()[0].text(), "[nova] This turn stopped"));
+    try std.testing.expectEqual(@as(usize, 1), seen.events.items.len);
+    try std.testing.expectEqual(@as(u32, 100), seen.events.items[0].tool_budget_exhausted);
 }
 
 test "raw enqueued messages are delivered verbatim without @-mention expansion" {

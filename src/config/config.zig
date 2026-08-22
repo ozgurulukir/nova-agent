@@ -72,6 +72,11 @@ pub const globalConfigPath = parse_mod.globalConfigPath;
 /// `request_limiter.default_permits`.
 pub const default_max_concurrent_requests: u32 = 2;
 
+/// Default per-turn bound on LLM→tool iterations. The parse layer accepts
+/// 1–1000 and drops out-of-range values; this is the value used when the
+/// knob is unset.
+pub const default_tool_call_limit_per_turn: u32 = 100;
+
 /// Context window management and automatic compaction policy.
 /// Serialized as `"context"` in JSON (camelCase keys inside).
 pub const ContextSettings = struct {
@@ -100,6 +105,17 @@ pub const ContextSettings = struct {
     /// HTTP 400 (some OpenRouter `:free` / gateway-fronted models — kimi,
     /// inclusionai/ling).
     disable_prompt_cache: ?bool = null,
+    /// Upper bound on LLM→tool iterations (one assistant batch of tool calls
+    /// = one iteration) within a single turn. A runaway model loop terminates
+    /// the turn instead of spinning forever. Null = default (100); parse
+    /// accepts 1–1000 and drops out-of-range values.
+    tool_call_limit_per_turn: ?u32 = null,
+    /// When true (default), reaching `tool_call_limit_per_turn` does NOT fail
+    /// the turn: the loop exits cleanly, queued user messages are delivered,
+    /// a continuation hint is left in history, and a typed event lets the
+    /// TUI render a resumable notice. When false, the turn ends with
+    /// `error.ToolCallLimit` as in previous releases.
+    soft_stop_on_tool_call_limit: ?bool = null,
     compaction: CompactionSettings = .{},
 };
 
