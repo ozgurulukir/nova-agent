@@ -460,3 +460,36 @@ test "sign out removes missing auth file without error" {
         return error.TestUnexpectedFilePresent;
     } else |err| try std.testing.expectEqual(error.FileNotFound, err);
 }
+
+test "accountIdFromAccessToken extracts chatgpt_account_id from valid JWT token" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const valid_jwt = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjLTEyMzQ1In19.sig";
+
+    // Act
+    const account_id = try accountIdFromAccessToken(gpa, valid_jwt);
+    defer gpa.free(account_id);
+
+    // Assert
+    try std.testing.expectEqualStrings("acc-12345", account_id);
+}
+
+test "accountIdFromAccessToken returns InvalidCredentials on invalid JSON payload in JWT token" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const invalid_json_jwt = "e30.bm90IGpzb24.sig";
+
+    // Act & Assert
+    try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, invalid_json_jwt));
+}
+
+test "accountIdFromAccessToken returns InvalidCredentials on missing claims or malformed JWT token" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const missing_claims_jwt = "e30.eyJmb28iOiJiYXIifQ.sig";
+    const malformed_jwt = "header.payload";
+
+    // Act & Assert
+    try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, missing_claims_jwt));
+    try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, malformed_jwt));
+}

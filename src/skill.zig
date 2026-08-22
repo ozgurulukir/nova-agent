@@ -288,11 +288,29 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         else => log.warn("skipping skill {s}: {s}", .{ skill_path, @errorName(err) }),
     }
 
+    var entries: std.ArrayList(std.Io.Dir.Entry) = .empty;
+    defer {
+        for (entries.items) |e| gpa.free(e.name);
+        entries.deinit(gpa);
+    }
+
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.name.len == 0) continue;
         if (entry.name[0] == '.') continue;
         if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+        var e = entry;
+        e.name = try gpa.dupe(u8, entry.name);
+        try entries.append(gpa, e);
+    }
+
+    std.mem.sort(std.Io.Dir.Entry, entries.items, {}, struct {
+        fn lessThan(_: void, a: std.Io.Dir.Entry, b: std.Io.Dir.Entry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+
+    for (entries.items) |entry| {
         const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(child);
         switch (entry.kind) {
@@ -674,6 +692,7 @@ test "duplicate skill names keep the first occurrence" {
     const rel_dir = ".zig-cache/skill-dupe-test";
     const full_dir = try std.fs.path.join(gpa, &.{ root, rel_dir });
     defer gpa.free(full_dir);
+    std.Io.Dir.deleteTree(.cwd(), io, full_dir) catch {};
     const agents_dir = try std.fs.path.join(gpa, &.{ full_dir, ".agents", "skills" });
     defer gpa.free(agents_dir);
     try std.Io.Dir.createDirPath(.cwd(), io, agents_dir);
