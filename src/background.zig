@@ -23,7 +23,7 @@ const pws = @import("tools/pwsh_exec.zig");
 const temp_files = @import("tools/temp_files.zig");
 const os = @import("os.zig");
 const platform = @import("platform");
-const lanes_util = @import("tui/lanes.zig");
+const paths = @import("paths.zig");
 
 const assert = std.debug.assert;
 
@@ -749,10 +749,10 @@ const windows = struct {
 };
 
 pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
-    if (lanes_util.pathsEqual(child, parent)) return true;
+    if (paths.pathsEqual(child, parent)) return true;
     if (child.len <= parent.len) return false;
     const prefix = child[0..parent.len];
-    if (lanes_util.pathsEqual(prefix, parent)) {
+    if (paths.pathsEqual(prefix, parent)) {
         const sep = child[parent.len];
         return sep == '/' or sep == '\\';
     }

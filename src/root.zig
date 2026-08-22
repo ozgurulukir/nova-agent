@@ -19,6 +19,7 @@ pub const context_assembly = @import("context/assembly.zig");
 pub const db = @import("db.zig");
 pub const executor = @import("executor.zig");
 pub const os = @import("os.zig");
+pub const paths = @import("paths.zig");
 pub const search = @import("search.zig");
 pub const session = @import("session.zig");
 pub const skill = @import("skill.zig");
@@ -298,6 +299,8 @@ test {
     // the agent at call sites — reference it explicitly so its exhaustive
     // unit tests run (silent-drop guard per AGENTS.md §Test runner quirks).
     _ = @import("ai/text_tool_call.zig");
+    _ = @import("ai/model_compat.zig");
+    _ = @import("ai/openai_request.zig");
     _ = @import("ai/responses_request.zig");
     _ = @import("ai/responses_events.zig");
     _ = @import("ai/stream_part.zig");
@@ -312,4 +315,7 @@ test {
     // Idle-lane notice SSOT shared by mode/turn lifecycle; referenced
     // explicitly so its byte-pinning test runs.
     _ = @import("tui/lanes.zig");
+    // Platform-tolerant path comparison root leaf (extracted from
+    // tui/lanes.zig); referenced explicitly so its inline tests run.
+    _ = @import("paths.zig");
 }

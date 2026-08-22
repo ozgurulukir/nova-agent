@@ -20,6 +20,7 @@ const tui = @import("../tui.zig");
 const root_layout = @import("layout.zig");
 const lane_column = @import("lane_column.zig");
 const diff_viewer_overlay = @import("diff_viewer_overlay.zig");
+const tui_status = @import("status.zig");
 const tx_widget = @import("widgets/transcript.zig");
 const loading = @import("widgets/loading.zig");
 const input_mod = @import("widgets/input.zig");
@@ -67,8 +68,21 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
     app.input_surface_row = layout.input_row;
     app.nav.lanes_chip_rect = null;
 
-    var transcript_view: tx_widget.TranscriptWidget = .{ .app = app, .thread = app.thread };
-    var loading_view: loading.LoadingWidget = .{ .app = app };
+    // INV-WIDGET-1: leaf widgets take scalars, computed here per frame.
+    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    var transcript_view: tx_widget.TranscriptWidget = .{
+        .thread = app.thread,
+        .gpa = app.gpa,
+        .has_model_configured = has_model,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+    };
+    var loading_view: loading.LoadingWidget = .{
+        .awaiting_output = app.thread.turn_view.awaitingOutput(),
+        .word_index = app.thread.turn_view.loading_word_index,
+        .loading_frame = app.metrics.loading_frame,
+    };
     var input_view: input_mod.InputWidget = .{ .app = app };
     var overlay_view: overlay.OverlayWidget = .{ .app = app };
 
