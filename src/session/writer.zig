@@ -147,9 +147,9 @@ pub const SessionWriter = struct {
         return self.session.snapshotAt(gpa);
     }
 
-    /// Save a prompt to the session's prompt history, race-free. Deduplicates
-    /// against the most recent entry so consecutive identical prompts aren't
-    /// stored twice.
+    /// Save a prompt to the session's prompt history, race-free. A plain
+    /// append — no dedup (the table is a per-session log; only the UI ring
+    /// dedups).
     pub fn savePromptHistory(self: *SessionWriter, prompt: []const u8) Error!void {
         self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
@@ -162,6 +162,22 @@ pub const SessionWriter = struct {
         self.quiesce();
         defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
         return self.session.loadPromptHistory(gpa);
+    }
+
+    /// Drop the newest prompt-history row, race-free. `/undo`'s second half:
+    /// keeps `[0]` tracking the active branch across chained undos. Idempotent.
+    pub fn deleteNewestPromptHistory(self: *SessionWriter) Error!void {
+        self.quiesce();
+        defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
+        try self.session.deleteNewestPromptHistory();
+    }
+
+    /// Race-free `Session.lastUserEntry`: the newest user message entry on the
+    /// active path, or null when the session holds none. Allocation-free.
+    pub fn lastUserEntry(self: *SessionWriter) Error!?session_type.UserEntryRef {
+        self.quiesce();
+        defer self.restart() catch |err| log.warn("session writer restart failed: {s}", .{@errorName(err)});
+        return self.session.lastUserEntry();
     }
 
     /// Load the whole session tree, race-free. Stops the background writer so

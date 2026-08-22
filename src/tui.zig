@@ -869,6 +869,10 @@ pub const App = struct {
         return session_switcher.navigateToEntry(self, entry_id);
     }
 
+    pub fn undoLastTurn(self: *App) !void {
+        return session_switcher.undoLastTurn(self);
+    }
+
     pub fn reportSessionSwitchError(self: *App, err: anyerror) !void {
         return session_switcher.reportSessionSwitchError(self, err);
     }
@@ -1325,7 +1329,7 @@ pub fn shouldOpenCommandMenuForSlash(app: *const App, key: vaxis.Key) bool {
     return mode_lifecycle.shouldOpenCommandMenuForSlash(app, key);
 }
 
-pub const Command = enum { connect, model, mcp, new, resume_session, timeline, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills, theme };
+pub const Command = enum { connect, model, mcp, new, resume_session, timeline, undo, diff, parallel, save, close, merge, lanes, search, clear, compact, status, help, export_session, settings, copy, paste, exit_cmd, plugins, skills, theme };
 /// `multi_lane` commands act on another lane, so they're hidden from the palette
 /// (and unresolvable) until more than one lane exists.
 pub const CommandEntry = struct { name: []const u8, command: Command, description: []const u8 = "", category: []const u8 = "", multi_lane: bool = false };
@@ -1339,6 +1343,7 @@ pub const commands = [_]CommandEntry{
     .{ .name = "New", .command = .new, .description = "Start a fresh session", .category = "SESSION" },
     .{ .name = "Resume", .command = .resume_session, .description = "Resume a past session", .category = "SESSION" },
     .{ .name = "Timeline", .command = .timeline, .description = "Browse session tree history", .category = "SESSION" },
+    .{ .name = "Undo", .command = .undo, .description = "Rewind the last turn and restore its prompt", .category = "SESSION" },
     .{ .name = "Clear", .command = .clear, .description = "Clear current transcript view", .category = "SESSION" },
     .{ .name = "Compact", .command = .compact, .description = "Compact session context history", .category = "SESSION" },
     .{ .name = "Export", .command = .export_session, .description = "Save conversation transcript as Markdown", .category = "SESSION" },

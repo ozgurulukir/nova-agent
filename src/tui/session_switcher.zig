@@ -221,6 +221,77 @@ pub fn reportSessionSwitchError(app: *App, err: anyerror) !void {
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
 }
 
+fn postUndoNotice(app: *App, body: []const u8) void {
+    _ = app.thread.transcript.append(app.gpa, .notice, "session", body) catch {};
+}
+
+/// `/undo`: re-attach the leaf to the parent of the last user prompt,
+/// restore the working tree to that point, and refill the main input with
+/// the raw prompt so the user can rephrase and resubmit. Everything after
+/// the last user entry on the active path is exactly the last turn, so
+/// landing on its parent rewinds precisely that turn — non-destructively
+/// (the old branch stays alive for `/timeline`).
+pub fn undoLastTurn(app: *App) !void {
+    // Ordering hazard: `reportSessionSwitchError` clears the input line, so
+    // the prompt restore must run after `navigateToEntry` — never before.
+    if (app.thread.turn.isActive()) {
+        postUndoNotice(app, "A turn is still running — interrupt it with Esc before undoing.");
+        return;
+    }
+    const rt = app.liveRuntime() orelse return error.NoActiveRuntime;
+    const position = (try rt.session_writer.lastUserEntry()) orelse {
+        postUndoNotice(app, "Nothing to undo — this session has no prompts yet.");
+        return;
+    };
+    const parent = position.parent_id orelse {
+        // Null parent = the session's first prompt. Rewinding past it would
+        // need an "empty leaf" position the tree model cannot represent —
+        // nothing ever moves leaf_entry_id back to null, and a second root
+        // has never been exercised. `/new` is the escape hatch.
+        postUndoNotice(app, "Nothing to undo — this is the session's first prompt.");
+        return;
+    };
+    // Capture the raw prompt from the history table, NOT the persisted user
+    // entry: the entry is augmented (@file contents inlined, $skill bodies
+    // injected) and would double-inline on resubmit, while the table stores
+    // the text exactly as typed. It is also untouched by compaction.
+    const history = try rt.session_writer.loadPromptHistory(app.gpa);
+    defer {
+        for (history) |prompt| app.gpa.free(prompt);
+        app.gpa.free(history);
+    }
+    const prompt: ?[]const u8 = if (history.len > 0) history[0] else null;
+
+    try navigateToEntry(app, parent.slice());
+
+    // The rewind has landed; everything below is best-effort and must not
+    // fail it.
+    var restored = false;
+    if (prompt) |text| {
+        app.clearInput();
+        if (app.inputs.input.insertSliceAtCursor(text)) {
+            restored = true;
+        } else |_| {
+            postUndoNotice(app, "Undone — the prompt could not be restored to the input line.");
+        }
+    } else {
+        postUndoNotice(app, "Undone — no saved prompt text to restore.");
+    }
+    // Drop the restored row so a chained /undo restores the *previous*
+    // turn's prompt: rows are pushed per turn at submit time, and without
+    // the delete the next [0] would still be the prompt just handed back.
+    // Only after a successful handoff — the table's copy is the only
+    // non-augmented record of the text, so a failed restore must keep it.
+    // The table is a per-session log, so a `/timeline` jump to another
+    // branch can leave [0] off-branch; restore stays a best-effort "last
+    // text typed". Warn-only — the rewind itself already succeeded.
+    if (restored) {
+        rt.session_writer.deleteNewestPromptHistory() catch |err|
+            log.warn("undo.prompt_history_delete_failed err={s}", .{@errorName(err)});
+        postUndoNotice(app, "Undone — the last prompt is back in the input line; edit and resubmit.");
+    }
+}
+
 /// Enter the rename sub-state for the currently selected session. Prefills
 /// the rename buffer with the existing title (or empty if untitled). No-op
 /// when the selection is a project header or no session is selected.
@@ -414,4 +485,220 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     // definitions instead of running tool-less until an unrelated MCP event.
     provider_model.injectToolsInto(app, runtime);
     return runtime;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const agent_mod = @import("../agent.zig");
+const ai = @import("../ai.zig");
+
+fn undoNoticeContains(app: *App, needle: []const u8) bool {
+    for (app.thread.transcript.messages.items) |m| {
+        const body: []const u8 = switch (m) {
+            .notice => |x| x.body,
+            else => continue,
+        };
+        if (std.mem.indexOf(u8, body, needle) != null) return true;
+    }
+    return false;
+}
+
+/// Append a text message through the runtime's session writer (the enqueue
+/// path every quiesce-based wrapper flushes before reading).
+fn appendTurnText(writer: *session_mod.SessionWriter, gpa: std.mem.Allocator, role: ai.Role, text: []const u8) !void {
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    defer {
+        for (blocks) |*block| block.deinit(gpa);
+        gpa.free(blocks);
+    }
+    blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
+    const message: ai.ChatMessage = switch (role) {
+        .user => .{ .user = .{ .content = blocks } },
+        .assistant => .{ .assistant = .{ .content = blocks } },
+        else => return error.InvalidRole,
+    };
+    try writer.append(message);
+}
+
+/// Focused live primary lane with a REAL session writer (real tree, real
+/// writer thread) — `thread.agent` wired because `rebuildTranscriptFromAgent`
+/// derefs it. Teardown is free: App.deinit → Thread.deinit honors `owns`.
+fn makeUndoTestApp(gpa: std.mem.Allocator, home_abs: []const u8, agent: *agent_mod.Agent) !App {
+    const test_helpers = @import("test_helpers.zig");
+    var app = try App.init(std.testing.io, gpa, agent);
+    const runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs);
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = true } };
+    app.thread.agent = &runtime.agent;
+    return app;
+}
+
+test "undoLastTurn rewinds the leaf, restores the raw prompt, and drops the newest history row" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try makeUndoTestApp(gpa, home_abs, &agent);
+    defer app.deinit();
+
+    const runtime = app.thread.engine.live.runtime;
+    const writer = &runtime.session_writer;
+    // Two full turns. Rows land at "turn start", mirroring beginSubmit.
+    try writer.savePromptHistory("first prompt");
+    try appendTurnText(writer, gpa, .user, "one");
+    try appendTurnText(writer, gpa, .assistant, "two");
+    try writer.savePromptHistory("second prompt");
+    try appendTurnText(writer, gpa, .user, "three");
+    try appendTurnText(writer, gpa, .assistant, "four");
+
+    // Quiesced read: newest user entry is turn 2's, its parent is the
+    // rewind target (turn 1's last entry).
+    const position = (try writer.lastUserEntry()) orelse return error.TestFailed;
+    const target = position.parent_id orelse return error.TestFailed;
+
+    try undoLastTurn(&app);
+
+    // Leaf moved to the target branch point.
+    try std.testing.expectEqualSlices(u8, target.slice(), writer.leaf().?);
+    // The RAW prompt (as typed, not the augmented entry) is in the input.
+    {
+        const input = try app.peekInput();
+        defer gpa.free(input);
+        try std.testing.expectEqualStrings("second prompt", input);
+    }
+    // The restored row is dropped: [0] is now the previous turn's prompt —
+    // this is what keeps a chained /undo restoring the right text.
+    {
+        const prompts = try writer.loadPromptHistory(gpa);
+        defer {
+            for (prompts) |p| gpa.free(p);
+            gpa.free(prompts);
+        }
+        try std.testing.expectEqual(@as(usize, 1), prompts.len);
+        try std.testing.expectEqualStrings("first prompt", prompts[0]);
+    }
+    try std.testing.expect(undoNoticeContains(&app, "Undone"));
+    // The conversation re-projects to the u1/a1 branch.
+    {
+        var non_system: usize = 0;
+        var first_user: ?[]const u8 = null;
+        for (runtime.agent.messages()) |m| {
+            if (m.role() == .system) continue;
+            non_system += 1;
+            if (m.role() == .user and first_user == null) first_user = m.text();
+        }
+        try std.testing.expectEqual(@as(usize, 2), non_system);
+        try std.testing.expectEqualStrings("one", first_user orelse return error.TestFailed);
+    }
+
+    // Chained undo: u1's parent is null — the first-prompt refusal, and no
+    // state moves (leaf, input, and history all stay as the first undo left
+    // them).
+    try undoLastTurn(&app);
+    try std.testing.expectEqualSlices(u8, target.slice(), writer.leaf().?);
+    try std.testing.expect(undoNoticeContains(&app, "first prompt"));
+    {
+        const input = try app.peekInput();
+        defer gpa.free(input);
+        try std.testing.expectEqualStrings("second prompt", input);
+    }
+}
+
+test "undoLastTurn notices nothing to undo on a fresh session and on the first prompt" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try makeUndoTestApp(gpa, home_abs, &agent);
+    defer app.deinit();
+
+    const writer = &app.thread.engine.live.runtime.session_writer;
+
+    // Fresh session: no entries at all → notice, no state change.
+    try undoLastTurn(&app);
+    try std.testing.expect(undoNoticeContains(&app, "no prompts yet"));
+    try std.testing.expect(writer.leaf() == null);
+
+    // A single user entry: its parent is null → the first-prompt refusal.
+    try writer.savePromptHistory("only prompt");
+    try appendTurnText(writer, gpa, .user, "only");
+    try undoLastTurn(&app);
+    try std.testing.expect(undoNoticeContains(&app, "first prompt"));
+    try std.testing.expect(writer.leaf() != null);
+    {
+        const input = try app.peekInput();
+        defer gpa.free(input);
+        try std.testing.expectEqual(@as(usize, 0), input.len);
+    }
+}
+
+test "submitMode dispatches /undo end to end and the restored prompt survives" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try makeUndoTestApp(gpa, home_abs, &agent);
+    defer app.deinit();
+
+    const writer = &app.thread.engine.live.runtime.session_writer;
+    try writer.savePromptHistory("first prompt");
+    try appendTurnText(writer, gpa, .user, "one");
+    try appendTurnText(writer, gpa, .assistant, "two");
+    try writer.savePromptHistory("second prompt");
+    try appendTurnText(writer, gpa, .user, "three");
+    try appendTurnText(writer, gpa, .assistant, "four");
+
+    // Drive the REAL dispatch path (palette → resolveCommand → idle guard →
+    // clearInput → handler), not the handler directly. This pins the ordering
+    // the input-wipe hazard demands: the dispatch's clearInput runs BEFORE
+    // the handler's restore, and nothing after the switch wipes it again.
+    app.mode = .command;
+    try app.inputs.palette.buf.insertSliceAtCursor("undo");
+    app.nav.command_selection = 0;
+    try std.testing.expect(try app.submitMode());
+
+    try std.testing.expectEqual(App.Mode.normal, app.mode);
+    {
+        const input = try app.peekInput();
+        defer gpa.free(input);
+        try std.testing.expectEqualStrings("second prompt", input);
+    }
+    try std.testing.expect(undoNoticeContains(&app, "Undone"));
+}
+
+test "undoLastTurn refuses when a turn is active" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // The in-flight guard precedes every runtime deref, so an undefined
+    // runtime suffices (mirrors the submitMode InFlightTurn fixture).
+    var fake_runtime: runtime_mod.AgentRuntime = undefined;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &fake_runtime, .owns = false } };
+    app.thread.turn.state = .active;
+
+    try undoLastTurn(&app);
+    try std.testing.expect(undoNoticeContains(&app, "still running"));
+    try std.testing.expect(app.thread.turn.state == .active);
 }
