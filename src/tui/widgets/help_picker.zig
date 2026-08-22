@@ -53,6 +53,7 @@ pub const help_lines = [_]HelpLine{
     .{ .key = "/new", .desc = "Start a fresh session" },
     .{ .key = "/resume", .desc = "Resume past session from history" },
     .{ .key = "/timeline", .desc = "Interactive session tree browser" },
+    .{ .key = "/undo", .desc = "Rewind the last turn and restore its prompt" },
     .{ .key = "/diff", .desc = "Full-screen git diff viewer & comments" },
     .{ .key = "/parallel", .desc = "Fork worktree into a new parallel lane" },
     .{ .key = "/save", .desc = "Commit git-shadow working copy snapshot" },
@@ -117,6 +118,12 @@ test "help documents every diff-viewer, jobs-modal, and lane binding" {
     for ([_][]const u8{"Ctrl+L"}) |k| {
         try std.testing.expect(indexOfKey(k, .lanes) != null);
     }
+}
+
+// The /undo help line is a user-facing contract of the command's semantics
+// (rewind + prompt restore); guard it against removal just like the bindings.
+test "help documents /undo" {
+    try std.testing.expect(indexOfKey("/undo", .global) != null);
 }
 
 /// The help overlay's outer height in rows, as sized by `overlaySize` in

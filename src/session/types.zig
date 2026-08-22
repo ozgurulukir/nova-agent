@@ -152,6 +152,14 @@ pub const EntryRecord = struct {
     }
 };
 
+/// Fixed-size reference to a user message entry on the active path — the
+/// `/undo` walk's result. Carries only the two ids the caller needs, so the
+/// lookup stays allocation-free (no payload ownership).
+pub const UserEntryRef = struct {
+    id: EntryId,
+    parent_id: ?EntryId,
+};
+
 /// A compaction boundary found while walking a branch.
 pub const CompactionBoundary = struct {
     /// Index in the path array of the compaction entry itself.

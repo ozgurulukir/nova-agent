@@ -24,6 +24,7 @@ pub const QueuedEntry = session_type.QueuedEntry;
 pub const CreateOptions = session_type.CreateOptions;
 pub const SessionSummary = session_type.SessionSummary;
 pub const EntryRecord = session_type.EntryRecord;
+pub const UserEntryRef = session_type.UserEntryRef;
 pub const CompactionBoundary = session_type.CompactionBoundary;
 pub const CompactionCut = session_type.CompactionCut;
 pub const EntryKind = session_type.EntryKind;
@@ -286,8 +287,9 @@ pub const Session = struct {
         try expectDone(&statement);
     }
 
-    /// Save a prompt to the session's prompt history. Deduplicates against the
-    /// most recent entry so consecutive identical prompts aren't stored twice.
+    /// Save a prompt to the session's prompt history. A plain append: the table
+    /// is a per-session log of prompts as typed (no dedup — consecutive
+    /// identical prompts each get their own row; only the UI ring dedups).
     pub fn savePromptHistory(self: *Session, prompt: []const u8) Error!void {
         assert(prompt.len > 0);
         const timestamp_ms = nowMs(self.manager.io);
@@ -299,10 +301,13 @@ pub const Session = struct {
         try expectDone(&statement);
     }
 
-    /// Load the prompt history for this session, newest first. Caller owns the
-    /// slice and each string.
+    /// Load the prompt history for this session, newest first. Ordered by the
+    /// monotonic autoincrement `id`, not `created_at_ms`: millisecond ties and
+    /// clock skew would leave the order unspecified, and `/undo` relies on
+    /// `[0]` agreeing with `deleteNewestPromptHistory`'s victim. Caller owns
+    /// the slice and each string.
     pub fn loadPromptHistory(self: *Session, gpa: std.mem.Allocator) Error![][]u8 {
-        var statement = try self.manager.connection.prepare("select prompt_text from prompt_history where session_id = ? order by created_at_ms desc");
+        var statement = try self.manager.connection.prepare("select prompt_text from prompt_history where session_id = ? order by id desc");
         defer statement.finalize();
         try statement.bindText(1, self.id.slice());
 
@@ -315,6 +320,20 @@ pub const Session = struct {
             try prompts.append(gpa, try gpa.dupe(u8, row.text(0)));
         }
         return prompts.toOwnedSlice(gpa);
+    }
+
+    /// Drop the newest prompt-history row. `/undo` calls this after a
+    /// successful rewind so the table's `[0]` tracks the newest prompt *on the
+    /// active branch* — without it, a chained undo would restore the prompt of
+    /// the turn it already discarded. Idempotent by construction: deleting
+    /// from an empty table is a no-op.
+    pub fn deleteNewestPromptHistory(self: *Session) Error!void {
+        var statement = try self.manager.connection.prepare(
+            "delete from prompt_history where session_id = ?1 and id = (select id from prompt_history where session_id = ?1 order by id desc limit 1)",
+        );
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        try expectDone(&statement);
     }
 
     /// Update the model provider, ID, and reasoning effort for this session.
@@ -368,6 +387,38 @@ pub const Session = struct {
         const row = (try statement.step()) orelse return null;
         if (row.columnType(0) == .null) return null;
         return try gpa.dupe(u8, row.text(0));
+    }
+
+    /// The newest user message entry on the active root→leaf path (walking
+    /// leaf→root), or null when the path holds none (a fresh session). `/undo`'s
+    /// target selection: everything after this entry is the last turn, so the
+    /// undo target is its `parent_id`. The role filter is pure SQL — compaction
+    /// boundaries (role null) and legacy non-message kinds are skipped by the
+    /// database itself. Allocation-free: ids are fixed-size.
+    pub fn lastUserEntry(self: *Session) Error!?UserEntryRef {
+        const leaf_id = self.leaf_entry_id orelse return null;
+        var statement = try self.manager.connection.prepare(
+            \\with recursive anc(id, parent_id, kind, role, depth) as (
+            \\  select id, parent_id, kind, role, 0 from session_entries
+            \\    where session_id = ?1 and id = ?2
+            \\  union all
+            \\  select e.id, e.parent_id, e.kind, e.role, anc.depth + 1
+            \\    from session_entries e join anc on e.id = anc.parent_id
+            \\    where e.session_id = ?1
+            \\)
+            \\select id, parent_id from anc
+            \\  where kind = 'message' and role = 'user' order by depth limit 1
+        );
+        defer statement.finalize();
+        try statement.bindText(1, self.id.slice());
+        try statement.bindText(2, leaf_id.slice());
+        const row = (try statement.step()) orelse return null;
+        const id = try EntryId.fromSlice(row.text(0));
+        const parent_id: ?EntryId = if (row.columnType(1) == .null)
+            null
+        else
+            try EntryId.fromSlice(row.text(1));
+        return .{ .id = id, .parent_id = parent_id };
     }
 
     /// Project the active branch into the message list the model sees. The
@@ -1072,6 +1123,134 @@ test "snapshotAt reads the nearest ancestor-or-self snapshot, branch-aware" {
         defer gpa.free(got);
         try std.testing.expectEqualStrings(sha_a, got);
     }
+}
+
+test "lastUserEntry walks the active path to the newest user message" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "e" ** session_id_len });
+
+    var user1: [entry_id_len]u8 = undefined;
+    var asst1: [entry_id_len]u8 = undefined;
+    var user2: [entry_id_len]u8 = undefined;
+    var asst2: [entry_id_len]u8 = undefined;
+    var scratch: [entry_id_len]u8 = undefined;
+
+    // Fresh session: no entries → no user entry.
+    try std.testing.expect((try session.lastUserEntry()) == null);
+
+    try appendTextEntry(&session, gpa, .user, "one", &user1);
+    try appendTextEntry(&session, gpa, .assistant, "two", &asst1);
+    try appendTextEntry(&session, gpa, .user, "three", &user2);
+    try appendTextEntry(&session, gpa, .assistant, "four", &asst2);
+
+    // Leaf is a2: the newest user entry on the path is u2, its parent asst1 is
+    // exactly the /undo target (the last entry of the previous turn).
+    {
+        const got = (try session.lastUserEntry()) orelse return error.TestFailed;
+        try std.testing.expectEqualSlices(u8, user2[0..], got.id.slice());
+        try std.testing.expectEqualSlices(u8, asst1[0..], got.parent_id.?.slice());
+    }
+
+    // A compaction boundary appended after the leaf must be skipped by the
+    // kind/role filters (compaction rows are kind='compaction', role null).
+    try session.appendCompaction(asst2[0..], "SUMMARY", &scratch);
+    {
+        const got = (try session.lastUserEntry()) orelse return error.TestFailed;
+        try std.testing.expectEqualSlices(u8, user2[0..], got.id.slice());
+    }
+
+    // Rewind to a1 (the /undo navigation): u2 is off-path, u1 is the newest
+    // user entry — and its null parent is the "first prompt" discriminator.
+    try session.branch(asst1[0..], null, null);
+    {
+        const got = (try session.lastUserEntry()) orelse return error.TestFailed;
+        try std.testing.expectEqualSlices(u8, user1[0..], got.id.slice());
+        try std.testing.expect(got.parent_id == null);
+    }
+}
+
+test "deleteNewestPromptHistory removes exactly the newest row" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "f" ** session_id_len });
+
+    try session.savePromptHistory("first");
+    try session.savePromptHistory("second");
+    try session.savePromptHistory("third");
+
+    {
+        const prompts = try session.loadPromptHistory(gpa);
+        defer {
+            for (prompts) |p| gpa.free(p);
+            gpa.free(prompts);
+        }
+        try std.testing.expectEqual(@as(usize, 3), prompts.len);
+        try std.testing.expectEqualStrings("third", prompts[0]);
+    }
+    try session.deleteNewestPromptHistory();
+    {
+        const prompts = try session.loadPromptHistory(gpa);
+        defer {
+            for (prompts) |p| gpa.free(p);
+            gpa.free(prompts);
+        }
+        try std.testing.expectEqual(@as(usize, 2), prompts.len);
+        try std.testing.expectEqualStrings("second", prompts[0]);
+        try std.testing.expectEqualStrings("first", prompts[1]);
+    }
+
+    // Drain to empty, then one more delete: a no-op, not an error.
+    try session.deleteNewestPromptHistory();
+    try session.deleteNewestPromptHistory();
+    try session.deleteNewestPromptHistory();
+    {
+        const prompts = try session.loadPromptHistory(gpa);
+        defer {
+            for (prompts) |p| gpa.free(p);
+            gpa.free(prompts);
+        }
+        try std.testing.expectEqual(@as(usize, 0), prompts.len);
+    }
+}
+
+test "prompt history newest-first order is insertion-stable under millisecond ties" {
+    const gpa = std.testing.allocator;
+    var manager = try SessionManager.init(gpa, std.testing.io, ":memory:");
+    defer manager.deinit();
+    var session = try manager.create("/tmp/nova", .{ .id = "6" ** session_id_len });
+
+    // Two rows sharing created_at_ms: the order must fall back to insertion
+    // order (autoincrement id) — the agreement point between
+    // loadPromptHistory[0] and deleteNewestPromptHistory's victim.
+    {
+        var stmt = try manager.connection.prepare(
+            "insert into prompt_history(session_id, prompt_text, created_at_ms) values (?, ?, 0)",
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, session.id.slice());
+        try stmt.bindText(2, "older insert");
+        try expectDone(&stmt);
+    }
+    {
+        var stmt = try manager.connection.prepare(
+            "insert into prompt_history(session_id, prompt_text, created_at_ms) values (?, ?, 0)",
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, session.id.slice());
+        try stmt.bindText(2, "newer insert");
+        try expectDone(&stmt);
+    }
+    const prompts = try session.loadPromptHistory(gpa);
+    defer {
+        for (prompts) |p| gpa.free(p);
+        gpa.free(prompts);
+    }
+    try std.testing.expectEqual(@as(usize, 2), prompts.len);
+    try std.testing.expectEqualStrings("newer insert", prompts[0]);
+    try std.testing.expectEqualStrings("older insert", prompts[1]);
 }
 
 test "initDefault creates directory and initializes database" {

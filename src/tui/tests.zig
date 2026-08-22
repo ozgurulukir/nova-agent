@@ -1637,8 +1637,8 @@ test "lane commands stay hidden until a second lane exists" {
     defer app.deinit();
 
     // Single lane: the multi-lane commands (/merge, /close) are filtered out of
-    // the palette and can't be resolved; the twenty-four always-on commands remain.
-    try std.testing.expectEqual(@as(u32, 24), commandMatchesCountForFilter(&app, ""));
+    // the palette and can't be resolved; the twenty-five always-on commands remain.
+    try std.testing.expectEqual(@as(u32, 25), commandMatchesCountForFilter(&app, ""));
     try std.testing.expect(resolveCommand(&app, "Close") == null);
     try std.testing.expect(resolveCommand(&app, "Merge") == null);
     // `/sync` was removed with the git-shadow pivot and never came back.

@@ -356,7 +356,7 @@ pub fn submitMode(app: *App) !bool {
             return true;
         }
         if (resolveCommand(app, filter)) |command| {
-            // These four deref `app.liveRuntime().?` down their call chains
+            // These deref `app.liveRuntime().?` down their call chains
             // (session_switcher / provider_model.refreshProviderApiKeys);
             // refuse on a focused idle lane BEFORE clearing the command bar,
             // so the user's typed `/resume` survives the refuse (matches the
@@ -364,7 +364,7 @@ pub fn submitMode(app: *App) !bool {
             // The other commands are idle-lane-safe (self-guarded or
             // runtime-free) and don't reach this guard.
             const crashes_on_idle = switch (command) {
-                .new, .resume_session, .timeline, .connect => true,
+                .new, .resume_session, .timeline, .undo, .connect => true,
                 else => false,
             };
             if (crashes_on_idle and refuseOnIdleLane(app)) return true;
@@ -374,6 +374,10 @@ pub fn submitMode(app: *App) !bool {
                 .new => app.switchToNewSession() catch |err| try app.reportSessionSwitchError(err),
                 .resume_session => app.openResumePicker() catch |err| try app.reportSessionSwitchError(err),
                 .timeline => diff_lifecycle.openTimelineSelector(app) catch |err| try app.reportSessionSwitchError(err),
+                .undo => {
+                    app.mode = .normal;
+                    app.undoLastTurn() catch |err| try app.reportSessionSwitchError(err);
+                },
                 .connect => provider_model.openProviderPicker(app) catch |err| try app.reportConnectionError(err),
                 .model => provider_model.openModelPicker(app) catch |err| try app.reportConnectionError(err),
                 .mcp => tui.openMcp(app),
@@ -665,6 +669,18 @@ test "submitMode refuses on the crashing commands but leaves safe commands worki
     const kept = try app.peekPaletteInput();
     defer gpa.free(kept);
     try std.testing.expectEqualStrings("resume", kept);
+
+    // /undo joins the crashing list (it derefs liveRuntime through
+    // undoLastTurn): same refuse, same preserved input.
+    app.inputs.palette.clearRetainingCapacity();
+    app.mode = .command;
+    try app.inputs.palette.buf.insertSliceAtCursor("undo");
+    app.nav.command_selection = 0;
+    try std.testing.expect(try app.submitMode());
+    try std.testing.expect(transcriptNoticeContains(&app, "idle"));
+    const kept_undo = try app.peekPaletteInput();
+    defer gpa.free(kept_undo);
+    try std.testing.expectEqualStrings("undo", kept_undo);
 
     // A safe command (.help) is NOT blocked by the idle-lane guard — the
     // guard is per-case, not blanket. This pins that /help, /close, /exit,
