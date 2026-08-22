@@ -8,11 +8,13 @@ const c = @import("c");
 const State = @import("state.zig").State;
 
 /// Thread-local override for the working directory a plugin tool runs in.
-/// `executor.produceOutput` sets it to the executor's re-rooted cwd (e.g. a
-/// lane worktree) before dispatching so cwd-sensitive plugins like
-/// `nova.git_commit` operate in the same workspace as the rest of the tool
-/// batch. Lives here (not `registry_bridge.zig`) because `plugin_api.zig`
-/// imports this leaf module — placing it here avoids an import cycle.
+/// Fed from `ExecutorService.cwd` = `Agent.effectiveCwd()` (lane worktree OR
+/// `/resume` session cwd), set in two windows: around each plugin dispatch in
+/// `produceOutput`, and around the whole `runAll` for event callbacks. Outside
+/// these windows (e.g. `init.lua` load) callers fall back to the process cwd
+/// via `resolvePluginCwd`. Lives here (not `registry_bridge.zig`) because
+/// `plugin_api.zig` imports this leaf module — placing it here avoids an import
+/// cycle.
 pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 
 /// Thread-local carrying the remote shell-safety classifier URL to the Lua C
@@ -22,6 +24,32 @@ pub threadlocal var plugin_cwd_slot: ?[]const u8 = null;
 /// plugin event callbacks) and re-asserted around each plugin dispatch. Lives
 /// here beside `plugin_cwd_slot` for the same import-cycle reason.
 pub threadlocal var bash_classifier_url_slot: ?[]const u8 = null;
+
+/// Resolved working directory for a plugin bridge: either a borrow of
+/// `plugin_cwd_slot` (no free needed), or an owned allocation from
+/// `currentPathAlloc` (must call `deinit`).
+pub const ResolvedCwd = struct {
+    path: []const u8,
+    owned: ?[]u8 = null,
+
+    pub fn deinit(self: ResolvedCwd) void {
+        if (self.owned) |o| std.heap.page_allocator.free(o);
+    }
+};
+
+/// Resolve the effective working directory for a plugin bridge.
+/// When `plugin_cwd_slot` is set (from Agent.effectiveCwd() — a lane worktree
+/// or a resumed session's cwd), borrows its path. Otherwise falls back to
+/// `std.process.currentPathAlloc` on `std.heap.page_allocator` (the process
+/// cwd, frozen at launch). Returns null on allocation failure.
+/// Callers must call `deinit` on the result.
+pub fn resolvePluginCwd(io: std.Io) ?ResolvedCwd {
+    if (plugin_cwd_slot) |s| {
+        return .{ .path = s };
+    }
+    const owned = std.process.currentPathAlloc(io, std.heap.page_allocator) catch return null;
+    return .{ .path = owned, .owned = owned };
+}
 
 /// Returns true if T is an array of u8 (e.g. [5:0]u8).
 fn isArrayOfU8(comptime T: type) bool {
@@ -179,4 +207,41 @@ test "pull from nil returns null" {
     try std.testing.expect(pullValue(&L, i64, -1) == null);
     try std.testing.expect(pullValue(&L, []const u8, -1) == null);
     L.pop(1);
+}
+
+test "resolvePluginCwd borrows from plugin_cwd_slot when set" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const fake = ".zig-cache/test_resolve_cwd_borrow";
+    std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, fake);
+    defer std.Io.Dir.cwd().deleteTree(io, fake) catch {};
+
+    const abs_fake = try std.fs.path.resolve(gpa, &.{fake});
+    defer gpa.free(abs_fake);
+
+    plugin_cwd_slot = abs_fake;
+    defer plugin_cwd_slot = null;
+
+    var resolved = resolvePluginCwd(io) orelse return error.TestFailed;
+    defer resolved.deinit();
+
+    try std.testing.expect(resolved.owned == null);
+    try std.testing.expectEqualStrings(abs_fake, resolved.path);
+}
+
+test "resolvePluginCwd falls back to process currentPathAlloc when slot is null" {
+    const io = std.testing.io;
+
+    const prev = plugin_cwd_slot;
+    plugin_cwd_slot = null;
+    defer plugin_cwd_slot = prev;
+
+    var resolved = resolvePluginCwd(io) orelse return error.TestFailed;
+    defer resolved.deinit();
+
+    try std.testing.expect(resolved.owned != null);
+    // Must resolve to a non-empty path (the test runner's cwd).
+    try std.testing.expect(resolved.path.len > 0);
 }

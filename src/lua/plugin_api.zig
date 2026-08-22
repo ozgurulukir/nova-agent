@@ -959,12 +959,9 @@ pub fn deletePath(L: ?*c.lua_State) callconv(.c) c_int {
     defer std.heap.page_allocator.free(clean_path);
 
     // Prevent deleting the workspace root itself
-    var cwd_buf: ?[]u8 = null;
-    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
-    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |s| s else blk: {
-        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch null;
-        break :blk if (cwd_buf) |b| b else "";
-    };
+    var resolved_cwd = bridge.resolvePluginCwd(io);
+    defer if (resolved_cwd) |*r| r.deinit();
+    const cwd: []const u8 = if (resolved_cwd) |r| r.path else "";
     if (cwd.len > 0 and std.mem.eql(u8, clean_path, cwd)) {
         state.pushNil();
         state.pushString("cannot delete project root directory");
@@ -1249,16 +1246,15 @@ fn runShellWithBackend(L: ?*c.lua_State, backend: ShellBackend) c_int {
             return 2;
         };
     } else blk: {
-        if (bridge.plugin_cwd_slot) |slot_cwd| {
-            break :blk std.heap.page_allocator.dupe(u8, slot_cwd) catch {
-                state.pushNil();
-                state.pushString("out of memory");
-                return 2;
-            };
-        }
-        break :blk std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+        var resolved = bridge.resolvePluginCwd(io) orelse {
             state.pushNil();
             state.pushString("could not resolve cwd");
+            return 2;
+        };
+        defer resolved.deinit();
+        break :blk std.heap.page_allocator.dupe(u8, resolved.path) catch {
+            state.pushNil();
+            state.pushString("out of memory");
             return 2;
         };
     };
@@ -1395,14 +1391,14 @@ pub fn getCwd(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
-    state.pushString(cwd);
+    state.pushString(resolved.path);
     return 1;
 }
 
@@ -1414,15 +1410,15 @@ pub fn getProjectRoot(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
-    const root = findGitRoot(io, cwd) catch cwd;
-    defer if (root.ptr != cwd.ptr) std.heap.page_allocator.free(root);
+    const root = findGitRoot(io, resolved.path) catch resolved.path;
+    defer if (root.ptr != resolved.path.ptr) std.heap.page_allocator.free(root);
 
     state.pushString(root);
     return 1;
@@ -1436,14 +1432,14 @@ pub fn gitStatus(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
-    var result = bash_exec.run(std.heap.page_allocator, io, cwd, "git status --porcelain") catch |err| {
+    var result = bash_exec.run(std.heap.page_allocator, io, resolved.path, "git status --porcelain") catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1481,12 +1477,12 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     const io = getIo(L_ptr);
 
     const path = bridge.pullValue(&state, []const u8, 1);
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
     // Build `git diff [-- <escaped-path>]`. The path is single-quote-escaped so
     // a malicious `path = "x; rm -rf ~"` cannot break out of the argument —
@@ -1514,7 +1510,7 @@ pub fn gitDiff(L: ?*c.lua_State) callconv(.c) c_int {
     }
     defer std.heap.page_allocator.free(cmd);
 
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = cwd, .command = cmd }) catch |err| {
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = resolved.path, .command = cmd }) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1542,12 +1538,12 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
     var n: u32 = 10;
     if (bridge.pullValue(&state, i64, 1)) |v| n = @intCast(@max(v, 1));
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
     const cmd = std.fmt.allocPrint(std.heap.page_allocator, "git log --oneline -{d}", .{n}) catch {
         state.pushNil();
@@ -1558,7 +1554,7 @@ pub fn gitLog(L: ?*c.lua_State) callconv(.c) c_int {
 
     // `n` is a clamped integer, so it carries no injection risk; routing through
     // runWithOptions keeps the command on the classified path regardless.
-    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = cwd, .command = cmd }) catch |err| {
+    var result = bash_exec.runWithOptions(std.heap.page_allocator, io, .{ .cwd = resolved.path, .command = cmd }) catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1583,14 +1579,14 @@ pub fn gitBranch(L: ?*c.lua_State) callconv(.c) c_int {
     var state = State{ .handle = L_ptr };
     const io = getIo(L_ptr);
 
-    const cwd = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
+    var resolved = bridge.resolvePluginCwd(io) orelse {
         state.pushNil();
         state.pushString("could not resolve cwd");
         return 2;
     };
-    defer std.heap.page_allocator.free(cwd);
+    defer resolved.deinit();
 
-    var result = bash_exec.run(std.heap.page_allocator, io, cwd, "git branch --show-current") catch |err| {
+    var result = bash_exec.run(std.heap.page_allocator, io, resolved.path, "git branch --show-current") catch |err| {
         state.pushNil();
         state.pushString(@errorName(err));
         return 2;
@@ -1637,19 +1633,13 @@ pub fn gitAdd(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     }
 
-    var cwd_buf: ?[]u8 = null;
-    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
-
-    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
-        slot_cwd
-    else blk: {
-        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
-            state.pushNil();
-            state.pushString("could not resolve cwd");
-            return 2;
-        };
-        break :blk cwd_buf.?;
+    var resolved = bridge.resolvePluginCwd(io) orelse {
+        state.pushNil();
+        state.pushString("could not resolve cwd");
+        return 2;
     };
+    defer resolved.deinit();
+    const cwd = resolved.path;
 
     var cmd_buf: std.ArrayList(u8) = .empty;
     defer cmd_buf.deinit(std.heap.page_allocator);
@@ -1746,19 +1736,13 @@ pub fn gitCommit(L: ?*c.lua_State) callconv(.c) c_int {
         return 2;
     };
 
-    var cwd_buf: ?[]u8 = null;
-    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
-
-    const cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
-        slot_cwd
-    else blk: {
-        cwd_buf = std.process.currentPathAlloc(io, std.heap.page_allocator) catch {
-            state.pushNil();
-            state.pushString("could not resolve cwd");
-            return 2;
-        };
-        break :blk cwd_buf.?;
+    var resolved = bridge.resolvePluginCwd(io) orelse {
+        state.pushNil();
+        state.pushString("could not resolve cwd");
+        return 2;
     };
+    defer resolved.deinit();
+    const cwd = resolved.path;
 
     var cmd_buf: std.ArrayList(u8) = .empty;
     defer cmd_buf.deinit(std.heap.page_allocator);
@@ -2544,15 +2528,9 @@ pub fn callToolHandler(
 fn sanitizePath(io: std.Io, path: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
 
-    var cwd_buf: ?[]u8 = null;
-    defer if (cwd_buf) |b| std.heap.page_allocator.free(b);
-
-    const raw_cwd: []const u8 = if (bridge.plugin_cwd_slot) |slot_cwd|
-        slot_cwd
-    else blk: {
-        cwd_buf = try std.process.currentPathAlloc(io, std.heap.page_allocator);
-        break :blk cwd_buf.?;
-    };
+    var resolved_cwd = bridge.resolvePluginCwd(io) orelse return error.OutOfMemory;
+    defer resolved_cwd.deinit();
+    const raw_cwd = resolved_cwd.path;
 
     var abs_cwd_buf: ?[]u8 = null;
     defer if (abs_cwd_buf) |b| std.heap.page_allocator.free(b);
@@ -4177,6 +4155,97 @@ test "plugin_api: findGitRoot finds directory .git and file .git worktree" {
     const abs_file_repo = try std.fs.path.resolve(gpa, &.{ root, file_repo });
     defer gpa.free(abs_file_repo);
     try std.testing.expectEqualStrings(abs_file_repo, root2);
+}
+
+test "plugin_api: get_cwd and get_project_root respect bridge.plugin_cwd_slot" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const test_dir = ".zig-cache/test_slot_ctx";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    // Create a fixture: <repo>/.git + <repo>/nested
+    const repo = test_dir ++ "/repo";
+    try std.Io.Dir.cwd().createDirPath(io, repo ++ "/.git");
+    try std.Io.Dir.cwd().createDirPath(io, repo ++ "/nested");
+
+    const abs_nested = try std.fs.path.resolve(gpa, &.{ root, repo ++ "/nested" });
+    defer gpa.free(abs_nested);
+    const abs_repo = try std.fs.path.resolve(gpa, &.{ root, repo });
+    defer gpa.free(abs_repo);
+
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    bridge.plugin_cwd_slot = abs_nested;
+    defer bridge.plugin_cwd_slot = null;
+
+    try expectLuaOk(&L,
+        \\local cwd = nova.get_cwd()
+        \\assert(type(cwd) == "string", "get_cwd failed")
+        \\local root = nova.get_project_root()
+        \\assert(type(root) == "string", "get_project_root failed")
+        \\return "OK"
+    );
+}
+
+test "plugin_api: git read bridges run in bridge.plugin_cwd_slot cwd" {
+    if (os.is_windows) return error.SkipZigTest;
+    if (!gitAvailable()) return;
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const test_dir = ".zig-cache/test_git_slot_cwd";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    // Init a git repo with a dedicated branch name.
+    var init = bash_exec.run(gpa, io, test_dir, "git init -b nova-slot-test") catch return;
+    defer init.deinit(gpa);
+    if (init.code != 0) return error.SkipZigTest;
+
+    var commit = bash_exec.run(gpa, io, test_dir, "git commit --allow-empty -m initial") catch return;
+    defer commit.deinit(gpa);
+    if (commit.code != 0) return error.SkipZigTest;
+
+    const abs_test_dir = try std.fs.path.resolve(gpa, &.{test_dir});
+    defer gpa.free(abs_test_dir);
+
+    const sandbox = @import("sandbox.zig");
+    var L = try sandbox.createSandboxedStateWithIo(.{}, io);
+    defer {
+        sandbox.freeHookData(L.handle);
+        L.deinit();
+    }
+
+    bridge.plugin_cwd_slot = abs_test_dir;
+    defer bridge.plugin_cwd_slot = null;
+
+    try expectLuaOk(&L,
+        \\local branch = nova.git_branch()
+        \\assert(branch == "nova-slot-test", "expected nova-slot-test, got " .. tostring(branch))
+        \\local status = nova.git_status()
+        \\assert(type(status) == "string", "git_status failed")
+        \\local log = nova.git_log(1)
+        \\assert(type(log) == "string", "git_log failed")
+        \\local diff = nova.git_diff()
+        \\assert(type(diff) == "string", "git_diff failed")
+        \\return "OK"
+    );
 }
 
 test "plugin_api: globMatchSegment handles Windows backslashes and forward slashes interchangeably" {

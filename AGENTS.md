@@ -25,6 +25,13 @@ The codebase patterns (TUI architecture, MCP, Lua plugins, AI tool schema, type 
   - **Startup GC & Git Prune:** Startup hygiene in `src/root.zig:run()` runs `vcs.gcOrphanedWorktrees` (7-day TTL) and `vcs.worktreePrune` to purge abandoned checkouts and sync `.git/worktrees` metadata.
   - **Non-Blocking Async Provisioning:** Heavy `git worktree add` runs on a background thread (`WorktreeJob`). `spawnLane` uses multi-tick polling across `LaneBridge.service` without blocking the TUI render loop; `advanceAnimations` and `decideShouldTick` query `anyAsyncWorktreeActive` to advance loading frames smoothly.
   - **PowerShell Root Containment:** `pwsh.zig` enforces root containment with `[System.IO.Path]::GetFullPath`, `paths.pathsEqual` (`src/paths.zig`), `$root.TrimEnd('\', '/')`, and blocks directory escaping (`Push-Location`/`Pop-Location`).
+  - **Lua plugin lane & session awareness:** all plugin cwd resolution goes through
+  `bridge.resolvePluginCwd` (`src/lua/bridge.zig`) reading
+  `plugin_cwd_slot`, fed from `Agent.effectiveCwd()` (lane worktree OR
+  `/resume` session cwd — the process cwd is frozen at the launch dir), set
+  around plugin dispatch (`produceOutput`) and around the whole `runAll`
+  (event callbacks; refreshed by `rerootFromRequester`). Never call
+  `std.process.currentPathAlloc` directly in a bridge.
 
 ## Zig Development
 

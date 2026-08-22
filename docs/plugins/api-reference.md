@@ -176,8 +176,8 @@ Run all registered test suites. Returns `true` if all tests pass.
 | `nova.run_bash(cmd, opts?)` | `cmd`, `opts.cwd`, `opts.timeout`, `opts.stdin` | `{stdout, stderr, code}` | Bash command execution (git-bash on Windows) |
 | `nova.shell_quote(s, dialect?)` | `s`, `dialect` (`"posix"` default, or `"native"`) | quoted `string` or `nil, err` | Quote one argument for a shell command line (see below) |
 | `nova.get_env(name)` | `name` | `string` or `nil` | Environment variable |
-| `nova.get_cwd()` | — | `string` | Current working directory |
-| `nova.get_project_root()` | — | `string` | Git repo root or cwd |
+| `nova.get_cwd()` | — | `string` | Effective cwd of the current dispatch/event callback — a lane worktree root, or a resumed session's cwd; outside dispatch (init.lua load) the process cwd |
+| `nova.get_project_root()` | — | `string` | Git root of the effective cwd (worktree root in a worktree, matching `git rev-parse --show-toplevel`) |
 
 **`opts.stdin`** (string): bytes written to the child's stdin, then closed —
 e.g. `nova.run_bash("cat", { stdin = "hello" })` returns
@@ -227,6 +227,22 @@ local r = nova.run_bash("grep -c " .. q .. " src/*.zig")
 | `nova.git_branch()` | — | `string` | Current branch name |
 | `nova.git_add(files)` | `files` (string or array) | `{success, output}` | Stage specific files or patterns |
 | `nova.git_commit(msg, opts?)` | `msg`, `opts.files`, `opts.staged_only`, `opts.stage_all` | `{success, output}` | Create commit (selective or staged) |
+
+### Lane & session awareness
+
+All git, filesystem, and shell bridges (`nova.git_status`, `nova.git_diff`,
+`nova.git_log`, `nova.git_branch`, `nova.git_add`, `nova.git_commit`,
+`nova.get_cwd`, `nova.get_project_root`, `nova.run_shell`, `nova.run_bash`,
+`nova.delete_path`) operate on the **effective cwd** automatically — no
+`git -C <path>` workarounds needed. The effective cwd is:
+
+- A **lane worktree root** when the call is made from a lane worker agent.
+- The **resumed session's project root** after a cross-project `/resume`.
+- The **process cwd** (Nova's launch directory) when called outside tool
+  dispatch (e.g. during `init.lua` load).
+
+A lane/session descriptor table (id, branch, main-repo path) is a possible
+future addition.
 
 ### Plugin System & Modular Code
 
