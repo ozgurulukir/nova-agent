@@ -526,18 +526,37 @@ test "serialize prefix drops reasoning and tags roles" {
     try std.testing.expectEqualStrings("[user]: hello\n[tool result]: output\n", text);
 }
 
-test "keepRecentTokens scales with context window and respects config ceiling" {
-    // config_keep = 20_000 (old default): large window hits the ceiling.
-    try std.testing.expectEqual(@as(u32, 20_000), keepRecentTokens(200_000, 20_000));
-    // Small windows scale proportionally (35%).
+test "keepRecentTokens returns config_keep when context_window is zero" {
+    try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(0, 8_000));
+    try std.testing.expectEqual(@as(u32, 500), keepRecentTokens(0, 500));
+}
+
+test "keepRecentTokens enforces minimum floor of 1000 tokens for small context windows" {
+    // 35% of 2,000 = 700 tokens, which is below floor -> returns 1,000
+    try std.testing.expectEqual(@as(u32, 1_000), keepRecentTokens(2_000, 8_000));
+    // 35% of 1,000 = 350 tokens -> returns 1,000
+    try std.testing.expectEqual(@as(u32, 1_000), keepRecentTokens(1_000, 8_000));
+}
+
+test "keepRecentTokens scales proportionally at 35 percent of context window" {
+    // 35% of 32,000 = 11,200
     try std.testing.expectEqual(@as(u32, 11_200), keepRecentTokens(32_000, 20_000));
+    // 35% of 16,000 = 5,600
     try std.testing.expectEqual(@as(u32, 5_600), keepRecentTokens(16_000, 20_000));
+    // 35% of 8,000 = 2,800
     try std.testing.expectEqual(@as(u32, 2_800), keepRecentTokens(8_000, 20_000));
-    // config_keep = 8_000 (new default): ceiling is lower.
+}
+
+test "keepRecentTokens clamps to config_keep ceiling" {
+    // 35% of 200,000 = 70,000, capped at config_keep (8,000 or 20,000)
+    try std.testing.expectEqual(@as(u32, 20_000), keepRecentTokens(200_000, 20_000));
     try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(200_000, 8_000));
     try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(32_000, 8_000));
-    // Zero context window returns config_keep directly.
-    try std.testing.expectEqual(@as(u32, 8_000), keepRecentTokens(0, 8_000));
+}
+
+test "keepRecentTokens handles config_keep smaller than minimum floor" {
+    // When config_keep is 500 and target (35% of 2000) is 700: min(500, 700) = 500, max(1000, 500) = 1000
+    try std.testing.expectEqual(@as(u32, 1_000), keepRecentTokens(2_000, 500));
 }
 
 test "contextWindowTokens is pure — same ModelInfo yields same result" {
