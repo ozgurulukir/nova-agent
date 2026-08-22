@@ -56,7 +56,7 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 - **Background Jobs:** Launch long-running builds, test suites, or dev servers asynchronously (`run_in_background: true`). Inspect live logs (`tail`), check progress (`status`), or cancel processes (`cancel`) via the native `background` tool or the `Ctrl+O` dashboard.
 - **Context Compaction:** Dynamic, token-calibrated retention budgets that automatically summarize long sessions below model watermark limits.
 - **Extensible via Lua & MCP:** Add custom tools and hooks with sandboxed Lua plugins (workspace-confined execution layer with instruction limits) or standard Model Context Protocol (MCP) servers (stdio or Streamable HTTP).
-- **Offline & Local-First:** Complete conversation trees persisted in SQLite; full timeline branching (`/timeline`), session resume, and Markdown export.
+- **Offline & Local-First:** Complete conversation trees persisted in SQLite; full timeline branching (`/timeline`), single-keystroke turn rewind (`/undo`), session resume, and Markdown export.
 
 ---
 
@@ -73,7 +73,7 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 | Tool | Purpose | When Needed |
 |:---|:---|:---|
 | **[ripgrep (`rg`)](https://github.com/BurntSushi/ripgrep)** | High-speed regex code search | Used by `search-tools` plugin when `regex: true` (`scoop install ripgrep` / `brew install ripgrep` / `apt install ripgrep`). Substring search uses built-in walker with 0 dependencies. |
-| **[uv](https://github.com/astral-sh/uv) & Python** | Neural model export pipeline | Only when downloading and exporting the optional ModernBERT ONNX safety model. |
+| **[uv](https://github.com/astral-sh/uv) & Python** | Neural safety classifier service | Only when running or serving the optional ModernBERT safety classifier. |
 
 ---
 
@@ -113,12 +113,12 @@ nova --version
 
 Nova provides multi-tier safety guards for shell command execution (`bash` on Linux/macOS, `pwsh` on Windows):
 
-1. **Built-in Deterministic Safety Matcher (Default):** Zero-dependency AST and pattern analysis built directly into the native Zig binary. Intercepts destructive commands (`rm -rf /`, drive root wipes, fork bombs, critical system redirects) with zero latency.
+1. **Built-in Deterministic Safety Matcher (Default):** Zero-dependency lexical token and pattern analysis built directly into the native Zig binary. Intercepts destructive commands (`rm -rf /`, drive root wipes, fork bombs, critical system redirects) with zero latency.
 2. **AI-Powered Safety Classifier (Optional):** Plug in a standalone REST safety service powered by fine-tuned Transformer models (ModernBERT) or an LLM safety proxy:
 
 ```bash
 # Run standalone safety classifier via uv (port 8765):
-uv run tools/classifier/server.py --model modernbert --port 8765
+uv run -m tools.classifier.server --model modernbert --port 8765
 
 # Configure in Nova (via env or ~/.config/nova/config.json):
 export NOVA_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
@@ -132,7 +132,7 @@ export NOVA_BASH_CLASSIFIER_URL="http://127.0.0.1:8765/classify"
 
 | Shortcut | Action |
 |:---|:---|
-| `/` | Open command palette (`/connect`, `/model`, `/parallel`, `/diff`, `/timeline`, `/help`) |
+| `/` | Open command palette (`/connect`, `/model`, `/parallel`, `/diff`, `/timeline`, `/undo`, `/help`) |
 | `@file` | Attach file contents directly into the prompt |
 | `$skill` | Invoke a specialized agent skill |
 | `Ctrl+O` | Open Background Jobs & Log Viewer modal |
