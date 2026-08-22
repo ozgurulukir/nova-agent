@@ -65,6 +65,8 @@ pub const ModelInfo = struct {
 /// The merged, deduplicated provider list. Owns all string memory.
 pub const Registry = struct {
     providers: []Provider,
+    /// Fast O(1) lookup map for providers by id.
+    provider_map: std.StringHashMapUnmanaged(Provider) = .empty,
     /// Flat list of all models across all providers, from `api.json`.
     /// Empty when only builtins are available (no remote fetch).
     models: []ModelInfo = &.{},
@@ -72,6 +74,7 @@ pub const Registry = struct {
     strings: std.ArrayList(u8),
 
     pub fn deinit(self: *Registry, gpa: std.mem.Allocator) void {
+        self.provider_map.deinit(gpa);
         gpa.free(self.providers);
         if (self.models.len > 0) gpa.free(self.models);
         self.strings.deinit(gpa);
@@ -80,10 +83,7 @@ pub const Registry = struct {
 
     /// Find a provider by id. Returns null when not found.
     pub fn lookup(self: *const Registry, id: []const u8) ?Provider {
-        for (self.providers) |p| {
-            if (std.mem.eql(u8, p.id, id)) return p;
-        }
-        return null;
+        return self.provider_map.get(id);
     }
 
     /// Look up per-model capability data by model id. Strips any provider
@@ -524,8 +524,13 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
     const providers = try gpa.alloc(Provider, unresolved.items.len);
     errdefer gpa.free(providers);
 
+    var provider_map: std.StringHashMapUnmanaged(Provider) = .empty;
+    errdefer provider_map.deinit(gpa);
+    try provider_map.ensureTotalCapacity(gpa, @intCast(unresolved.items.len));
+
     for (unresolved.items, 0..) |item, i| {
         providers[i] = item.resolve(strings.items);
+        provider_map.putAssumeCapacity(providers[i].id, providers[i]);
     }
 
     const models: []ModelInfo = if (unresolved_models.items.len > 0) blk: {
@@ -539,6 +544,7 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
 
     return .{
         .providers = providers,
+        .provider_map = provider_map,
         .models = models,
         .strings = strings,
     };
@@ -740,8 +746,13 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
     const providers = try gpa.alloc(Provider, unresolved.items.len);
     errdefer gpa.free(providers);
 
+    var provider_map: std.StringHashMapUnmanaged(Provider) = .empty;
+    errdefer provider_map.deinit(gpa);
+    try provider_map.ensureTotalCapacity(gpa, @intCast(unresolved.items.len));
+
     for (unresolved.items, 0..) |item, i| {
         providers[i] = item.resolve(strings.items);
+        provider_map.putAssumeCapacity(providers[i].id, providers[i]);
     }
 
     const models: []ModelInfo = if (unresolved_models.items.len > 0) blk: {
@@ -755,6 +766,7 @@ fn parseModelsDevJson(gpa: std.mem.Allocator, bytes: []const u8) !Registry {
 
     return .{
         .providers = providers,
+        .provider_map = provider_map,
         .models = models,
         .strings = strings,
     };
