@@ -4,7 +4,7 @@ const common = @import("common.zig");
 const os = @import("../os.zig");
 const platform = @import("platform");
 const pws = @import("pwsh_exec.zig");
-const lanes_util = @import("../tui/lanes.zig");
+const paths = @import("../paths.zig");
 
 pub const tool: common.Tool = .{
     .name = "pwsh",
@@ -307,7 +307,7 @@ fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, res
     const normalized_root = std.fs.path.resolve(gpa, &.{project_root}) catch return false;
     defer gpa.free(normalized_root);
 
-    if (!lanes_util.pathsEqual(normalized[0..@min(normalized.len, normalized_root.len)], normalized_root)) return false;
+    if (!paths.pathsEqual(normalized[0..@min(normalized.len, normalized_root.len)], normalized_root)) return false;
     const root_has_sep = normalized_root.len > 0 and (normalized_root[normalized_root.len - 1] == '/' or normalized_root[normalized_root.len - 1] == '\\');
     if (normalized.len > normalized_root.len and !root_has_sep and normalized[normalized_root.len] != std.fs.path.sep and normalized[normalized_root.len] != '/') return false;
 
@@ -325,7 +325,7 @@ fn validateCwd(gpa: std.mem.Allocator, io: std.Io, project_root: []const u8, res
     const real_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, normalized_root, gpa) catch return true;
     defer gpa.free(real_root);
 
-    if (!lanes_util.pathsEqual(real_cwd[0..@min(real_cwd.len, real_root.len)], real_root)) return false;
+    if (!paths.pathsEqual(real_cwd[0..@min(real_cwd.len, real_root.len)], real_root)) return false;
     const real_root_has_sep = real_root.len > 0 and (real_root[real_root.len - 1] == '/' or real_root[real_root.len - 1] == '\\');
     if (real_cwd.len > real_root.len and !real_root_has_sep and real_cwd[real_root.len] != std.fs.path.sep and real_cwd[real_root.len] != '/') return false;
 

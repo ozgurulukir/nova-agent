@@ -14,7 +14,6 @@ const tui = @import("../../tui.zig");
 const tui_style = @import("../style.zig");
 const tui_status = @import("../status.zig");
 const telemetry = @import("../telemetry.zig");
-const agent_mod = @import("../../agent.zig");
 
 const App = tui.App;
 const Palette = tui_style.Palette;
@@ -440,6 +439,7 @@ test "layoutStatusBar skips empty velocity and meter" {
 
 test "status bar rightmost segment lands at max_width - 3" {
     const gpa = std.testing.allocator;
+    const agent_mod = @import("../../agent.zig");
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
@@ -484,6 +484,7 @@ test "status bar rightmost segment lands at max_width - 3" {
 
 test "StatusBarWidget renders velocity during thinking activity" {
     const gpa = std.testing.allocator;
+    const agent_mod = @import("../../agent.zig");
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();

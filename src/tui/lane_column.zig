@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const tui_style = @import("style.zig");
+const tui_status = @import("status.zig");
 const lanes_util = @import("lanes.zig");
 const tx_widget = @import("widgets/transcript.zig");
 const tui_message = @import("widgets/message.zig");
@@ -28,7 +29,18 @@ fn driverWorkspacePath(app: *const App) ?[]const u8 {
 }
 
 pub fn drawLaneColumn(app: *App, ctx: vxfw.DrawContext, lane: *Thread, width: u16, height: u16, active: bool, focused: bool) std.mem.Allocator.Error!vxfw.Surface {
-    var transcript_view: tx_widget.TranscriptWidget = .{ .app = app, .thread = lane };
+    // INV-WIDGET-1: leaf widgets take scalars, computed here per frame. The
+    // model flag mirrors the pre-scalarization behavior: always the ACTIVE
+    // lane's runtime, never the rendered lane's.
+    const has_model = tui_status.modelStatus(app.liveRuntime(), app.cached_config) != null;
+    var transcript_view: tx_widget.TranscriptWidget = .{
+        .thread = lane,
+        .gpa = app.gpa,
+        .has_model_configured = has_model,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+    };
     const title = if (lane.title) |t| t else "untitled";
     // Active-view marker (●/○) + turn-state marker (S14): a spinner frame
     // while the lane's turn is running, a stop glyph while interrupting, a

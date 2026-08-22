@@ -1,29 +1,38 @@
 //! The transcript pane widget: scrollable list of messages per lane.
 //!
 //! Pulled out of `tui.zig` (R5.1d of `_pm/Projects/tui-split`) — the widget
-//! reads `App.metrics` and the `Thread` lane state, drives the underlying
-//! vxfw list view, and handles viewport/cursor sync, so it earns its own
-//! file under `widgets/`.
+//! reads the `Thread` lane state, drives the underlying vxfw list view, and
+//! handles viewport/cursor sync. INV-WIDGET-1: it carries only scalars and
+//! the `Thread` handle (no `App` reference); the per-frame construction site
+//! computes them, and `blackhole_visible` writes back into `App.metrics` via
+//! pointer so the intro-animation tick can stop.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("../../tui.zig");
 const tui_message = @import("message.zig");
 const tui_metrics = @import("../metrics.zig");
-const tui_status = @import("../status.zig");
+const Thread = @import("../thread.zig");
+const transcript_mod = @import("../../transcript.zig");
 
-const App = tui.App;
-const Thread = tui.Thread;
 const MessageWidget = tui_message.MessageWidget;
 const ConversationLayout = tui_message.ConversationLayout;
 const messageRowsCached = tui_metrics.messageRowsCached;
 
 pub const TranscriptWidget = struct {
-    app: *App,
     /// The lane this pane renders — the active lane today; any lane once tiled.
     thread: *Thread,
+    /// Per-frame scalars computed by the construction site (INV-WIDGET-1).
+    gpa: std.mem.Allocator,
+    /// `tui_status.modelStatus(live_runtime, cached_config) != null` —
+    /// precomputed so this leaf never touches the App or config modules.
+    has_model_configured: bool,
+    loading_frame: u8,
+    blackhole_frame: u16,
+    /// Write-back into `App.metrics.blackhole_visible` — see
+    /// `updateBlackholeVisibility`.
+    blackhole_visible: *bool,
 
     pub fn widget(self: *TranscriptWidget) vxfw.Widget {
         return .{
@@ -36,16 +45,14 @@ pub const TranscriptWidget = struct {
         const self: *TranscriptWidget = @ptrCast(@alignCast(ptr));
         self.syncViewport(ctx);
 
-        const has_model = tui_status.modelStatus(self.app.liveRuntime(), self.app.cached_config) != null;
-
         var builder: MessageListBuilder = .{
             .arena = ctx.arena,
             .messages = self.thread.transcript.messages.items,
             .selected = self.thread.transcript.selected,
-            .loading_frame = self.app.metrics.loading_frame,
-            .blackhole_frame = self.app.metrics.blackhole_frame,
-            .gpa = self.app.gpa,
-            .has_model_configured = has_model,
+            .loading_frame = self.loading_frame,
+            .blackhole_frame = self.blackhole_frame,
+            .gpa = self.gpa,
+            .has_model_configured = self.has_model_configured,
         };
         self.thread.transcript_list.children = .{ .builder = .{ .userdata = &builder, .buildFn = MessageListBuilder.build } };
         self.thread.transcript_list.item_count = @intCast(self.thread.transcript.messages.items.len);
@@ -65,7 +72,7 @@ pub const TranscriptWidget = struct {
     // `scroll.top` advances and the animation tick is allowed to stop.
     fn updateBlackholeVisibility(self: *TranscriptWidget) void {
         const messages = self.thread.transcript.messages.items;
-        self.app.metrics.blackhole_visible = messages.len > 0 and
+        self.blackhole_visible.* = messages.len > 0 and
             messages[0] == .logo and
             self.thread.transcript_list.scroll.top == 0;
     }
@@ -113,7 +120,7 @@ pub const TranscriptWidget = struct {
 
 pub const MessageListBuilder = struct {
     arena: std.mem.Allocator,
-    messages: []tui.transcript_mod.Message,
+    messages: []transcript_mod.Message,
     selected: ?u32 = null,
     loading_frame: u8 = 0,
     blackhole_frame: u16 = 0,
@@ -139,7 +146,7 @@ pub const MessageListBuilder = struct {
 
 test "MessageListBuilder.build returns null for out-of-bounds index" {
     const gpa = std.testing.allocator;
-    var transcript: tui.transcript_mod.Transcript = .{};
+    var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
 
     _ = try transcript.append(gpa, .user, "user", "hello");
@@ -162,7 +169,7 @@ test "MessageListBuilder.build returns null for out-of-bounds index" {
 
 test "MessageListBuilder.build constructs widget with correct message and selection state" {
     const gpa = std.testing.allocator;
-    var transcript: tui.transcript_mod.Transcript = .{};
+    var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
 
     _ = try transcript.append(gpa, .user, "user", "first");
@@ -215,7 +222,7 @@ test "MessageListBuilder.build handles empty transcript cleanly" {
 
 test "MessageListBuilder.build handles out-of-range selection index" {
     const gpa = std.testing.allocator;
-    var transcript: tui.transcript_mod.Transcript = .{};
+    var transcript: transcript_mod.Transcript = .{};
     defer transcript.deinit(gpa);
 
     _ = try transcript.append(gpa, .user, "user", "msg1");

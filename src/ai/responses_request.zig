@@ -7,10 +7,11 @@
 const std = @import("std");
 
 const ai = @import("../ai.zig");
-const openai_compatible = @import("openai_compatible.zig");
+const model_compat = @import("model_compat.zig");
 const responses_core = @import("responses_core.zig");
+const stream_parser = @import("stream_parser.zig");
 const tool_schema = @import("tool_schema.zig");
-const tools_common = @import("../tools.zig");
+const tools_mod = @import("../tools.zig");
 
 pub fn writeRequestPayload(
     out: *std.Io.Writer,
@@ -54,14 +55,14 @@ pub fn writeRequestPayload(
         var wrote = false;
         if (value.effort) |effort| {
             // Clip Ollama-incompatible effort values for the minimal dialect,
-            // mirroring the chat-completions path (openai_compatible.wireEffortLabel).
+            // mirroring the chat-completions path (model_compat.wireEffortLabel).
             // The Responses-API site is not dialect-gated for cache fields (C1/C2
             // in AGENTS.md), but effort clipping is cheap and keeps the two wire
             // clients consistent so a provider switch never changes the effort
             // semantics unexpectedly.
-            const wire_label = openai_compatible.clipEffortForModel(
+            const wire_label = model_compat.clipEffortForModel(
                 config.model,
-                openai_compatible.wireEffortLabel(config.wire_dialect, effort),
+                model_compat.wireEffortLabel(config.wire_dialect, effort),
             );
             if (wire_label) |label| {
                 try out.writeAll("\"effort\":");
@@ -141,7 +142,7 @@ fn writeFunctionCall(out: *std.Io.Writer, call: ai.ToolCall) !void {
     try out.writeAll(",\"name\":");
     try std.json.Stringify.value(call.name, .{}, out);
     try out.writeAll(",\"arguments\":");
-    const args = openai_compatible.sanitizeToolArguments(call.arguments);
+    const args = stream_parser.sanitizeToolArguments(call.arguments);
     try std.json.Stringify.value(args, .{}, out);
     try out.writeByte('}');
 }
@@ -415,7 +416,7 @@ test "openresponses tools json is an array" {
 
 test "openresponses strict schema includes nullable union types and top-level additionalProperties:false" {
     const gpa = std.testing.allocator;
-    const tools = [_]tools_common.Tool{
+    const tools = [_]tools_mod.Tool{
         .{
             .name = "demo",
             .description = "Demo tool",
@@ -446,7 +447,7 @@ test "openresponses omits strict mode and filters required when strict is false 
     // client is built with strict=false. `required` then lists only the
     // genuinely-required properties.
     const gpa = std.testing.allocator;
-    const tools = [_]tools_common.Tool{
+    const tools = [_]tools_mod.Tool{
         .{
             .name = "demo",
             .description = "Demo tool",

@@ -626,7 +626,14 @@ test "up enters selected long message at bottom" {
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    var transcript_widget: tx_widget.TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: tx_widget.TranscriptWidget = .{
+        .thread = app.thread,
+        .gpa = app.gpa,
+        .has_model_configured = false,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+    };
     const ctx: vxfw.DrawContext = .{
         .arena = arena.allocator(),
         .min = .{},
@@ -2834,7 +2841,14 @@ fn benchTranscriptDraw(gpa: std.mem.Allocator, n: usize) !BenchResult {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
-    var transcript_widget: tx_widget.TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: tx_widget.TranscriptWidget = .{
+        .thread = app.thread,
+        .gpa = app.gpa,
+        .has_model_configured = false,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+    };
 
     // Warm frame: renders + caches markdown for the visible messages.
     try drawTranscriptFrame(&transcript_widget, &arena, &counting, 100, 40);
@@ -2994,7 +3008,14 @@ test "transcript draw width-change re-count stays below a fixed gpa ceiling" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var counting: CountingAllocator = .{ .child = arena.allocator() };
-    var transcript_widget: tx_widget.TranscriptWidget = .{ .app = &app, .thread = app.thread };
+    var transcript_widget: tx_widget.TranscriptWidget = .{
+        .thread = app.thread,
+        .gpa = app.gpa,
+        .has_model_configured = false,
+        .loading_frame = app.metrics.loading_frame,
+        .blackhole_frame = app.metrics.blackhole_frame,
+        .blackhole_visible = &app.metrics.blackhole_visible,
+    };
 
     // Warm at width 100 so the visible messages hold populated incremental
     // caches (stable segments owned by App.gpa).
