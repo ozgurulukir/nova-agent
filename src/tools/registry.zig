@@ -29,6 +29,10 @@ pub const ToolRegistry = struct {
     /// is reused across calls so the `all()` pointer is stable between calls
     /// that don't add or remove tools.
     scratch: std.ArrayList(Tool) = .empty,
+    /// Hash map index for O(1) tool lookups by name. Builtins take precedence
+    /// over plugin tools on name collisions.
+    lookup_index: std.StringHashMapUnmanaged(Tool) = .empty,
+    index_valid: bool = false,
 
     pub fn init(builtin_slice: []const Tool) ToolRegistry {
         return .{ .builtin = builtin_slice };
@@ -46,6 +50,21 @@ pub const ToolRegistry = struct {
         }
         self.plugin.deinit(gpa);
         self.scratch.deinit(gpa);
+        self.lookup_index.deinit(gpa);
+    }
+
+    fn ensureIndex(self: *ToolRegistry, gpa: std.mem.Allocator) !void {
+        if (self.index_valid) return;
+        self.lookup_index.clearRetainingCapacity();
+        for (self.builtin) |tool| {
+            try self.lookup_index.put(gpa, tool.name, tool);
+        }
+        for (self.plugin.items) |tool| {
+            if (!self.lookup_index.contains(tool.name)) {
+                try self.lookup_index.put(gpa, tool.name, tool);
+            }
+        }
+        self.index_valid = true;
     }
 
     /// Borrowed flat slice of every registered tool (builtin + plugin). The
@@ -62,14 +81,8 @@ pub const ToolRegistry = struct {
     /// Look up a tool by name. Searches builtin first (so builtins always
     /// win name collisions), then plugin tools. Returns null when absent.
     pub fn lookup(self: *ToolRegistry, gpa: std.mem.Allocator, name: []const u8) !?Tool {
-        for (self.builtin) |tool| {
-            if (std.mem.eql(u8, tool.name, name)) return tool;
-        }
-        for (self.plugin.items) |tool| {
-            if (std.mem.eql(u8, tool.name, name)) return tool;
-        }
-        _ = gpa;
-        return null;
+        try self.ensureIndex(gpa);
+        return self.lookup_index.get(name);
     }
 
     /// Append a plugin tool. The registry takes ownership of `tool.userdata`
@@ -77,6 +90,7 @@ pub const ToolRegistry = struct {
     /// `removePluginToolsWithPrefix` strips the tool.
     pub fn addPluginTool(self: *ToolRegistry, gpa: std.mem.Allocator, tool: Tool) !void {
         try self.plugin.append(gpa, tool);
+        self.index_valid = false;
     }
 
     /// Remove every plugin tool whose name starts with the
@@ -89,6 +103,7 @@ pub const ToolRegistry = struct {
         prefix: []const u8,
     ) void {
         var i: usize = 0;
+        var removed = false;
         while (i < self.plugin.items.len) {
             const t = self.plugin.items[i];
             if (std.mem.startsWith(u8, t.name, prefix)) {
@@ -96,9 +111,13 @@ pub const ToolRegistry = struct {
                 gpa.free(t.description);
                 if (t.userdata_free) |free_fn| free_fn(gpa, t.userdata);
                 _ = self.plugin.orderedRemove(i);
+                removed = true;
             } else {
                 i += 1;
             }
+        }
+        if (removed) {
+            self.index_valid = false;
         }
     }
 };
@@ -368,4 +387,60 @@ test "registry builtin carries exactly one shell tool" {
     try std.testing.expectEqualStrings("background", tools[2].name);
     try std.testing.expectEqualStrings("skill", tools[3].name);
     try std.testing.expect(shell_tool.name.len == 4 or std.mem.eql(u8, shell_tool.name, "pwsh"));
+}
+
+test "ToolRegistry: benchmark lookup performance" {
+    const platform = @import("platform");
+    const gpa = std.testing.allocator;
+    var reg: ToolRegistry = .init(@import("../tools.zig").builtinRegistry());
+    defer reg.deinit(gpa);
+
+    // Add 50 plugin tools to simulate a populated registry
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        const name = try std.fmt.allocPrint(gpa, "lua__plugin_{d}__tool", .{i});
+        errdefer gpa.free(name);
+        const desc = try gpa.dupe(u8, "plugin tool desc");
+        errdefer gpa.free(desc);
+
+        try reg.addPluginTool(gpa, .{
+            .name = name,
+            .description = desc,
+            .schema = .{ .properties = &.{} },
+            .run = dummy_run,
+            .display = dummy_display,
+            .userdata = undefined,
+            .userdata_free = dummy_free,
+        });
+    }
+
+    const start_time = platform.monotonicNowNs();
+    const iterations: usize = 100_000;
+    var iterations_done: usize = 0;
+
+    var iter: usize = 0;
+    while (iter < iterations) : (iter += 1) {
+        // Look up builtin tool
+        if (try reg.lookup(gpa, shell_tool.name)) |t| {
+            _ = t;
+            iterations_done += 1;
+        }
+        // Look up last plugin tool (worst case for linear scan)
+        if (try reg.lookup(gpa, "lua__plugin_49__tool")) |t| {
+            _ = t;
+            iterations_done += 1;
+        }
+        // Look up non-existent tool
+        if (try reg.lookup(gpa, "non_existent_tool_name")) |t| {
+            _ = t;
+            iterations_done += 1;
+        }
+    }
+
+    const elapsed_ns = platform.monotonicNowNs() - start_time;
+    std.debug.print("\n[BENCHMARK] ToolRegistry lookup: {d} ops in {d} ns ({d} ns/op)\n", .{
+        iterations_done,
+        elapsed_ns,
+        @divTrunc(elapsed_ns, @as(i128, @intCast(iterations_done))),
+    });
 }
