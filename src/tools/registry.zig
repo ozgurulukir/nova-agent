@@ -9,6 +9,8 @@ const pwsh_tool = @import("pwsh.zig");
 const skill_tool = @import("skill.zig");
 const Tool = common.Tool;
 
+const log = std.log.scoped(.registry);
+
 /// Runtime-mutable tool registry. The App owns one; builtin tools live in
 /// its immutable `builtin` slice, plugin tools are appended at runtime
 /// through `addPluginTool`. This is the single source of truth for tools
@@ -67,8 +69,10 @@ pub const ToolRegistry = struct {
         return self.scratch.items;
     }
 
-    /// Look up a tool by name (O(1)). Read-only operation; safe for concurrent
-    /// access without locks.
+    /// Look up a tool by name (O(1)). Read-only operation. Safe without locks
+    /// during turn execution when no mutations occur concurrently (guaranteed
+    /// while the `anyLaneTurnActive` mutation gate is active; plugin/MCP tools
+    /// are registered at initRuntime before worker turns start).
     pub fn lookup(self: *const ToolRegistry, name: []const u8) ?Tool {
         return self.lookup_index.get(name);
     }
@@ -77,6 +81,7 @@ pub const ToolRegistry = struct {
     /// always win name collisions.
     pub fn addPluginTool(self: *ToolRegistry, gpa: std.mem.Allocator, tool: Tool) !void {
         try self.plugin.append(gpa, tool);
+        errdefer _ = self.plugin.pop();
         if (!self.lookup_index.contains(tool.name)) {
             try self.lookup_index.put(gpa, tool.name, tool);
         }
@@ -109,11 +114,15 @@ pub const ToolRegistry = struct {
         if (removed) {
             self.lookup_index.clearRetainingCapacity();
             for (self.builtin) |tool| {
-                self.lookup_index.put(gpa, tool.name, tool) catch {};
+                self.lookup_index.put(gpa, tool.name, tool) catch |err| {
+                    log.warn("failed to index builtin tool '{s}': {s}", .{ tool.name, @errorName(err) });
+                };
             }
             for (self.plugin.items) |tool| {
                 if (!self.lookup_index.contains(tool.name)) {
-                    self.lookup_index.put(gpa, tool.name, tool) catch {};
+                    self.lookup_index.put(gpa, tool.name, tool) catch |err| {
+                        log.warn("failed to index plugin tool '{s}': {s}", .{ tool.name, @errorName(err) });
+                    };
                 }
             }
         }
@@ -436,9 +445,15 @@ test "ToolRegistry: benchmark lookup performance" {
     }
 
     const elapsed_ns = platform.monotonicNowNs() - start_time;
-    std.debug.print("\n[BENCHMARK] ToolRegistry lookup: {d} ops in {d} ns ({d} ns/op)\n", .{
-        iterations_done,
-        elapsed_ns,
-        @divTrunc(elapsed_ns, @as(i128, @intCast(iterations_done))),
-    });
+    var env_map = platform.getEnvMap(gpa) catch null;
+    if (env_map) |*m| {
+        defer m.deinit();
+        if (m.get("NOVA_BENCHMARK") != null) {
+            std.debug.print("\n[BENCHMARK] ToolRegistry lookup: {d} ops in {d} ns ({d} ns/op)\n", .{
+                iterations_done,
+                elapsed_ns,
+                @divTrunc(elapsed_ns, @as(i128, @intCast(iterations_done))),
+            });
+        }
+    }
 }
