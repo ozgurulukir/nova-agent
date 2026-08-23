@@ -318,4 +318,5 @@ test {
     // Platform-tolerant path comparison root leaf (extracted from
     // tui/lanes.zig); referenced explicitly so its inline tests run.
     _ = @import("paths.zig");
+    _ = @import("agent/compactor.zig");
 }

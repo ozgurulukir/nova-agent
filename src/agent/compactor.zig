@@ -79,3 +79,44 @@ fn produceStoredSummary(job: Job) ![]u8 {
     if (summary.len == 0) return error.EmptySummary;
     return compaction.buildStoredSummary(job.gpa, summary);
 }
+
+test "returnsTrue_whenStateMatchesExpected" {
+    // Arrange
+    const compactor: Compactor = .{};
+
+    // Act
+    const is_idle = compactor.stateIs(.idle);
+
+    // Assert
+    try std.testing.expect(is_idle);
+}
+
+test "returnsFalse_whenStateDiffersFromExpected" {
+    // Arrange
+    const compactor: Compactor = .{};
+
+    // Act & Assert
+    try std.testing.expect(!compactor.stateIs(.running));
+    try std.testing.expect(!compactor.stateIs(.ready));
+    try std.testing.expect(!compactor.stateIs(.failed));
+}
+
+test "returnsTrue_afterAtomicStateTransitions" {
+    // Arrange
+    var compactor: Compactor = .{};
+
+    // Act & Assert: transition to running
+    compactor.state.store(.running, .release);
+    try std.testing.expect(compactor.stateIs(.running));
+    try std.testing.expect(!compactor.stateIs(.idle));
+
+    // Act & Assert: transition to ready
+    compactor.state.store(.ready, .release);
+    try std.testing.expect(compactor.stateIs(.ready));
+    try std.testing.expect(!compactor.stateIs(.running));
+
+    // Act & Assert: transition to failed
+    compactor.state.store(.failed, .release);
+    try std.testing.expect(compactor.stateIs(.failed));
+    try std.testing.expect(!compactor.stateIs(.ready));
+}
