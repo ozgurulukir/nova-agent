@@ -495,4 +495,3 @@ test "mergeResult rolls back atomically on failure" {
     try std.testing.expectEqual(@as(usize, 2), agg.sources.items.len);
     try std.testing.expectEqual(agg.models.items.len, agg.sources.items.len);
 }
-
