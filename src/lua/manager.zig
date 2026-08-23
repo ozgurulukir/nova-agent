@@ -16,6 +16,34 @@ const events = @import("events.zig");
 const Manifest = @import("manifest.zig").Manifest;
 const plugin_config = @import("../config/plugin.zig");
 
+/// True when `plugin_dir` is the same as `project_dir` or a subdirectory
+/// of it (separator-boundary checked — never a bare `startsWith`).
+/// Treats `/` and `\` as equivalent separators for cross-platform safety.
+fn pluginDirUnderProjectDir(plugin_dir: []const u8, project_dir: []const u8) bool {
+    if (project_dir.len == 0) return false;
+    if (plugin_dir.len < project_dir.len) return false;
+
+    // Compare prefix, treating / and \ as equivalent separators.
+    var i: usize = 0;
+    while (i < project_dir.len) {
+        const pc = project_dir[i];
+        const dc = plugin_dir[i];
+        const is_sep_p = (pc == '/' or pc == '\\');
+        const is_sep_d = (dc == '/' or dc == '\\');
+        if (is_sep_p and is_sep_d) {
+            i += 1;
+            continue;
+        }
+        if (pc != dc) return false;
+        i += 1;
+    }
+
+    // Prefix matches. Check separator boundary or exact match.
+    if (plugin_dir.len == i) return true;
+    const next = plugin_dir[i];
+    return next == '/' or next == '\\';
+}
+
 /// A loaded plugin instance with its manifest and sandboxed Lua state.
 pub const PluginInstance = struct {
     manifest: Manifest,
@@ -324,6 +352,109 @@ pub const PluginManager = struct {
             if (!plugin.active) continue;
             drainEventCallbacks(plugin.state.handle, plugin.manifest.name, event_name, event);
         }
+    }
+
+    /// Repoint project-scoped discovery from the old project to `new_cwd`:
+    /// unload plugins loaded from the old project dir, free + replace
+    /// `project_dir`, load from the new one. Global plugins are untouched
+    /// (states, event subscriptions, require caches survive). Caller owns the
+    /// all-lanes-idle guarantee — unloading frees Lua states mid-dispatch
+    /// would be fatal.
+    pub fn repointProjectDir(self: *Self, new_cwd: []const u8) !void {
+        // Step 1: snapshot old project_dir, compute new one.
+        const old_project_dir = if (self.project_dir.len > 0)
+            try self.allocator.dupe(u8, self.project_dir)
+        else
+            "";
+        // old_project_dir is freed at the end; it must outlive the unload
+        // loop below. When old_project_dir is empty ("" — a compile-time
+        // literal), the free is skipped.
+
+        const new_project_dir = if (new_cwd.len > 0)
+            std.fs.path.join(self.allocator, &.{ new_cwd, ".nova", "plugins" }) catch ""
+        else
+            "";
+        // new_project_dir is stored into self.project_dir at step 4.
+        // If new_cwd was empty we set self.project_dir = "" below.
+
+        // Step 2: unload every plugin whose dir_path is under the old
+        // project dir. Build a new map with only surviving entries to
+        // avoid HashMap iterator invalidation during removal.
+        if (old_project_dir.len > 0) {
+            var surviving: std.StringHashMapUnmanaged(*PluginInstance) = .empty;
+            // No defer — ownership transfers to self.plugins below.
+
+            var it = self.plugins.iterator();
+            while (it.next()) |entry| {
+                if (pluginDirUnderProjectDir(entry.value_ptr.*.dir_path, old_project_dir)) {
+                    // Unload this plugin
+                    entry.value_ptr.*.deinit(self.allocator);
+                    self.allocator.destroy(entry.value_ptr.*);
+                } else {
+                    try surviving.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
+                }
+            }
+
+            self.plugins.deinit(self.allocator);
+            self.plugins = surviving;
+        }
+
+        // Step 3: re-scan global_dir for globals that were shadowed by
+        // the unloaded project plugins. Only load names absent from the
+        // current plugin set — new-project same-name copies still win via
+        // the duplicate path in step 5.
+        if (self.global_dir.len > 0) {
+            var dir = std.Io.Dir.openDir(.cwd(), self.io, self.global_dir, .{ .iterate = true }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => null,
+                else => return err,
+            };
+            if (dir) |*d| {
+                defer d.close(self.io);
+                var iter = d.iterate();
+                while (try iter.next(self.io)) |entry| {
+                    if (entry.name.len == 0 or entry.name[0] == '.') continue;
+                    if (entry.kind != .directory and entry.kind != .sym_link) continue;
+                    if (self.plugins.contains(entry.name)) continue;
+
+                    const plugin_dir = try std.fs.path.join(self.allocator, &.{ self.global_dir, entry.name });
+                    defer self.allocator.free(plugin_dir);
+
+                    const manifest_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, "plugin.lua" });
+                    defer self.allocator.free(manifest_path);
+
+                    if (!self.fileExists(manifest_path)) continue;
+
+                    _ = self.loadOne(plugin_dir, false) catch |err| switch (err) {
+                        error.PluginDisabled => continue,
+                        else => {
+                            log.warn("plugin.repoint.global_restore_failed name={s} reason={s}", .{ entry.name, @errorName(err) });
+                            continue;
+                        },
+                    };
+                }
+            }
+        }
+
+        // Step 4: free old project_dir, store new.
+        if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
+        if (new_project_dir.len > 0) {
+            self.project_dir = new_project_dir;
+        } else {
+            self.project_dir = "";
+        }
+
+        // Step 5: load from new project dir. Missing dir → warn + no-op
+        // (existing loadFromDir behavior). Non-FileNotFound failures are
+        // soft-degraded — aborting the switch would leave a half-swapped
+        // manager.
+        if (self.project_dir.len > 0) {
+            self.loadFromDir(self.project_dir, false) catch |err| {
+                log.warn("plugin.repoint.load_new_dir_failed dir={s} reason={s}", .{ self.project_dir, @errorName(err) });
+            };
+        }
+
+        // Free the snapshot from step 1.
+        if (old_project_dir.len > 0) self.allocator.free(old_project_dir);
     }
 
     // ── private helpers ─────────────────────────────────────────────
@@ -853,4 +984,220 @@ test "plugin manager: emitEvent delivers to plugin callbacks" {
     } else {
         return error.CallbackDidNotFire;
     }
+}
+
+// ── repointProjectDir tests ──────────────────────────────────────
+
+test "repointProjectDir swaps project plugins, keeps globals" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root_tmp = "/tmp/nova_test_repoint_swap";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
+
+    // Create: <home>/.config/nova/plugins/
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    defer gpa.free(home_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
+
+    // Create: <old_project>/.nova/plugins/
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    defer gpa.free(old_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
+
+    // Create: <new_project>/.nova/plugins/
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    defer gpa.free(new_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
+
+    try writeFixturePlugin(home_plugins, "global_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
+    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
+    try writeFixturePlugin(new_proj_plugins, "new_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'new' end})");
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
+    defer gpa.free(home_dir);
+    const old_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "old_project" });
+    defer gpa.free(old_cwd);
+
+    var manager = PluginManager.init(gpa, testing.io, home_dir, old_cwd);
+    defer manager.deinit();
+
+    try manager.syncPluginConfig(&.{});
+    _ = try manager.loadAll();
+
+    // Verify initial state: all three loaded
+    try testing.expect(manager.get("global_plugin") != null);
+    try testing.expect(manager.get("old_proj_plugin") != null);
+    try testing.expect(manager.get("new_proj_plugin") == null);
+
+    // Repoint to new_project
+    const new_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "new_project" });
+    defer gpa.free(new_cwd);
+    try manager.repointProjectDir(new_cwd);
+
+    // Verify: old project plugin gone, new one loaded, global stays
+    try testing.expect(manager.get("global_plugin") != null);
+    try testing.expect(manager.get("old_proj_plugin") == null);
+    try testing.expect(manager.get("new_proj_plugin") != null);
+
+    // Verify project_dir updated to new_project's .nova/plugins
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ new_cwd, ".nova", "plugins" });
+    defer gpa.free(expected_new_dir);
+    try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
+}
+
+test "repointProjectDir to a project without plugins is a no-op" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root_tmp = "/tmp/nova_test_repoint_noop";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
+
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    defer gpa.free(home_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
+
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    defer gpa.free(old_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
+
+    try writeFixturePlugin(home_plugins, "global_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global' end})");
+    try writeFixturePlugin(old_proj_plugins, "old_proj_plugin", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old' end})");
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
+    defer gpa.free(home_dir);
+    const old_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "old_project" });
+    defer gpa.free(old_cwd);
+
+    var manager = PluginManager.init(gpa, testing.io, home_dir, old_cwd);
+    defer manager.deinit();
+
+    try manager.syncPluginConfig(&.{});
+    _ = try manager.loadAll();
+
+    try testing.expect(manager.get("global_plugin") != null);
+    try testing.expect(manager.get("old_proj_plugin") != null);
+
+    // Repoint to a directory with no .nova/plugins
+    const no_project_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "no_project" });
+    defer gpa.free(no_project_cwd);
+    // Ensure the target directory exists (but no .nova/plugins subdir)
+    std.Io.Dir.cwd().createDirPath(testing.io, no_project_cwd) catch {};
+    try manager.repointProjectDir(no_project_cwd);
+
+    // Verify: old project plugin gone, global stays, no new plugins loaded
+    try testing.expect(manager.get("global_plugin") != null);
+    try testing.expect(manager.get("old_proj_plugin") == null);
+    try testing.expectEqual(@as(usize, 1), manager.count());
+
+    // Verify project_dir updated
+    const expected_new_dir = try std.fs.path.join(gpa, &.{ no_project_cwd, ".nova", "plugins" });
+    defer gpa.free(expected_new_dir);
+    try testing.expectEqualStrings(expected_new_dir, manager.project_dir);
+}
+
+test "repointProjectDir unloads by dir, not by name" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root_tmp = "/tmp/nova_test_repoint_samename";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
+
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    defer gpa.free(home_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
+
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    defer gpa.free(old_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
+
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    defer gpa.free(new_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
+
+    // Same plugin name in both old and new project dirs
+    try writeFixturePlugin(old_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
+    try writeFixturePlugin(new_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'new_foo' end})");
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
+    defer gpa.free(home_dir);
+    const old_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "old_project" });
+    defer gpa.free(old_cwd);
+
+    var manager = PluginManager.init(gpa, testing.io, home_dir, old_cwd);
+    defer manager.deinit();
+
+    try manager.syncPluginConfig(&.{});
+    _ = try manager.loadAll();
+
+    // Verify "foo" loaded from old project dir
+    const foo_before = manager.get("foo") orelse return error.PluginNotFound;
+    const old_foo_dir = try std.fs.path.join(gpa, &.{ old_proj_plugins, "foo" });
+    defer gpa.free(old_foo_dir);
+    try testing.expectEqualStrings(old_foo_dir, foo_before.dir_path);
+
+    // Repoint to new_project
+    const new_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "new_project" });
+    defer gpa.free(new_cwd);
+    try manager.repointProjectDir(new_cwd);
+
+    // Verify "foo" still present, now loaded from new project dir
+    const foo_after = manager.get("foo") orelse return error.PluginNotFound;
+
+    const new_foo_dir = try std.fs.path.join(gpa, &.{ new_proj_plugins, "foo" });
+    defer gpa.free(new_foo_dir);
+    try testing.expectEqualStrings(new_foo_dir, foo_after.dir_path);
+}
+
+test "repointProjectDir restores globals shadowed by old project plugins" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const root_tmp = "/tmp/nova_test_repoint_shadow";
+    defer std.Io.Dir.cwd().deleteTree(testing.io, root_tmp) catch {};
+
+    const home_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "home", ".config", "nova", "plugins" });
+    defer gpa.free(home_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, home_plugins) catch {};
+
+    const old_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "old_project", ".nova", "plugins" });
+    defer gpa.free(old_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, old_proj_plugins) catch {};
+
+    const new_proj_plugins = try std.fs.path.join(gpa, &.{ root_tmp, "new_project", ".nova", "plugins" });
+    defer gpa.free(new_proj_plugins);
+    std.Io.Dir.cwd().createDirPath(testing.io, new_proj_plugins) catch {};
+
+    // Global dir has "foo", old project dir also has "foo" (shadows global),
+    // new project dir has no "foo".
+    try writeFixturePlugin(home_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'global_foo' end})");
+    try writeFixturePlugin(old_proj_plugins, "foo", "nova.register_tool({name='t',description='t',parameters={},handler=function() return 'old_foo' end})");
+
+    const home_dir = try std.fs.path.join(gpa, &.{ root_tmp, "home" });
+    defer gpa.free(home_dir);
+    const old_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "old_project" });
+    defer gpa.free(old_cwd);
+
+    var manager = PluginManager.init(gpa, testing.io, home_dir, old_cwd);
+    defer manager.deinit();
+
+    try manager.syncPluginConfig(&.{});
+    _ = try manager.loadAll();
+
+    // At this point "foo" is loaded from the old project dir (shadows global)
+    const foo_before = manager.get("foo") orelse return error.PluginNotFound;
+    const old_foo_dir = try std.fs.path.join(gpa, &.{ old_proj_plugins, "foo" });
+    defer gpa.free(old_foo_dir);
+    try testing.expectEqualStrings(old_foo_dir, foo_before.dir_path);
+
+    // Repoint to new_project (no "foo" in its plugins)
+    const new_cwd = try std.fs.path.join(gpa, &.{ root_tmp, "new_project" });
+    defer gpa.free(new_cwd);
+    try manager.repointProjectDir(new_cwd);
+
+    // "foo" should be reloaded from the global dir — the shadowed global is restored
+    const foo_after = manager.get("foo") orelse return error.PluginNotFound;
+    const global_foo_dir = try std.fs.path.join(gpa, &.{ home_plugins, "foo" });
+    defer gpa.free(global_foo_dir);
+    try testing.expectEqualStrings(global_foo_dir, foo_after.dir_path);
 }

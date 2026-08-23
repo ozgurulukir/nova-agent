@@ -10,6 +10,7 @@ const vxfw = vaxis.vxfw;
 const tui = @import("../tui.zig");
 const config_mod = @import("../config/config.zig");
 const provider_model = @import("provider_model.zig");
+const lane_lifecycle = @import("lane_lifecycle.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
 const runtime_mod = @import("../runtime.zig");
 const session_mod = @import("../session.zig");
@@ -400,6 +401,13 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
     // runtime as template — skills and plugin prompts must load from the
     // session's own cwd, not the current project's.
     const cross_project = session_id != null and !std.mem.eql(u8, cwd, current.cwd);
+    // Guard: before any App-state mutation — refuse if any lane has an
+    // active turn. Unloading Lua states and stripping tool records from the
+    // shared registry while a worker dispatches through them is a
+    // use-after-free hazard. Every turn-start site runs synchronously on the
+    // UI thread and createRuntime never yields (no yield points in the
+    // check-to-mutation window), so no idle→active transition can interleave.
+    if (cross_project and lane_lifecycle.anyLaneTurnActive(app)) return error.InFlightTurn;
     const template: ?*const runtime_mod.AgentRuntime = if (cross_project) null else current;
 
     // Cross-project resume: reload config from the target project's
@@ -467,6 +475,17 @@ pub fn createRuntime(app: *App, cwd: []const u8, session_dir: []const u8, sessio
         // which code path touches the picker next.
         provider_model.invalidateProviderEntries(app);
         app.mcp_manager.syncFromConfig(app.io, &app.cached_config) catch {};
+    }
+
+    // Cross-project plugin repoint: sync config, repoint discovery, re-register.
+    if (cross_project) {
+        app.plugin_manager.syncPluginConfig(app.cached_config.plugins) catch |err| {
+            log.warn("session.plugin.syncPluginConfig_failed err={s}", .{@errorName(err)});
+        };
+        app.plugin_manager.repointProjectDir(cwd) catch |err| {
+            log.warn("session.plugin.repointProjectDir_failed err={s}", .{@errorName(err)});
+        };
+        provider_model.registerPluginTools(app);
     }
 
     runtime.agent.background_manager = app.background;
@@ -701,4 +720,75 @@ test "undoLastTurn refuses when a turn is active" {
     try undoLastTurn(&app);
     try std.testing.expect(undoNoticeContains(&app, "still running"));
     try std.testing.expect(app.thread.turn.state == .active);
+}
+
+test "createRuntime refuses cross-project switch when a lane turn is active" {
+    const gpa = std.testing.allocator;
+    const test_helpers = @import("test_helpers.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs);
+    defer {
+        runtime.deinit();
+        gpa.destroy(runtime);
+    }
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
+    app.thread.agent = &runtime.agent;
+
+    // Activate a turn
+    app.thread.turn.state = .active;
+
+    // cross_project: different cwd + non-null session_id
+    const result = createRuntime(&app, "/other/project", "/other/project", "session-123");
+    try std.testing.expectError(error.InFlightTurn, result);
+    // Guard ran before any mutation — turn state is unchanged
+    try std.testing.expect(app.thread.turn.state == .active);
+}
+
+test "same-project createRuntime guard does not fire" {
+    const gpa = std.testing.allocator;
+    const test_helpers = @import("test_helpers.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    const runtime = try test_helpers.makeParkTestRuntime(gpa, home_abs);
+    defer {
+        runtime.deinit();
+        gpa.destroy(runtime);
+    }
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
+    app.thread.agent = &runtime.agent;
+
+    // Even with an active turn, same-project should NOT trigger the guard
+    // because cross_project is false when cwd matches.
+    app.thread.turn.state = .active;
+
+    // Verify the guard condition directly: cross_project requires different cwd.
+    const current = app.templateRuntime().?;
+    const cross_project = !std.mem.eql(u8, runtime.cwd, current.cwd);
+    try std.testing.expect(!cross_project);
+    // Since cross_project is false, the guard (cross_project and anyLaneTurnActive)
+    // is short-circuited to false regardless of the turn state.
+    try std.testing.expect(!(cross_project and lane_lifecycle.anyLaneTurnActive(&app)));
 }

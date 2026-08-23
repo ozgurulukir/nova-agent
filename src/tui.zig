@@ -1387,12 +1387,14 @@ pub fn openPlugins(app: *App) void {
     app.pickers.plugins.reset();
     if (app.liveRuntime() != null) {
         // Push the current tool set into the live AI client. Deliberately NO
-        // `registerPluginTools` here: the loaded-plugin set is immutable
-        // mid-session (loadAll runs once at startup), so a re-registration
-        // could only re-append the same tools — and its strip-and-rebuild
-        // frees tool records that worker threads may be dispatching through
-        // the shared registry right now (use-after-free). Registration is an
-        // initRuntime-time operation.
+        // `registerPluginTools` here: the loaded-plugin set is now known to
+        // change only at initRuntime and at a guarded cross-project resume
+        // (createRuntime with the anyLaneTurnActive guard). This site has no
+        // such guard, and createRuntime already owns the refresh, so calling
+        // registerPluginTools here would be both unnecessary and unsafe — its
+        // strip-and-rebuild frees tool records that worker threads may be
+        // dispatching through the shared registry right now (use-after-free).
+        // Registration is an initRuntime-time and guarded-resume-time operation.
         provider_model.refreshMcpTools(app);
     }
     app.clearInput();

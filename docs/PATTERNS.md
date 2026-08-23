@@ -313,3 +313,21 @@ Worktrees isolate parallel worker agents and user lanes from the primary reposit
 5. **Asynchronous Non-Blocking Worktree Provisioning:**
    In large repositories, `git worktree add` can block the host process for 2–5 seconds. `spawnLane` offloads worktree creation to a background worker thread (`WorktreeJob`) and returns `null` on the first tick, keeping the request queued in `LaneBridge.pending`. The TUI event loop continues ticking at 30ms, while `advanceAnimations` and `decideShouldTick` query `lane_lifecycle.anyAsyncWorktreeActive` to drive loading spinners smoothly until provisioning completes.
 
+### Plugin Discovery Lifecycle
+
+Project-scoped Lua plugins (`.nova/plugins/*`) are discovered **once** at App startup via `PluginManager.init` → `syncPluginConfig` → `loadAll`. The loaded set is immutable mid-session to avoid two free hazards:
+
+- **Lua state frees:** unloading a plugin calls `PluginInstance.deinit`, which destroys its sandboxed Lua state. Any lane worker mid-dispatch through a plugin handler would be killed.
+- **Registry tool-record frees:** `registerPluginTools` (`src/tui/provider_model.zig`) strips all `lua__`-prefixed tools from the shared `ToolRegistry` before re-adding. A worker dispatching through a tool record that `removePluginToolsWithPrefix` just freed is a use-after-free.
+
+There is exactly **one** mid-session exception: a guarded cross-project `/resume`. When `createRuntime` detects `cross_project` (session cwd differs from the current runtime's cwd), it runs:
+
+1. `anyLaneTurnActive` guard — iterates every lane; if any has a turn in `.active` or `.interrupting` state, the switch is refused with `error.InFlightTurn`. The guard runs synchronously on the UI thread with zero yield points, so no idle→active transition can interleave.
+2. `syncPluginConfig` — applies the reloaded project's enable/disable + settings (build-then-swap: error leaves the previous set intact).
+3. `repointProjectDir` — unloads old project plugins by directory prefix (with separator-boundary check), frees the old `project_dir`, loads from the new project's `.nova/plugins/`. Re-scans the global dir for plugins that were shadowed by the old project and are now absent.
+4. `registerPluginTools` — strips the previous `lua__` generation and re-adds from the live manager (idempotent; descriptor-build failure leaves the stale-but-valid set).
+
+Global plugins (loaded from `~/.config/nova/plugins/` or `%APPDATA%/nova/plugins/`) are never touched during a repoint — their Lua states, event subscriptions, and `require` caches survive the switch. New-project plugins that share a name with a global override the global (mirroring `loadAll` semantics).
+
+Known limitation: live lane clients keep their spawn-time `tools_json` until their client is rebuilt, matching the existing MCP-config change behavior on session switch.
+

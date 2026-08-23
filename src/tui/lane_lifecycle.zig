@@ -404,6 +404,27 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
 }
 
+/// True when any lane (thread) has an active or interrupting turn in progress.
+/// The check-then-mutate window between this guard and the mutation it protects
+/// (e.g., PluginManager.repointProjectDir + registerPluginTools) runs entirely
+/// on the UI thread with no yield points — no `await`, no `io.yield`, no
+/// synchronous call that blocks — so no idle→active transition can interleave.
+/// Verified at implementation time (2026-08-22): every turn-start site
+/// (beginSubmit, delivery-turn start in deliverPendingLaneCompletions,
+/// bridge-serviced lane ops) is synchronous on the UI thread and createRuntime
+/// never yields. Covers both hazards that the guard protects: (a) unloading
+/// Lua states mid-dispatch (fatal if a worker is inside a plugin call), and
+/// (b) the registry strip-and-rebuild freeing tool records that a worker may
+/// be dispatching through right now.
+pub fn anyLaneTurnActive(app: *const App) bool {
+    std.debug.assert(app.threads.len() > 0);
+    std.debug.assert(app.threads.len() <= max_threads);
+    for (app.threads.slice()) |lane| {
+        if (lane.turn.isActive()) return true;
+    }
+    return false;
+}
+
 /// True while any lane has a turn in flight — keeps the drain/animation tick
 /// alive so background lanes' events (and their terminal `turn_finished`)
 /// keep draining even when the visible lane is idle.
@@ -3674,6 +3695,51 @@ test "resolveLane handles case-insensitivity and suggests open worker IDs on fai
     defer gpa.free(res2.text);
     try std.testing.expect(res2.code != 0);
     try std.testing.expectEqualStrings("lane: no open lane with id 'badhex123'. Open worker lanes: [a1b2c3d4e5f6]. (Note: [0] is the driver lane, not a worker).\n", res2.text);
+}
+
+test "anyLaneTurnActive: all lanes idle returns false" {
+    const test_helpers = @import("test_helpers.zig");
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Default state: primary lane is idle.
+    try std.testing.expect(!app.thread.turn.isActive());
+    try std.testing.expect(!anyLaneTurnActive(&app));
+
+    // Add an idle focused lane — still all idle.
+    try test_helpers.addIdleFocusedLane(gpa, &app, "idle-test");
+    try std.testing.expect(!anyLaneTurnActive(&app));
+}
+
+test "anyLaneTurnActive: one live lane with active turn returns true" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fake_runtime: runtime_mod.AgentRuntime = undefined;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &fake_runtime, .owns = false } };
+    app.thread.turn.state = .active;
+
+    try std.testing.expect(anyLaneTurnActive(&app));
+}
+
+test "anyLaneTurnActive: interrupting state also counts as active" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    var fake_runtime: runtime_mod.AgentRuntime = undefined;
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &fake_runtime, .owns = false } };
+    app.thread.turn.state = .interrupting;
+
+    try std.testing.expect(anyLaneTurnActive(&app));
 }
 
 test "parkFinishedWorker closes runtime-bound overlays on the focused lane" {
