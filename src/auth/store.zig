@@ -463,3 +463,26 @@ test "saveProviderApiKey and removeProviderApiKey round-trip" {
     const after = try loadProviderApiKey(gpa, std.testing.io, home_dir, "cerebras");
     try std.testing.expect(after == null);
 }
+
+test "freeApiKeyMap frees empty map without error" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var map: ApiKeyMap = .empty;
+
+    // Act & Assert
+    // freeApiKeyMap must complete without error and leak detector verifies deallocation.
+    freeApiKeyMap(gpa, &map);
+}
+
+test "freeApiKeyMap frees key and value memory for populated map" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var map: ApiKeyMap = .empty;
+    try map.put(gpa, try gpa.dupe(u8, "cerebras"), try gpa.dupe(u8, "csk-key"));
+    try map.put(gpa, try gpa.dupe(u8, "openai"), try gpa.dupe(u8, "sk-key"));
+    try std.testing.expectEqual(@as(usize, 2), map.count());
+
+    // Act & Assert
+    // freeApiKeyMap must free all duped keys, values, and hashmap storage without leaks.
+    freeApiKeyMap(gpa, &map);
+}
