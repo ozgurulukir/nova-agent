@@ -446,7 +446,7 @@ test "PluginManager: heap-allocated tool registry round-trip" {
         reg.deinit(gpa);
         gpa.destroy(reg);
     }
-    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    reg.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
 
     const descs = try buildPluginToolDescriptors(gpa, &manager);
     defer {

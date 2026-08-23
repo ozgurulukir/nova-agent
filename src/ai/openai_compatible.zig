@@ -751,7 +751,7 @@ test "buildAllToolsJson via updateMcpTools: registry builtin suppresses duplicat
         reg.deinit(gpa);
         gpa.destroy(reg);
     }
-    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    reg.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     // Ownership of `plugin_name` and `plugin_desc` transfers to the
     // registry via addPluginTool; registry.deinit frees them.
     const plugin_name = try gpa.dupe(u8, "lua__p__t");
@@ -809,7 +809,7 @@ test "updateMcpTools propagates plugin tools into tools_json end-to-end" {
         reg.deinit(gpa);
         gpa.destroy(reg);
     }
-    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    reg.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
 
     for ([_][]const u8{ "lua__hello-world__greet", "lua__hello-world__current_time" }) |tool_name| {
         const owned_name = try gpa.dupe(u8, tool_name);
@@ -1023,7 +1023,7 @@ test "writeRequestPayload ships the full tools array for OpenRouter byte-for-byt
     const gpa = std.testing.allocator;
 
     // Registry: builtin (bash, lane) + plugin tools, aynen üretimdeki gibi.
-    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    var registry = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     defer registry.deinit(gpa);
     const plugin_names = [_][]const u8{
         "lua__file-tools__read",        "lua__file-tools__write",        "lua__file-tools__edit",
@@ -1108,7 +1108,7 @@ test "ollama_cloud(minimal) vs openrouter dialect: identical tools array, only c
     const gpa = std.testing.allocator;
 
     // Aynı tool seti, her iki dialect için.
-    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    var registry = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     defer registry.deinit(gpa);
     try registry.addPluginTool(gpa, .{
         .name = try gpa.dupe(u8, "lua__file-tools__read"),

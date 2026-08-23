@@ -337,7 +337,7 @@ pub const ExecutorService = struct {
         const content = try tool_display.formatLlmObservation(self.gpa, output);
         errdefer self.gpa.free(content);
         const looked_up = if (self.tool_registry) |r|
-            try r.lookup(self.gpa, call.name)
+            r.lookup(call.name)
         else
             tools.lookupIn(tools.builtinRegistry(), call.name);
         var display = try tool_display.lookupDisplay(self.gpa, looked_up, call.name, call.arguments);
@@ -1011,7 +1011,7 @@ test "executor rejects bash call with invalid JSON" {
 
 test "executor rejects plugin tool call with enum violation" {
     const gpa = std.testing.allocator;
-    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
     defer registry.deinit(gpa);
     try addPluginModeTool(gpa, &registry);
 
@@ -1033,7 +1033,7 @@ test "executor rejects plugin tool call with enum violation" {
 
 test "executor rejects plugin tool call with missing required argument" {
     const gpa = std.testing.allocator;
-    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
     defer registry.deinit(gpa);
     try addPluginModeTool(gpa, &registry);
 
@@ -1054,7 +1054,7 @@ test "executor rejects plugin tool call with missing required argument" {
 
 test "executor rejects plugin tool call with wrong type" {
     const gpa = std.testing.allocator;
-    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
     defer registry.deinit(gpa);
     try addPluginModeTool(gpa, &registry);
 
@@ -1076,7 +1076,7 @@ test "executor rejects plugin tool call with wrong type" {
 
 test "executor rejects plugin tool call with invalid JSON" {
     const gpa = std.testing.allocator;
-    var registry = tools.ToolRegistry.init(tools.builtinRegistry());
+    var registry = try tools.ToolRegistry.init(gpa, tools.builtinRegistry());
     defer registry.deinit(gpa);
     try addPluginModeTool(gpa, &registry);
 

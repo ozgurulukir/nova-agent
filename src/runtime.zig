@@ -987,7 +987,7 @@ test "OwnedClient.updateMcpTools pushes plugin tools into a freshly-attached cli
         reg.deinit(gpa);
         gpa.destroy(reg);
     }
-    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    reg.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     const owned_name = try gpa.dupe(u8, "lua__p__t");
     const owned_desc = try gpa.dupe(u8, "test");
     try reg.addPluginTool(gpa, .{
@@ -1080,7 +1080,7 @@ test "attach rebuilds tools from the registry once it is wired" {
         reg.deinit(gpa);
         gpa.destroy(reg);
     }
-    reg.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+    reg.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     const owned_name = try gpa.dupe(u8, "lua__p__t");
     const owned_desc = try gpa.dupe(u8, "test");
     try reg.addPluginTool(gpa, .{
