@@ -438,6 +438,16 @@ test "parseApiKeys returns empty map when section absent" {
     try std.testing.expectEqual(@as(usize, 0), map.count());
 }
 
+test "parseCredentials returns InvalidCredentials on malformed json" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentials, parseCredentials(gpa, "{invalid json"));
+}
+
+test "parseApiKeys returns InvalidCredentials on malformed json" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentials, parseApiKeys(gpa, "{invalid json"));
+}
+
 test "writeApiKeys serializes non-empty entries as a json object" {
     const gpa = std.testing.allocator;
     var map: ApiKeyMap = .empty;
