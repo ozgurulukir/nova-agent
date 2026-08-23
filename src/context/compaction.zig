@@ -701,3 +701,66 @@ fn toolMessage(gpa: std.mem.Allocator, text: []const u8) !ai.ChatMessage {
     blocks[0] = .{ .text = .{ .text = try gpa.dupe(u8, text) } };
     return .{ .tool = .{ .call_id = .{ .value = try gpa.dupe(u8, "c1") }, .content = blocks } };
 }
+
+test "shouldStartSummary_returnsTrue_whenUsedTokensExceedsLimit" {
+    // Arrange
+    const context_window: u32 = 100_000;
+    const threshold: f64 = 0.75; // limit = 75_000
+    const used_tokens: u32 = 75_001;
+
+    // Act
+    const result = shouldStartSummary(used_tokens, context_window, threshold);
+
+    // Assert
+    try std.testing.expect(result);
+}
+
+test "shouldStartSummary_returnsFalse_whenUsedTokensAtOrBelowLimit" {
+    // Arrange
+    const context_window: u32 = 100_000;
+    const threshold: f64 = 0.75; // limit = 75_000
+
+    // Act
+    const result_exact = shouldStartSummary(75_000, context_window, threshold);
+    const result_zero = shouldStartSummary(0, context_window, threshold);
+    const result_below = shouldStartSummary(50_000, context_window, threshold);
+
+    // Assert
+    try std.testing.expect(!result_exact);
+    try std.testing.expect(!result_zero);
+    try std.testing.expect(!result_below);
+}
+
+test "shouldStartSummary_fallsBackToDefault_whenThresholdOutOfBounds" {
+    // Arrange
+    const context_window: u32 = 100_000; // default threshold 0.75 => limit = 75_000
+    const low_threshold: f64 = 0.05; // < 0.10
+    const high_threshold: f64 = 0.95; // > 0.90
+
+    // Act
+    const result_low_below = shouldStartSummary(75_000, context_window, low_threshold);
+    const result_low_above = shouldStartSummary(75_001, context_window, low_threshold);
+    const result_high_below = shouldStartSummary(75_000, context_window, high_threshold);
+    const result_high_above = shouldStartSummary(75_001, context_window, high_threshold);
+
+    // Assert
+    try std.testing.expect(!result_low_below);
+    try std.testing.expect(result_low_above);
+    try std.testing.expect(!result_high_below);
+    try std.testing.expect(result_high_above);
+}
+
+test "shouldStartSummary_handlesBoundaryThresholdsCorrectly" {
+    // Arrange
+    const context_window: u32 = 100_000;
+    const min_threshold: f64 = 0.10; // limit = 10_000
+    const max_threshold: f64 = 0.90; // limit = 90_000
+
+    // Act & Assert min_threshold
+    try std.testing.expect(!shouldStartSummary(10_000, context_window, min_threshold));
+    try std.testing.expect(shouldStartSummary(10_001, context_window, min_threshold));
+
+    // Act & Assert max_threshold
+    try std.testing.expect(!shouldStartSummary(90_000, context_window, max_threshold));
+    try std.testing.expect(shouldStartSummary(90_001, context_window, max_threshold));
+}
