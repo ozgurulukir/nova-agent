@@ -404,6 +404,10 @@ pub const Client = struct {
     /// surfaces connection-refused as NTSTATUS 0xc0000236 (`error.Unexpected`)
     /// rather than `error.ConnectionRefused`. The breadth is accepted because no
     /// other `error.Unexpected` source is expected before any response bytes.
+    ///
+    /// `error.HttpConnectionClosing` is std.http's report for reusing an idle
+    /// keep-alive connection the server already closed (0-byte head read): the
+    /// retry loop reconnects and re-sends, so the user sees nothing.
     fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
         _ = self;
         return switch (err) {
@@ -414,6 +418,7 @@ pub const Client = struct {
             error.ConnectionResetByPeer,
             error.ConnectionTimedOut,
             error.BrokenPipe,
+            error.HttpConnectionClosing,
             error.Unexpected,
             => error.ConnectionFailed,
             else => err,
@@ -1840,6 +1845,10 @@ test "headPhaseFailure maps transient connection drops to a retryable error" {
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionResetByPeer));
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.BrokenPipe));
+    // Stale keep-alive: the server closed an idle connection and the 0-byte
+    // head read surfaces as error.HttpConnectionClosing (std.http), not one of
+    // the socket errors above — still a transient head-phase drop.
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.HttpConnectionClosing));
     // Windows surfaces connection-refused as NTSTATUS 0xc0000236 (error.Unexpected),
     // which is treated as a transient connect/read drop in the head phase.
     try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.Unexpected));
