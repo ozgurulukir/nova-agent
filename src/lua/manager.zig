@@ -19,6 +19,10 @@ const plugin_config = @import("../config/plugin.zig");
 /// True when `plugin_dir` is the same as `project_dir` or a subdirectory
 /// of it (separator-boundary checked — never a bare `startsWith`).
 /// Treats `/` and `\` as equivalent separators for cross-platform safety.
+/// Assumes `project_dir` carries no trailing separator (holds for every
+/// producer: `std.fs.path.join` and `currentPathAlloc` never leave one) —
+/// with a trailing separator the boundary check below would reject true
+/// subdirectories.
 fn pluginDirUnderProjectDir(plugin_dir: []const u8, project_dir: []const u8) bool {
     if (project_dir.len == 0) return false;
     if (plugin_dir.len < project_dir.len) return false;
@@ -361,42 +365,58 @@ pub const PluginManager = struct {
     /// all-lanes-idle guarantee — unloading frees Lua states mid-dispatch
     /// would be fatal.
     pub fn repointProjectDir(self: *Self, new_cwd: []const u8) !void {
-        // Step 1: snapshot old project_dir, compute new one.
+        // Step 1: snapshot old project_dir, compute new one — both BEFORE any
+        // mutation, so an allocation failure here leaves the manager intact.
         const old_project_dir = if (self.project_dir.len > 0)
             try self.allocator.dupe(u8, self.project_dir)
         else
             "";
-        // old_project_dir is freed at the end; it must outlive the unload
-        // loop below. When old_project_dir is empty ("" — a compile-time
-        // literal), the free is skipped.
+        // Snapshot must outlive the unload pass below; freed via errdefer on
+        // error and explicitly at the end of the happy path.
+        errdefer if (old_project_dir.len > 0) self.allocator.free(old_project_dir);
 
-        const new_project_dir = if (new_cwd.len > 0)
-            std.fs.path.join(self.allocator, &.{ new_cwd, ".nova", "plugins" }) catch ""
+        // `try`, not `catch ""`: an OOM here must fail the repoint, not
+        // silently empty discovery after old plugins were unloaded.
+        var new_project_dir: []u8 = if (new_cwd.len > 0)
+            try std.fs.path.join(self.allocator, &.{ new_cwd, ".nova", "plugins" })
         else
             "";
-        // new_project_dir is stored into self.project_dir at step 4.
-        // If new_cwd was empty we set self.project_dir = "" below.
+        // Ownership transfers to self.project_dir at step 4; the assignment
+        // of "" below disarms the errdefer.
+        errdefer if (new_project_dir.len > 0) self.allocator.free(new_project_dir);
 
         // Step 2: unload every plugin whose dir_path is under the old
-        // project dir. Build a new map with only surviving entries to
-        // avoid HashMap iterator invalidation during removal.
+        // project dir. Two-pass: collect survivors and unload victims FIRST
+        // (both fallible), swap the map, and only then destroy the victims.
+        // Destroying during iteration would leave self.plugins referencing
+        // freed instances if a later `put`/`append` failed with OOM.
         if (old_project_dir.len > 0) {
             var surviving: std.StringHashMapUnmanaged(*PluginInstance) = .empty;
-            // No defer — ownership transfers to self.plugins below.
+            // On error the original map still owns every instance; only the
+            // scratch buckets are freed.
+            errdefer surviving.deinit(self.allocator);
+            var unloaded: std.ArrayList(*PluginInstance) = .empty;
+            errdefer unloaded.deinit(self.allocator);
 
             var it = self.plugins.iterator();
             while (it.next()) |entry| {
                 if (pluginDirUnderProjectDir(entry.value_ptr.*.dir_path, old_project_dir)) {
-                    // Unload this plugin
-                    entry.value_ptr.*.deinit(self.allocator);
-                    self.allocator.destroy(entry.value_ptr.*);
+                    try unloaded.append(self.allocator, entry.value_ptr.*);
                 } else {
                     try surviving.put(self.allocator, entry.key_ptr.*, entry.value_ptr.*);
                 }
             }
 
+            // Swap first — from here on nothing fallible touches the maps,
+            // so self.plugins never references a destroyed instance.
             self.plugins.deinit(self.allocator);
             self.plugins = surviving;
+
+            for (unloaded.items) |instance| {
+                instance.deinit(self.allocator);
+                self.allocator.destroy(instance);
+            }
+            unloaded.deinit(self.allocator);
         }
 
         // Step 3: re-scan global_dir for globals that were shadowed by
@@ -435,13 +455,11 @@ pub const PluginManager = struct {
             }
         }
 
-        // Step 4: free old project_dir, store new.
+        // Step 4: free old project_dir, store new. Transferring ownership of
+        // new_project_dir (even when it's the "" literal) disarms its errdefer.
         if (self.project_dir.len > 0) self.allocator.free(self.project_dir);
-        if (new_project_dir.len > 0) {
-            self.project_dir = new_project_dir;
-        } else {
-            self.project_dir = "";
-        }
+        self.project_dir = new_project_dir;
+        new_project_dir = "";
 
         // Step 5: load from new project dir. Missing dir → warn + no-op
         // (existing loadFromDir behavior). Non-FileNotFound failures are
