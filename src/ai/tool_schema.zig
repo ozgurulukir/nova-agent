@@ -191,7 +191,7 @@ test "buildAllToolsJson emits every plugin+builtin+MCP tool at production scale"
     // tool'un enjeksiyon sırasında truncate edilmediğini / düşmediğini kanıtlar.
     const gpa = std.testing.allocator;
 
-    var registry: tools_mod.ToolRegistry = .init(tools_mod.builtinRegistry());
+    var registry = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
     defer registry.deinit(gpa);
 
     const plugin_names = [_][]const u8{

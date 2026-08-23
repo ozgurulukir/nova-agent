@@ -257,7 +257,7 @@ pub const App = struct {
         try threads.append(primary);
         const registry = try gpa.create(tools_mod.ToolRegistry);
         errdefer gpa.destroy(registry);
-        registry.* = tools_mod.ToolRegistry.init(tools_mod.builtinRegistry());
+        registry.* = try tools_mod.ToolRegistry.init(gpa, tools_mod.builtinRegistry());
         const bridge = try gpa.create(lane_bridge_mod.LaneBridge);
         errdefer gpa.destroy(bridge);
         // `create` allocates raw bytes — the mutex/condition must be
