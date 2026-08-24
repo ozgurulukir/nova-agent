@@ -520,3 +520,91 @@ test "accountIdFromAccessToken returns InvalidCredentials on missing claims or m
     try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, missing_claims_jwt));
     try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, malformed_jwt));
 }
+
+test "createAuthorizationFlow constructs valid PKCE authorization URL and state" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var flow = try createAuthorizationFlow(gpa, io);
+    defer flow.deinit(gpa);
+
+    try std.testing.expect(flow.verifier.len > 0);
+    try std.testing.expectEqual(@as(usize, 32), flow.state.len);
+    try std.testing.expect(std.mem.startsWith(u8, flow.url, authorize_url));
+    try std.testing.expect(std.mem.indexOf(u8, flow.url, "client_id=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flow.url, "code_challenge=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flow.url, "state=") != null);
+}
+
+const MockCallbackClient = struct {
+    io: std.Io,
+    path: []const u8,
+
+    fn run(self: MockCallbackClient) void {
+        var address = std.Io.net.IpAddress.parseIp4(auth_host, auth_port) catch return;
+        var retry: usize = 0;
+        while (retry < 100) : (retry += 1) {
+            if (address.connect(self.io, .{ .mode = .stream })) |stream| {
+                var local_stream = stream;
+                defer local_stream.close(self.io);
+                var write_buf: [1024]u8 = undefined;
+                var writer = local_stream.writer(self.io, &write_buf);
+                writer.interface.print("GET {s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n", .{ self.path, auth_port }) catch {};
+                writer.interface.flush() catch {};
+                return;
+            } else |_| {
+                self.io.sleep(.fromMilliseconds(5), .awake) catch {};
+            }
+        }
+    }
+};
+
+test "waitForAuthorizationCode accepts valid callback and returns authorization code" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const expected_state = "valid_state_1234567890abcdef";
+    const callback_path = "/auth/callback?code=test_code_xyz&state=valid_state_1234567890abcdef";
+
+    const client = MockCallbackClient{ .io = io, .path = callback_path };
+    const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
+    defer thread.join();
+
+    const code = try waitForAuthorizationCode(gpa, io, expected_state);
+    defer gpa.free(code);
+    try std.testing.expectEqualStrings("test_code_xyz", code);
+}
+
+test "waitForAuthorizationCode rejects state mismatch and invalid path" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // State Mismatch case
+    {
+        const client = MockCallbackClient{ .io = io, .path = "/auth/callback?code=test_code&state=wrong_state" };
+        const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
+        defer thread.join();
+
+        try std.testing.expectError(error.StateMismatch, waitForAuthorizationCode(gpa, io, "expected_state"));
+    }
+
+    // Invalid Path case
+    {
+        const client = MockCallbackClient{ .io = io, .path = "/wrong/path?code=test_code&state=expected_state" };
+        const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
+        defer thread.join();
+
+        try std.testing.expectError(error.InvalidCallback, waitForAuthorizationCode(gpa, io, "expected_state"));
+    }
+}
+
+test "login handles callback state mismatch and cleans up resources" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-login-test-home";
+
+    const client = MockCallbackClient{ .io = io, .path = "/auth/callback?code=some_code&state=unmatched_state" };
+    const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
+    defer thread.join();
+
+    try std.testing.expectError(error.StateMismatch, login(gpa, io, home_dir));
+}
