@@ -909,3 +909,36 @@ test "async empty query returns results" {
     try std.testing.expect(result.stdout.len > 0);
     try std.testing.expect(result.status == .ok);
 }
+
+fn failingConcurrent(
+    userdata: ?*anyopaque,
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start_fn: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) std.Io.ConcurrentError!*std.Io.AnyFuture {
+    _ = userdata;
+    _ = result_len;
+    _ = result_alignment;
+    _ = context;
+    _ = context_alignment;
+    _ = start_fn;
+    return error.ConcurrencyUnavailable;
+}
+
+test "start with io.concurrent failure sets state to failed" {
+    const gpa = std.testing.allocator;
+    var vtable = std.testing.io.vtable.*;
+    vtable.concurrent = failingConcurrent;
+    var failing_io = std.testing.io;
+    failing_io.vtable = &vtable;
+
+    start(gpa, failing_io, ".");
+    defer deinit(gpa, std.testing.io);
+
+    try std.testing.expectEqual(std.meta.activeTag(backend.state), .failed);
+    const msg = backend.lastFailure(gpa) orelse return error.TestExpectedFailureMessage;
+    defer gpa.free(msg);
+    try std.testing.expectEqualStrings("ConcurrencyUnavailable", msg);
+}
