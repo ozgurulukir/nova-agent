@@ -1179,11 +1179,11 @@ test "provider picker navigates from codex to catalogue providers" {
 
     var state: provider_picker.State = .{ .entries = &entries };
     try std.testing.expectEqual(@as(u32, 0), state.selection);
-    try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction());
+    try std.testing.expectEqual(provider_picker.Action.connect_codex, state.selectedAction("").?);
     // Below the Codex row sit the catalogue providers; selecting one opens its form.
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false, ""));
     try std.testing.expectEqual(@as(u32, 1), state.selection);
-    try std.testing.expect(state.selectedAction() == .open_entry);
+    try std.testing.expect(state.selectedAction("").? == .open_entry);
 }
 
 test "local provider model labels use correct separator" {

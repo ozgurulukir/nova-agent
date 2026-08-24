@@ -140,7 +140,9 @@ const ProviderPicker = struct {
             // Swallow everything else (arrows, tab) — Enter/Esc are handled upstream.
             return true;
         }
-        return app.getProviderPicker().handleKey(key, app.isCodexSignedIn());
+        const filter = try app.peekPaletteInput();
+        defer app.gpa.free(filter);
+        return app.getProviderPicker().handleKey(key, app.isCodexSignedIn(), filter);
     }
 };
 

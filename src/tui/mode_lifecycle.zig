@@ -14,6 +14,7 @@ const lanes_util = @import("lanes.zig");
 const skill_mod = @import("../skill.zig");
 const theme_lifecycle = @import("theme_lifecycle.zig");
 const theme_picker = @import("widgets/theme_picker.zig");
+const provider_picker = @import("widgets/provider_picker.zig");
 const tui_style = @import("style.zig");
 
 const App = tui.App;
@@ -44,6 +45,10 @@ pub fn syncModeWithInput(app: *App, value: []const u8) !void {
             // list. Stays in sync with the `.command` clamp in event_callbacks.
             const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
+        }
+        if (app.mode == .provider_picker and app.pickers.provider.stage == .list) {
+            const count = provider_picker.countMatching(app.pickers.provider.entries, value);
+            if (app.pickers.provider.selection >= count) app.pickers.provider.selection = 0;
         }
         if (app.mode == .session_picker) {
             if (app.nav.resume_selection >= try app.visibleResumeCount()) app.nav.resume_selection = 0;
@@ -221,16 +226,20 @@ pub fn submitMode(app: *App) !bool {
             }
             return true;
         }
-        switch (app.pickers.provider.selectedAction()) {
-            .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
-            .sign_out_codex => {
-                if (app.isCodexSignedIn()) {
-                    provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
-                } else {
-                    provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
-                }
-            },
-            .open_entry => |handle| provider_model.openProviderEntryForm(app, handle),
+        const filter = try app.peekPaletteInput();
+        defer app.gpa.free(filter);
+        if (app.pickers.provider.selectedAction(filter)) |action| {
+            switch (action) {
+                .connect_codex => provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err),
+                .sign_out_codex => {
+                    if (app.isCodexSignedIn()) {
+                        provider_model.signOutCodex(app) catch |err| try app.reportConnectionError(err);
+                    } else {
+                        provider_model.connectCodex(app) catch |err| try app.reportConnectionError(err);
+                    }
+                },
+                .open_entry => |handle| provider_model.openProviderEntryForm(app, handle),
+            }
         }
         return true;
     }

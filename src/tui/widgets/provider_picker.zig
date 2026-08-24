@@ -8,6 +8,7 @@ const tui_style = @import("../style.zig");
 const auth = @import("../../auth/store.zig");
 const config_mod = @import("../../config/config.zig");
 const modelsdev = @import("../../models/registry.zig");
+const command_panel = @import("command_panel.zig");
 
 const assert = std.debug.assert;
 pub const Status = enum { unknown, connected, failed };
@@ -18,6 +19,12 @@ pub const Action = union(enum) {
     connect_codex,
     sign_out_codex,
     open_entry: ProviderHandle,
+};
+
+/// Match result for a filtered provider row.
+pub const Match = union(enum) {
+    codex,
+    entry: ProviderHandle,
 };
 
 /// Unified handle for any provider source: builtin catalogue, models.dev
@@ -87,6 +94,54 @@ pub const ProviderHandle = union(enum) {
     }
 };
 
+/// Check if a row matches the given search filter. Null `handle_opt` checks the Codex row.
+pub fn matchesRow(handle_opt: ?ProviderHandle, filter: []const u8) bool {
+    if (filter.len == 0) return true;
+    if (handle_opt) |handle| {
+        return command_panel.containsIgnoreCase(handle.displayName(), filter) or
+            command_panel.containsIgnoreCase(handle.id(), filter) or
+            command_panel.containsIgnoreCase(handle.description(), filter);
+    } else {
+        return command_panel.containsIgnoreCase("OpenAI Codex", filter) or
+            command_panel.containsIgnoreCase("codex", filter) or
+            command_panel.containsIgnoreCase("chatgpt", filter) or
+            command_panel.containsIgnoreCase("OpenAI ChatGPT & Codex OAuth authentication", filter);
+    }
+}
+
+/// Count the number of visible matching rows for the given filter.
+pub fn countMatching(entries: []const ProviderHandle, filter: []const u8) u32 {
+    if (filter.len == 0) return 1 + @as(u32, @intCast(entries.len));
+    var count: u32 = 0;
+    if (matchesRow(null, filter)) count += 1;
+    for (entries) |entry| {
+        if (matchesRow(entry, filter)) count += 1;
+    }
+    return count;
+}
+
+/// Look up the matching item at index `index` in the filtered list.
+pub fn getMatchAt(entries: []const ProviderHandle, filter: []const u8, index: u32) ?Match {
+    if (filter.len == 0) {
+        if (index == 0) return .codex;
+        const entry_idx = index - 1;
+        if (entry_idx < entries.len) return .{ .entry = entries[entry_idx] };
+        return null;
+    }
+    var current: u32 = 0;
+    if (matchesRow(null, filter)) {
+        if (current == index) return .codex;
+        current += 1;
+    }
+    for (entries) |entry| {
+        if (matchesRow(entry, filter)) {
+            if (current == index) return .{ .entry = entry };
+            current += 1;
+        }
+    }
+    return null;
+}
+
 pub const State = struct {
     stage: Stage = .list,
     selection: u32 = 0,
@@ -108,25 +163,28 @@ pub const State = struct {
         return 1 + @as(u32, @intCast(self.entries.len));
     }
 
-    pub fn handleKey(self: *State, key: vaxis.Key, codex_signed_in: bool) bool {
+    pub fn handleKey(self: *State, key: vaxis.Key, codex_signed_in: bool, filter: []const u8) bool {
         if (self.stage == .form) return false;
 
-        const count = self.rowCount();
+        const count = countMatching(self.entries, filter);
         if (count == 0) return false;
-        // The background registry refresh can rebuild (and shrink) `entries`
-        // while the picker is open; a stale selection must clamp, not assert —
-        // `assert` is stripped in ReleaseFast and would index out of bounds.
+        // The background registry refresh or a new filter can shrink `entries`;
+        // a stale selection must clamp, not assert.
         if (self.selection >= count) self.selection = 0;
+
+        const current_match = getMatchAt(self.entries, filter, self.selection);
+        const is_codex = if (current_match) |m| (m == .codex) else false;
+
         if (key.matches(vaxis.Key.left, .{})) {
             self.column = .provider;
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            if (self.selection == 0 and codex_signed_in) self.column = .sign_out;
+            if (is_codex and codex_signed_in) self.column = .sign_out;
             return true;
         }
         if (key.matches(vaxis.Key.tab, .{})) {
-            if (self.selection == 0 and codex_signed_in) self.column = nextColumn(self.column);
+            if (is_codex and codex_signed_in) self.column = nextColumn(self.column);
             return true;
         }
         if (key.matches(vaxis.Key.up, .{})) {
@@ -159,16 +217,12 @@ pub const State = struct {
         if (self.selection >= self.rowCount()) self.selection = 0;
     }
 
-    pub fn selectedAction(self: *const State) Action {
-        const count = self.rowCount();
-        // Total guard, not an assert: ReleaseFast strips asserts and a stale
-        // selection (entries shrank between key handling and submit) would
-        // index out of bounds. Row 0 (codex) is the safe resolution.
-        if (self.selection == 0 or self.selection >= count) {
-            if (self.column == .sign_out) return .sign_out_codex;
-            return .connect_codex;
-        }
-        return .{ .open_entry = self.entries[self.selection - 1] };
+    pub fn selectedAction(self: *const State, filter: []const u8) ?Action {
+        const match = getMatchAt(self.entries, filter, self.selection) orelse return null;
+        return switch (match) {
+            .codex => if (self.column == .sign_out) .sign_out_codex else .connect_codex,
+            .entry => |entry| .{ .open_entry = entry },
+        };
     }
 };
 
@@ -178,6 +232,9 @@ pub const Content = struct {
     statuses: []const Status,
     key_input: []const u8 = "",
     api_keys: ?*const auth.ApiKeyMap = null,
+    filter: []const u8 = "",
+    highlight_enabled: bool = true,
+    highlight_style: config_mod.FuzzyHighlightStyle = .accent,
 
     pub fn widget(self: *Content) vxfw.Widget {
         return .{ .userdata = self, .drawFn = draw };
@@ -198,45 +255,82 @@ pub const Content = struct {
 
     fn drawList(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext) !void {
         const p = tui_style.activePalette();
-        const total_count = 1 + @as(u32, @intCast(self.state.entries.len));
-        const viewport = panel.ViewportWindow.compute(self.state.selection, total_count, surface.size.height);
+        const total_matches = countMatching(self.state.entries, self.filter);
+        if (total_matches == 0) {
+            try panel.lineStyledAt(surface, 0, "  No matching providers", ctx, 1, p.thinking_body);
+            return;
+        }
+
+        const viewport = panel.ViewportWindow.compute(self.state.selection, total_matches, surface.size.height);
         if (viewport.visible_height == 0) return;
 
-        var i: u32 = viewport.start_index;
-        while (i < viewport.end_index) : (i += 1) {
-            const row = viewport.screenRow(i);
-            if (i == 0) {
-                try self.drawCodex(surface, ctx, row);
-                continue;
+        var match_idx: u32 = viewport.start_index;
+        while (match_idx < viewport.end_index) : (match_idx += 1) {
+            const screen_row = viewport.screenRow(match_idx);
+            const match = getMatchAt(self.state.entries, self.filter, match_idx) orelse continue;
+            const row_selected = self.state.selection == match_idx;
+            const provider_focused = row_selected and self.state.column == .provider;
+
+            switch (match) {
+                .codex => {
+                    try self.drawCodex(surface, ctx, screen_row, row_selected, provider_focused);
+                },
+                .entry => |entry| {
+                    try self.drawEntry(surface, ctx, screen_row, entry, row_selected, provider_focused);
+                },
             }
-            const entry = self.state.entries[i - 1];
-            const focused = self.state.selection == i and self.state.column == .provider;
-            const base = try std.fmt.allocPrint(ctx.arena, "  {s}", .{entry.displayName()});
-            try panel.commandLine(surface, row, base, ctx, focused);
-
-            // Badge: builtins use the catalogue status array; everything else
-            // derives connectivity from the API-key map.
-            const status: Status = if (entry.catalogueIndex()) |ci|
-                (if (ci < self.statuses.len) self.statuses[ci] else .unknown)
-            else if (self.api_keys) |keys|
-                (if (keys.get(entry.id()) != null) .connected else .unknown)
-            else
-                .unknown;
-            try drawBadge(surface, ctx, row, base, status, focused);
-
-            const desc_style = if (focused) p.selected_item else p.thinking_body;
-            _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, entry.description(), desc_style);
         }
     }
 
-    fn drawBadge(
+    fn drawEntry(
+        self: *const Content,
         surface: *vxfw.Surface,
         ctx: vxfw.DrawContext,
         row: u16,
-        base: []const u8,
-        status: Status,
-        focused: bool,
+        entry: ProviderHandle,
+        row_selected: bool,
+        provider_focused: bool,
     ) !void {
+        const p = tui_style.activePalette();
+        const prefix = "  ";
+        const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
+
+        try panel.drawFuzzyListRow(surface, row, ctx, .{
+            .prefix = prefix,
+            .text = entry.displayName(),
+            .query = self.filter,
+            .selected = row_selected,
+            .base_style = base_style,
+            .start_col = message.ConversationLayout.left -| 1,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
+        });
+
+        // Badge: builtins use the catalogue status array; everything else
+        // derives connectivity from the API-key map.
+        const status: Status = if (entry.catalogueIndex()) |ci|
+            (if (ci < self.statuses.len) self.statuses[ci] else .unknown)
+        else if (self.api_keys) |keys|
+            (if (keys.get(entry.id()) != null) .connected else .unknown)
+        else
+            .unknown;
+        try self.drawBadge(surface, ctx, row, prefix, entry.displayName(), status, row_selected);
+
+        const desc_style = if (provider_focused) p.selected_item else p.thinking_body;
+        _ = panel.writeBorderTextEndingAt(surface, ctx, row, surface.size.width -| 2, entry.description(), desc_style);
+    }
+
+    fn drawBadge(
+        self: *const Content,
+        surface: *vxfw.Surface,
+        ctx: vxfw.DrawContext,
+        row: u16,
+        prefix: []const u8,
+        display_name: []const u8,
+        status: Status,
+        row_selected: bool,
+    ) !void {
+        _ = self;
         const p = tui_style.activePalette();
         const text: []const u8 = switch (status) {
             .connected => " [CONNECTED]",
@@ -248,24 +342,38 @@ pub const Content = struct {
             .failed => p.tool_failed,
             .unknown => unreachable,
         };
+        const text_width = ctx.stringWidth(prefix) + ctx.stringWidth(display_name);
         const badge_col: u16 = (message.ConversationLayout.left -| 1) +
-            @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
-        try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, focused));
+            @as(u16, @intCast(@min(text_width, @as(usize, std.math.maxInt(u16)))));
+        try panel.lineStyledAt(surface, row, text, ctx, badge_col, tui_style.onSelectionBg(style, row_selected));
     }
 
-    fn drawCodex(self: *const Content, surface: *vxfw.Surface, ctx: vxfw.DrawContext, row: u16) !void {
+    fn drawCodex(
+        self: *const Content,
+        surface: *vxfw.Surface,
+        ctx: vxfw.DrawContext,
+        row: u16,
+        row_selected: bool,
+        provider_focused: bool,
+    ) !void {
         const p = tui_style.activePalette();
-        const row_selected = self.state.selection == 0;
-        const provider_focused = row_selected and self.state.column == .provider;
-        if (row_selected) panel.fillRow(surface, row, p.selected);
-
         const prefix = "  ";
-        const base = try std.fmt.allocPrint(ctx.arena, "{s}OpenAI Codex", .{prefix});
         const base_style = if (provider_focused) p.selected_item else tui_style.onSelectionBg(p.thinking_body, row_selected);
-        try panel.lineStyledAt(surface, row, base, ctx, message.ConversationLayout.left -| 1, base_style);
+
+        try panel.drawFuzzyListRow(surface, row, ctx, .{
+            .prefix = prefix,
+            .text = "OpenAI Codex",
+            .query = self.filter,
+            .selected = row_selected,
+            .base_style = base_style,
+            .start_col = message.ConversationLayout.left -| 1,
+            .highlight_enabled = self.highlight_enabled,
+            .highlight_style = self.highlight_style,
+        });
+
         if (self.codex_signed_in) {
             const badge_col: u16 = (message.ConversationLayout.left -| 1) +
-                @as(u16, @intCast(@min(ctx.stringWidth(base), @as(usize, std.math.maxInt(u16)))));
+                @as(u16, @intCast(@min(ctx.stringWidth("  OpenAI Codex"), @as(usize, std.math.maxInt(u16)))));
             try panel.lineStyledAt(surface, row, " [CONNECTED]", ctx, badge_col, tui_style.onSelectionBg(p.success, row_selected));
             try self.drawSignOut(surface, ctx, row, row_selected);
         } else {
@@ -370,9 +478,9 @@ test "provider form masks the API key in the display" {
 
 test "provider picker navigation reaches sign out only when signed in" {
     var state: State = .{};
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.right }, false));
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.right }, false, ""));
     try std.testing.expectEqual(Column.provider, state.column);
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.right }, true));
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.right }, true, ""));
     try std.testing.expectEqual(Column.sign_out, state.column);
 }
 
@@ -423,9 +531,9 @@ test "provider picker selecting a catalogue row opens its form" {
     for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
 
     var state: State = .{ .entries = &entries };
-    try std.testing.expectEqual(Action.connect_codex, state.selectedAction());
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false));
-    const action = state.selectedAction();
+    try std.testing.expectEqual(Action.connect_codex, state.selectedAction("").?);
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.down }, false, ""));
+    const action = state.selectedAction("").?;
     try std.testing.expect(action == .open_entry);
     try std.testing.expectEqual(config_mod.catalogueProviders()[0], action.open_entry.builtin);
 }
@@ -509,31 +617,100 @@ test "provider picker viewport scrolling renders selected dynamic row" {
 
 test "provider picker form stage defers keys to the input field" {
     var state: State = .{ .stage = .form };
-    try std.testing.expect(!state.handleKey(.{ .codepoint = 'a' }, false));
-    try std.testing.expect(!state.handleKey(.{ .codepoint = vaxis.Key.down }, true));
+    try std.testing.expect(!state.handleKey(.{ .codepoint = 'a' }, false, ""));
+    try std.testing.expect(!state.handleKey(.{ .codepoint = vaxis.Key.down }, true, ""));
 }
 
-test "selectedAction is total for a stale selection" {
-    // Entries shrank between key handling and submit (background registry
-    // refresh): a selection past the end must resolve to the codex row, never
-    // index out of bounds.
+test "selectedAction is total for a stale selection and empty filter" {
+    // Entries shrank between key handling and submit (background registry refresh)
     var state: State = .{ .selection = 7 };
-    try std.testing.expectEqual(Action.connect_codex, state.selectedAction());
-    state.column = .sign_out;
-    try std.testing.expectEqual(Action.sign_out_codex, state.selectedAction());
+    try std.testing.expectEqual(@as(?Action, null), state.selectedAction("nonexistent"));
+    // Stale selection on empty filter returns null safely
+    try std.testing.expectEqual(@as(?Action, null), state.selectedAction(""));
+
     // In-range selections keep resolving to the entry.
     const entries = [_]ProviderHandle{.{ .builtin = .openai }};
     var in_range: State = .{ .selection = 1, .entries = &entries };
-    try std.testing.expect(std.meta.activeTag(in_range.selectedAction()) == .open_entry);
+    try std.testing.expect(std.meta.activeTag(in_range.selectedAction("").?) == .open_entry);
 }
 
 test "handleKey clamps a stale selection instead of asserting" {
     var state: State = .{ .selection = 5 };
     // Any navigation key first clamps the stale selection into range.
-    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.up }, false));
+    try std.testing.expect(state.handleKey(.{ .codepoint = vaxis.Key.up }, false, ""));
     try std.testing.expectEqual(@as(u32, 0), state.selection);
     // clampSelection is the rebuild-site counterpart.
     state.selection = 9;
     state.clampSelection();
     try std.testing.expectEqual(@as(u32, 0), state.selection);
+}
+
+test "provider picker matchesRow searches displayName, id, and description" {
+    const handle: ProviderHandle = .{ .builtin = .anthropic };
+    try std.testing.expect(matchesRow(handle, "anthropic"));
+    try std.testing.expect(matchesRow(handle, "Claude"));
+    try std.testing.expect(matchesRow(handle, "ANTHROPIC"));
+    try std.testing.expect(!matchesRow(handle, "nonexistent_term"));
+
+    // Codex row checks
+    try std.testing.expect(matchesRow(null, "codex"));
+    try std.testing.expect(matchesRow(null, "chatgpt"));
+    try std.testing.expect(matchesRow(null, "OAuth"));
+    try std.testing.expect(!matchesRow(null, "anthropic"));
+}
+
+test "provider picker countMatching and getMatchAt filter correctly" {
+    const entries = [_]ProviderHandle{
+        .{ .builtin = .openai },
+        .{ .builtin = .anthropic },
+        .{ .builtin = .ollama },
+    };
+
+    // Empty filter matches Codex + 3 entries = 4
+    try std.testing.expectEqual(@as(u32, 4), countMatching(&entries, ""));
+    try std.testing.expectEqual(Match.codex, getMatchAt(&entries, "", 0).?);
+    try std.testing.expectEqual(config_mod.Provider.openai, getMatchAt(&entries, "", 1).?.entry.builtin);
+
+    // "Claude" matches only Anthropic
+    try std.testing.expectEqual(@as(u32, 1), countMatching(&entries, "Claude"));
+    const match = getMatchAt(&entries, "Claude", 0).?;
+    try std.testing.expectEqual(config_mod.Provider.anthropic, match.entry.builtin);
+
+    // "OAuth" matches only Codex row
+    try std.testing.expectEqual(@as(u32, 1), countMatching(&entries, "OAuth"));
+    try std.testing.expectEqual(Match.codex, getMatchAt(&entries, "OAuth", 0).?);
+
+    // "codex" matches Codex row + OpenAI entry (whose description mentions Codex) = 2
+    try std.testing.expectEqual(@as(u32, 2), countMatching(&entries, "codex"));
+    try std.testing.expectEqual(Match.codex, getMatchAt(&entries, "codex", 0).?);
+    try std.testing.expectEqual(config_mod.Provider.openai, getMatchAt(&entries, "codex", 1).?.entry.builtin);
+
+    // Non-matching query
+    try std.testing.expectEqual(@as(u32, 0), countMatching(&entries, "xyz_not_found"));
+    try std.testing.expectEqual(@as(?Match, null), getMatchAt(&entries, "xyz_not_found", 0));
+}
+
+test "provider picker filtered navigation and empty list rendering" {
+    const entries = [_]ProviderHandle{
+        .{ .builtin = .openai },
+        .{ .builtin = .anthropic },
+    };
+    var content: Content = .{
+        .state = .{ .entries = &entries },
+        .codex_signed_in = false,
+        .statuses = &.{},
+        .filter = "nonexistent",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const surface = try content.widget().draw(ctx);
+    const line = try rowText(arena.allocator(), surface, 0);
+    try std.testing.expect(std.mem.indexOf(u8, line, "No matching providers") != null);
 }

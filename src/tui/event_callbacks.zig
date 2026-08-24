@@ -6,6 +6,7 @@ const vxfw = vaxis.vxfw;
 
 const tui = @import("../tui.zig");
 const provider_model = @import("provider_model.zig");
+const provider_picker = @import("widgets/provider_picker.zig");
 const resume_picker = @import("widgets/resume_picker.zig");
 
 const App = tui.App;
@@ -52,6 +53,12 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
                 app.pickers.models.model_selection = provider_model.firstMatchingModelDisplay(app, value) orelse 0;
             }
         },
+        .provider_picker => {
+            if (app.pickers.provider.stage == .list) {
+                const count = provider_picker.countMatching(app.pickers.provider.entries, value);
+                if (app.pickers.provider.selection >= count) app.pickers.provider.selection = 0;
+            }
+        },
         .diff_viewer => {
             if (app.diff.sub == .file_search) try app.diff.filterFiles(app.gpa, value);
         },
@@ -64,7 +71,7 @@ pub fn paletteInputChanged(userdata: ?*anyopaque, ctx: *vxfw.EventContext, value
             const count = theme_picker.countMatching(app.theme_registry.slice(), value);
             if (app.pickers.theme.selection >= count) app.pickers.theme.selection = 0;
         },
-        .provider_picker, .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins => {},
+        .normal, .save_message, .lanes, .help, .settings, .mcp, .plugins => {},
     }
     ctx.consumeAndRedraw();
 }

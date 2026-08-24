@@ -388,6 +388,7 @@ const OverlayInner = struct {
     }
 
     fn drawProviderContent(app: *App, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+        const filter = try app.peekPaletteInputArena(ctx.arena);
         var content: provider_picker.Content = .{
             .state = app.pickers.provider,
             .codex_signed_in = app.isCodexSignedIn(),
@@ -396,6 +397,9 @@ const OverlayInner = struct {
             .statuses = &app.provider_state.conn_status,
             .key_input = app.input_buffers.provider_key.items,
             .api_keys = &app.provider_state.api_keys,
+            .filter = filter,
+            .highlight_enabled = app.cached_config.tui.fuzzy_highlight,
+            .highlight_style = app.cached_config.tui.fuzzy_highlight_style,
         };
         return content.widget().draw(ctx);
     }
