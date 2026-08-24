@@ -260,6 +260,87 @@ const Macos = struct {
     }
 };
 
+test "save_returnsErrorUnsupported_whenBackendIsUnsupported" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const service = "NovaTest";
+    const account = "account";
+    const secret = "secret";
+
+    // Act
+    const err = Unsupported.save(gpa, service, account, secret);
+
+    // Assert
+    try std.testing.expectError(error.Unsupported, err);
+}
+
+test "loadAndDelete_returnsErrorUnsupported_whenBackendIsUnsupported" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const service = "NovaTest";
+    const account = "account";
+
+    // Act & Assert
+    try std.testing.expectError(error.Unsupported, Unsupported.load(gpa, service, account));
+    try std.testing.expectError(error.Unsupported, Unsupported.delete(gpa, service, account));
+}
+
+test "save_returnsBackendError_whenWindowsSecretExceedsMaxSize" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const service = "NovaTest";
+    const account = "account";
+    const oversized_secret = "x" ** (Windows.max_blob_bytes + 1);
+
+    // Act
+    const err = Windows.save(gpa, service, account, oversized_secret);
+
+    // Assert
+    try std.testing.expectError(error.Backend, err);
+}
+
+test "save_overwritesExistingSecret_whenSavingSameServiceAndAccount" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const service = "Nova Test";
+    const account = "cli|keyringtest_overwrite";
+    _ = delete(gpa, service, account) catch {};
+    defer _ = delete(gpa, service, account) catch {};
+
+    save(gpa, service, account, "initial-secret") catch |err| switch (err) {
+        error.Unsupported, error.Backend => return,
+        else => return err,
+    };
+
+    // Act
+    try save(gpa, service, account, "updated-secret");
+
+    // Assert
+    const loaded = (try load(gpa, service, account)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings("updated-secret", loaded);
+}
+
+test "save_succeedsWithEmptySecret_whenEmptyStringProvided" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const service = "Nova Test";
+    const account = "cli|keyringtest_empty";
+    _ = delete(gpa, service, account) catch {};
+    defer _ = delete(gpa, service, account) catch {};
+
+    // Act
+    save(gpa, service, account, "") catch |err| switch (err) {
+        error.Unsupported, error.Backend => return,
+        else => return err,
+    };
+
+    // Assert
+    const loaded = (try load(gpa, service, account)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings("", loaded);
+}
+
 test "keyring round-trips a secret on supported platforms" {
     const gpa = std.testing.allocator;
     const service = "Nova Test";
