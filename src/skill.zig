@@ -288,11 +288,34 @@ fn loadFromDir(gpa: std.mem.Allocator, io: std.Io, dir_path: []const u8, include
         else => log.warn("skipping skill {s}: {s}", .{ skill_path, @errorName(err) }),
     }
 
+    const EntryItem = struct {
+        name: []u8,
+        kind: std.Io.File.Kind,
+    };
+    var entries: std.ArrayList(EntryItem) = .empty;
+    defer {
+        for (entries.items) |e| gpa.free(e.name);
+        entries.deinit(gpa);
+    }
+
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.name.len == 0) continue;
         if (entry.name[0] == '.') continue;
         if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+        try entries.append(gpa, .{
+            .name = try gpa.dupe(u8, entry.name),
+            .kind = entry.kind,
+        });
+    }
+
+    std.mem.sort(EntryItem, entries.items, {}, struct {
+        fn lessThan(_: void, a: EntryItem, b: EntryItem) bool {
+            return std.ascii.lessThanIgnoreCase(a.name, b.name);
+        }
+    }.lessThan);
+
+    for (entries.items) |entry| {
         const child = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
         defer gpa.free(child);
         switch (entry.kind) {

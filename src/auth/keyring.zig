@@ -26,20 +26,32 @@ const impl = switch (os.tag) {
     else => Unsupported,
 };
 
+fn loadImpl(comptime Backend: type, gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!?[]u8 {
+    return Backend.load(gpa, service, account);
+}
+
+fn saveImpl(comptime Backend: type, gpa: std.mem.Allocator, service: []const u8, account: []const u8, secret: []const u8) Error!void {
+    return Backend.save(gpa, service, account, secret);
+}
+
+fn deleteImpl(comptime Backend: type, gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!bool {
+    return Backend.delete(gpa, service, account);
+}
+
 /// Read the secret for `service`/`account`. Returns gpa-owned bytes, or null
 /// when no such entry exists.
 pub fn load(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!?[]u8 {
-    return impl.load(gpa, service, account);
+    return loadImpl(impl, gpa, service, account);
 }
 
 /// Create or replace the secret for `service`/`account`.
 pub fn save(gpa: std.mem.Allocator, service: []const u8, account: []const u8, secret: []const u8) Error!void {
-    return impl.save(gpa, service, account, secret);
+    return saveImpl(impl, gpa, service, account, secret);
 }
 
 /// Remove the secret. Returns true when an entry was actually deleted.
 pub fn delete(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!bool {
-    return impl.delete(gpa, service, account);
+    return deleteImpl(impl, gpa, service, account);
 }
 
 const Unsupported = struct {
@@ -286,4 +298,184 @@ test "keyring round-trips a secret on supported platforms" {
 
     try std.testing.expect(try delete(gpa, service, account));
     try std.testing.expect((try load(gpa, service, account)) == null);
+}
+
+// --- Mock Backends for Testing -----------------------------------------------
+
+const MockBackend = struct {
+    var storage: std.StringArrayHashMapUnmanaged([]u8) = .empty;
+
+    fn reset(gpa: std.mem.Allocator) void {
+        var it = storage.iterator();
+        while (it.next()) |entry| {
+            gpa.free(entry.key_ptr.*);
+            gpa.free(entry.value_ptr.*);
+        }
+        storage.deinit(gpa);
+        storage = .empty;
+    }
+
+    fn makeKey(gpa: std.mem.Allocator, service: []const u8, account: []const u8) ![]u8 {
+        return std.fmt.allocPrint(gpa, "{s}:{s}", .{ service, account });
+    }
+
+    fn load(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!?[]u8 {
+        const key = try makeKey(gpa, service, account);
+        defer gpa.free(key);
+        if (storage.get(key)) |val| {
+            return try gpa.dupe(u8, val);
+        }
+        return null;
+    }
+
+    fn save(gpa: std.mem.Allocator, service: []const u8, account: []const u8, secret: []const u8) Error!void {
+        const key = try makeKey(gpa, service, account);
+        defer gpa.free(key);
+        if (storage.fetchOrderedRemove(key)) |kv| {
+            gpa.free(kv.key);
+            gpa.free(kv.value);
+        }
+        const owned_key = try gpa.dupe(u8, key);
+        errdefer gpa.free(owned_key);
+        const owned_val = try gpa.dupe(u8, secret);
+        errdefer gpa.free(owned_val);
+        try storage.put(gpa, owned_key, owned_val);
+    }
+
+    fn delete(gpa: std.mem.Allocator, service: []const u8, account: []const u8) Error!bool {
+        const key = try makeKey(gpa, service, account);
+        defer gpa.free(key);
+        if (storage.fetchOrderedRemove(key)) |kv| {
+            gpa.free(kv.key);
+            gpa.free(kv.value);
+            return true;
+        }
+        return false;
+    }
+};
+
+const FailureMockBackend = struct {
+    fn load(_: std.mem.Allocator, _: []const u8, _: []const u8) Error!?[]u8 {
+        return error.Backend;
+    }
+    fn save(_: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) Error!void {
+        return error.Backend;
+    }
+    fn delete(_: std.mem.Allocator, _: []const u8, _: []const u8) Error!bool {
+        return error.Backend;
+    }
+};
+
+test "returnsErrorUnsupported_whenBackendIsUnsupported" {
+    // Arrange
+    const gpa = std.testing.allocator;
+
+    // Act & Assert
+    try std.testing.expectError(error.Unsupported, loadImpl(Unsupported, gpa, "Nova", "user1"));
+    try std.testing.expectError(error.Unsupported, saveImpl(Unsupported, gpa, "Nova", "user1", "secret"));
+    try std.testing.expectError(error.Unsupported, deleteImpl(Unsupported, gpa, "Nova", "user1"));
+}
+
+test "returnsNull_whenNoSecretExists" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    MockBackend.reset(gpa);
+    defer MockBackend.reset(gpa);
+
+    // Act
+    const result = try loadImpl(MockBackend, gpa, "Nova", "nonexistent");
+
+    // Assert
+    try std.testing.expectEqual(@as(?[]u8, null), result);
+}
+
+test "returnsSecret_whenEntryExists" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    MockBackend.reset(gpa);
+    defer MockBackend.reset(gpa);
+    try saveImpl(MockBackend, gpa, "Nova", "user1", "secret123");
+
+    // Act
+    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+
+    // Assert
+    try std.testing.expect(loaded != null);
+    defer gpa.free(loaded.?);
+    try std.testing.expectEqualStrings("secret123", loaded.?);
+}
+
+test "overwritesSecret_whenEntryAlreadyExists" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    MockBackend.reset(gpa);
+    defer MockBackend.reset(gpa);
+    try saveImpl(MockBackend, gpa, "Nova", "user1", "initial_secret");
+
+    // Act
+    try saveImpl(MockBackend, gpa, "Nova", "user1", "updated_secret");
+    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+
+    // Assert
+    try std.testing.expect(loaded != null);
+    defer gpa.free(loaded.?);
+    try std.testing.expectEqualStrings("updated_secret", loaded.?);
+}
+
+test "deletesEntry_andReturnsNullOnSubsequentLoad" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    MockBackend.reset(gpa);
+    defer MockBackend.reset(gpa);
+    try saveImpl(MockBackend, gpa, "Nova", "user1", "secret_to_delete");
+
+    // Act
+    const deleted = try deleteImpl(MockBackend, gpa, "Nova", "user1");
+    const loaded = try loadImpl(MockBackend, gpa, "Nova", "user1");
+
+    // Assert
+    try std.testing.expect(deleted);
+    try std.testing.expectEqual(@as(?[]u8, null), loaded);
+
+    // Deleting again returns false
+    const delete_again = try deleteImpl(MockBackend, gpa, "Nova", "user1");
+    try std.testing.expect(!delete_again);
+}
+
+test "returnsError_whenBackendFails" {
+    // Arrange
+    const gpa = std.testing.allocator;
+
+    // Act & Assert
+    try std.testing.expectError(error.Backend, loadImpl(FailureMockBackend, gpa, "Nova", "user1"));
+    try std.testing.expectError(error.Backend, saveImpl(FailureMockBackend, gpa, "Nova", "user1", "secret"));
+    try std.testing.expectError(error.Backend, deleteImpl(FailureMockBackend, gpa, "Nova", "user1"));
+}
+
+test "formatsWindowsTargetName_asUtf16LeWithColon" {
+    // Arrange
+    const gpa = std.testing.allocator;
+
+    // Act
+    const target = try Windows.targetName(gpa, "Nova", "account1");
+    defer gpa.free(target);
+
+    // Assert: UTF-16 representation of "Nova:account1"
+    const expected_utf8 = "Nova:account1";
+    const expected_utf16 = try std.unicode.utf8ToUtf16LeAllocZ(gpa, expected_utf8);
+    defer gpa.free(expected_utf16);
+
+    try std.testing.expectEqualSlices(u16, expected_utf16, target);
+}
+
+test "rejectsOversizedSecret_onWindowsSave" {
+    if (comptime !os.is_windows) return;
+    // Arrange
+    const gpa = std.testing.allocator;
+    const oversized_secret = try gpa.alloc(u8, Windows.max_blob_bytes + 1);
+    defer gpa.free(oversized_secret);
+    @memset(oversized_secret, 'x');
+
+    // Act & Assert
+    try std.testing.expectError(error.Backend, saveImpl(Windows, gpa, "Nova", "account1", oversized_secret));
 }
