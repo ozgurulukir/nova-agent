@@ -60,6 +60,10 @@ pub const ResponsesConfig = struct {
     /// upstream clients never re-send them (openai/codex#25290, pi#6023) —
     /// so this transport opts out and relies on summaries only.
     include_encrypted_reasoning: bool = true,
+    /// Remove encrypted reasoning from replayed history before serialization.
+    /// This is transport-specific and therefore independent of whether the
+    /// current request asks the server to include encrypted reasoning.
+    scrub_encrypted_reasoning: bool = false,
     log_name: []const u8 = "standard",
 };
 

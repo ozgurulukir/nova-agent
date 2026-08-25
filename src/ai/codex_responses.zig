@@ -32,6 +32,7 @@ const codex_responses_config: core.ResponsesConfig = .{
     // The ChatGPT Codex backend rejects replayed encrypted reasoning blobs
     // with a misleading 400 (see include_encrypted_reasoning doc comment).
     .include_encrypted_reasoning = false,
+    .scrub_encrypted_reasoning = true,
     .headers = &.{
         .{ .name = "accept", .value = .{ .literal = http.media_type_event_stream } },
         .{ .name = "chatgpt-account-id", .value = .account_id },

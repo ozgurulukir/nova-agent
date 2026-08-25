@@ -30,7 +30,13 @@ pub fn writeRequestPayload(
     for (messages) |*view| {
         if (config.system_prompt.len > 0 and view.message().* == .system) continue;
         if (written > 0) try out.writeByte(',');
-        try writeInputMessage(out, view.message().*, gpa, responses_config.log_name);
+        try writeInputMessage(
+            out,
+            view.message().*,
+            gpa,
+            responses_config.log_name,
+            responses_config.scrub_encrypted_reasoning,
+        );
         written += 1;
     }
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
@@ -96,9 +102,10 @@ fn writeInputMessage(
     message: ai.ChatMessage,
     gpa: std.mem.Allocator,
     log_name: []const u8,
+    scrub_encrypted_reasoning: bool,
 ) !void {
     switch (message) {
-        .assistant => return writeAssistantItems(out, message, gpa, log_name),
+        .assistant => return writeAssistantItems(out, message, gpa, log_name, scrub_encrypted_reasoning),
         .tool => return writeToolOutput(out, message),
         .system => {
             try out.writeAll("{\"type\":\"message\",\"role\":\"system\",\"content\":");
@@ -159,6 +166,7 @@ fn writeAssistantItems(
     message: ai.ChatMessage,
     gpa: std.mem.Allocator,
     log_name: []const u8,
+    scrub_encrypted_reasoning: bool,
 ) !void {
     var first = true;
     for (message.assistant.content) |block| {
@@ -177,10 +185,14 @@ fn writeAssistantItems(
             },
             .reasoning => |reasoning| {
                 if (reasoning.responses_item_json) |json| {
-                    if (scrubEncryptedContent(gpa, json)) |clean| {
-                        defer gpa.free(clean);
-                        log.info("responses.replay.scrubbed_encrypted_content client={s}", .{log_name});
-                        try out.writeAll(clean);
+                    if (scrub_encrypted_reasoning) {
+                        if (scrubEncryptedContent(gpa, json)) |clean| {
+                            defer gpa.free(clean);
+                            log.info("responses.replay.scrubbed_encrypted_content client={s}", .{log_name});
+                            try out.writeAll(clean);
+                        } else {
+                            try out.writeAll(json);
+                        }
                     } else {
                         try out.writeAll(json);
                     }
@@ -670,11 +682,18 @@ test "writeRequestPayload scrubs encrypted_content from replayed reasoning items
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
 
-    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{
+        .include_encrypted_reasoning = false,
+        .scrub_encrypted_reasoning = true,
+    }, &views, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "gAAAAABsecret") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"rs_x\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "**Planning**") != null);
+
+    payload.clearRetainingCapacity();
+    try writeRequestPayload(&payload.writer, gpa, config, .{ .include_encrypted_reasoning = true }, &views, "[]");
+    try std.testing.expect(std.mem.indexOf(u8, payload.written(), "gAAAAABsecret") != null);
 }
 
 test "scrubEncryptedContent passes through malformed json as null" {
