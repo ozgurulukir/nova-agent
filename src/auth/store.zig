@@ -497,6 +497,71 @@ test "freeApiKeyMap frees key and value memory for populated map" {
     freeApiKeyMap(gpa, &map);
 }
 
+test "writeBlob falls back to auth.json when keyring save fails or is unsupported" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-writeblob-fallback-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    const secret_payload = "{\"apiKeys\":{\"openrouter\":\"or-key-12345\"}}";
+
+    // Act
+    try writeBlob(gpa, io, home_dir, secret_payload);
+
+    // Assert
+    const loaded = (try readBlob(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualStrings(secret_payload, loaded);
+
+    // Verify plaintext fallback file auth.json exists when keyring falls back to file
+    const file_bytes = (try readBlobFile(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(file_bytes);
+    try std.testing.expectEqualStrings(secret_payload, file_bytes);
+}
+
+test "writeBlob handles large payload triggering keyring error and falls back to auth.json" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-writeblob-large-payload-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    // Generate a payload exceeding 2560 bytes (Windows keyring max blob size limit)
+    const large_payload = try gpa.alloc(u8, 3000);
+    defer gpa.free(large_payload);
+    @memset(large_payload, 'a');
+
+    // Act
+    try writeBlob(gpa, io, home_dir, large_payload);
+
+    // Assert
+    const loaded = (try readBlob(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(loaded);
+    try std.testing.expectEqualSlices(u8, large_payload, loaded);
+}
+
+test "deleteBlob handles keyring delete failure and removes auth.json file" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-deleteblob-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    const payload = "{\"apiKeys\":{\"test\":\"key\"}}";
+    try writeBlobFile(gpa, io, home_dir, payload);
+
+    const initial = (try readBlobFile(gpa, io, home_dir)) orelse return error.TestUnexpectedResult;
+    defer gpa.free(initial);
+    try std.testing.expectEqualStrings(payload, initial);
+
+    // Act
+    try deleteBlob(gpa, io, home_dir);
+
+    // Assert
+    const after = try readBlobFile(gpa, io, home_dir);
+    try std.testing.expect(after == null);
+}
 
 test "pruneOrphanKeys removes unknown provider keys while keeping valid ones and codex credentials" {
     // Arrange
