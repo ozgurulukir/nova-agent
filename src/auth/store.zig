@@ -562,3 +562,126 @@ test "deleteBlob handles keyring delete failure and removes auth.json file" {
     const after = try readBlobFile(gpa, io, home_dir);
     try std.testing.expect(after == null);
 }
+
+test "pruneOrphanKeys removes unknown provider keys while keeping valid ones and codex credentials" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-auth-prune-test-1";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    const creds = Credentials{
+        .access = try gpa.dupe(u8, "access_token"),
+        .refresh = try gpa.dupe(u8, "refresh_token"),
+        .account_id = try gpa.dupe(u8, "account_123"),
+        .expires = 123456789,
+    };
+    var creds_copy = creds;
+    defer creds_copy.deinit(gpa);
+    try saveCredentials(gpa, io, home_dir, creds);
+
+    try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-valid");
+    try saveProviderApiKey(gpa, io, home_dir, "openai", "sk-valid");
+    try saveProviderApiKey(gpa, io, home_dir, "deprecated_provider", "key-orphan-1");
+    try saveProviderApiKey(gpa, io, home_dir, "old_custom", "key-orphan-2");
+
+    const valid_names = [_][]const u8{ "cerebras", "openai", "anthropic" };
+
+    // Act
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+
+    // Assert
+    try std.testing.expectEqual(@as(u32, 2), removed_count);
+
+    const cerebras_key = try loadProviderApiKey(gpa, io, home_dir, "cerebras");
+    defer if (cerebras_key) |k| gpa.free(k);
+    try std.testing.expectEqualStrings("csk-valid", cerebras_key.?);
+
+    const openai_key = try loadProviderApiKey(gpa, io, home_dir, "openai");
+    defer if (openai_key) |k| gpa.free(k);
+    try std.testing.expectEqualStrings("sk-valid", openai_key.?);
+
+    const orphan1 = try loadProviderApiKey(gpa, io, home_dir, "deprecated_provider");
+    try std.testing.expect(orphan1 == null);
+
+    const orphan2 = try loadProviderApiKey(gpa, io, home_dir, "old_custom");
+    try std.testing.expect(orphan2 == null);
+
+    var loaded_creds = (try loadCredentials(gpa, io, home_dir)).?;
+    defer loaded_creds.deinit(gpa);
+    try std.testing.expectEqualStrings("access_token", loaded_creds.access);
+    try std.testing.expectEqualStrings("refresh_token", loaded_creds.refresh);
+    try std.testing.expectEqualStrings("account_123", loaded_creds.account_id);
+    try std.testing.expectEqual(@as(i64, 123456789), loaded_creds.expires);
+}
+
+test "pruneOrphanKeys returns zero when no orphan keys exist" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-auth-prune-test-2";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-1");
+    try saveProviderApiKey(gpa, io, home_dir, "openai", "sk-2");
+
+    const valid_names = [_][]const u8{ "cerebras", "openai", "anthropic" };
+
+    // Act
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+
+    // Assert
+    try std.testing.expectEqual(@as(u32, 0), removed_count);
+
+    const cerebras_key = try loadProviderApiKey(gpa, io, home_dir, "cerebras");
+    defer if (cerebras_key) |k| gpa.free(k);
+    try std.testing.expectEqualStrings("csk-1", cerebras_key.?);
+
+    const openai_key = try loadProviderApiKey(gpa, io, home_dir, "openai");
+    defer if (openai_key) |k| gpa.free(k);
+    try std.testing.expectEqualStrings("sk-2", openai_key.?);
+}
+
+test "pruneOrphanKeys returns zero when no provider keys are stored" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-auth-prune-test-3";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    const valid_names = [_][]const u8{"cerebras"};
+
+    // Act
+    const removed_count = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+
+    // Assert
+    try std.testing.expectEqual(@as(u32, 0), removed_count);
+}
+
+test "pruneOrphanKeys is idempotent" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-auth-prune-test-4";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-valid");
+    try saveProviderApiKey(gpa, io, home_dir, "orphan_key", "key-orphan");
+
+    const valid_names = [_][]const u8{"cerebras"};
+
+    // Act
+    const first_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+    const second_run = try pruneOrphanKeys(gpa, io, home_dir, &valid_names);
+
+    // Assert
+    try std.testing.expectEqual(@as(u32, 1), first_run);
+    try std.testing.expectEqual(@as(u32, 0), second_run);
+
+    const cerebras_key = try loadProviderApiKey(gpa, io, home_dir, "cerebras");
+    defer if (cerebras_key) |k| gpa.free(k);
+    try std.testing.expectEqualStrings("csk-valid", cerebras_key.?);
+
+    const orphan = try loadProviderApiKey(gpa, io, home_dir, "orphan_key");
+    try std.testing.expect(orphan == null);
+}

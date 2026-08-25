@@ -411,6 +411,7 @@ pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
     const owned_query = try gpa.dupe(u8, request.query);
     errdefer gpa.free(owned_query);
     const done_ptr = try gpa.create(std.atomic.Value(bool));
+    errdefer gpa.destroy(done_ptr);
     done_ptr.* = .init(false);
 
     // Copy the ready slab so the task owns its data. This lets deinit/restart
@@ -420,12 +421,7 @@ pub fn queryAsync(gpa: std.mem.Allocator, io: std.Io, request: Request) !void {
     const files_copy = try gpa.dupe(u8, files);
     errdefer gpa.free(files_copy);
 
-    const future = io.concurrent(searchTask, .{ gpa, files_copy, count, owned_query, done_ptr }) catch |err| {
-        gpa.destroy(done_ptr);
-        gpa.free(owned_query);
-        gpa.free(files_copy);
-        return err;
-    };
+    const future = try io.concurrent(searchTask, .{ gpa, files_copy, count, owned_query, done_ptr });
     backend.search = .{ .running = .{
         .future = future,
         .done = done_ptr,
@@ -908,4 +904,62 @@ test "async empty query returns results" {
 
     try std.testing.expect(result.stdout.len > 0);
     try std.testing.expect(result.status == .ok);
+}
+
+fn failingConcurrent(
+    userdata: ?*anyopaque,
+    result_len: usize,
+    result_alignment: std.mem.Alignment,
+    context: []const u8,
+    context_alignment: std.mem.Alignment,
+    start_fn: *const fn (context: *const anyopaque, result: *anyopaque) void,
+) std.Io.ConcurrentError!*std.Io.AnyFuture {
+    _ = userdata;
+    _ = result_len;
+    _ = result_alignment;
+    _ = context;
+    _ = context_alignment;
+    _ = start_fn;
+    return error.ConcurrencyUnavailable;
+}
+
+test "start_whenConcurrentFails_transitionsToFailedState" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.concurrent = failingConcurrent;
+    const failing_io: std.Io = .{
+        .userdata = std.testing.io.userdata,
+        .vtable = &mock_vtable,
+    };
+
+    // Act
+    start(gpa, failing_io, ".");
+    defer deinit(gpa, std.testing.io);
+
+    // Assert
+    const msg = backend.lastFailure(gpa) orelse return error.TestExpectedFailureMessage;
+    defer gpa.free(msg);
+    try std.testing.expectEqualStrings("ConcurrencyUnavailable", msg);
+}
+
+test "queryAsync_whenConcurrentFails_returnsError" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    var mock_vtable = std.testing.io.vtable.*;
+    mock_vtable.concurrent = failingConcurrent;
+    const failing_io: std.Io = .{
+        .userdata = std.testing.io.userdata,
+        .vtable = &mock_vtable,
+    };
+
+    const files_slab = try gpa.dupe(u8, "main.zig\x00lib.zig\x00");
+    backend.state = .{ .ready = .{ .files = files_slab, .count = 2 } };
+    defer deinit(gpa, std.testing.io);
+
+    // Act & Assert
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        queryAsync(gpa, failing_io, .{ .op = .find, .query = "main" }),
+    );
 }
