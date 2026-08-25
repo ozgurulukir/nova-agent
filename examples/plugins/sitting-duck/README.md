@@ -10,7 +10,7 @@ syntax trees as SQL tables — so structural questions ("where are all the
 | Tool | What it does |
 |------|--------------|
 | `ast_outline` | glob → symbol list with `node_id` handles |
-| `ast_find_pattern` | structural search: code-skeleton patterns with `__NAME__` wildcards (zig: `fn __FN__(__) void {}`, python: `def __F__(__):`) |
+| `ast_find_pattern` | structural search: code-skeleton patterns with `__NAME__` wildcards (zig: `fn __FN__(__) void {}`, python: `def __F__(__):`, ruby: `def __FN__(__)`) |
 | `ast_get_source` | `node_id` → numbered source snippet |
 | `ast_query` | read-only SQL over `read_ast()` (single `SELECT`/`WITH`) |
 

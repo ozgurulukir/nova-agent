@@ -473,6 +473,13 @@ test.describe("find_pattern", function()
     test.assert.is_true(sql:find("LOAD sitting_duck;", 1, true) ~= nil)
   end)
 
+  test.it("infers ruby from rb glob", function()
+    fresh()
+    script_ok()
+    registered.ast_find_pattern.handler({ pattern = "def __FN__(__)", glob = "lib/**/*.rb" })
+    test.assert.is_true(sql_log[2]:find("ast_match('lib/**/*.rb', 'def __FN__(__)', 'ruby')", 1, true) ~= nil)
+  end)
+
   test.it("explicit language overrides glob inference", function()
     fresh()
     script_ok()

@@ -671,8 +671,9 @@ nova.register_tool({
     .. " (anonymous); every literal in the skeleton must match exactly."
     .. " Examples: zig 'fn __FN__(__) void {}' finds void-returning"
     .. " functions (zig skeletons need the return type to parse), python"
-    .. " 'def __F__(__):'. language is inferred from the glob's extension"
-    .. " (.zig → zig, .py → python, ...) or passed explicitly. Returns one"
+    .. " 'def __F__(__):', ruby 'def __FN__(__)'. language is inferred from"
+    .. " the glob's extension (.zig → zig, .py → python, .rb → ruby, ...)"
+    .. " or passed explicitly. Returns one"
     .. " row per match: file, line span, captures, and the matched root's"
     .. " node_id — usable with ast_get_source. Requires the duckdb CLI"
     .. " (plugins.sitting-duck.settings.duckdb_path / NOVA_SITTING_DUCK_BIN"
@@ -682,8 +683,8 @@ nova.register_tool({
     pattern = {
       type = "string",
       description = "Code skeleton in the target language with __NAME__"
-        .. " wildcards, e.g. 'fn __FN__(__) void {}' (zig) or"
-        .. " 'def __F__(__):' (python)",
+        .. " wildcards, e.g. 'fn __FN__(__) void {}' (zig),"
+        .. " 'def __F__(__):' (python), or 'def __FN__(__)' (ruby)",
     },
     glob = {
       type = "string",
@@ -694,7 +695,7 @@ nova.register_tool({
     language = {
       type = "string",
       optional = true,
-      description = "sitting_duck language name (zig, python, typescript,"
+      description = "sitting_duck language name (zig, python, ruby, typescript,"
         .. " ...). Inferred from the glob's extension when omitted;"
         .. " required for extension-less globs like '**/*'",
     },
