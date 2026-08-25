@@ -909,3 +909,23 @@ test "async empty query returns results" {
     try std.testing.expect(result.stdout.len > 0);
     try std.testing.expect(result.status == .ok);
 }
+
+test "initBackend walkSelectively failure returns failed outcome" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var failing_allocator = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const failing_gpa = failing_allocator.allocator();
+
+    const cwd_duped = try gpa.dupe(u8, ".");
+    var done = std.atomic.Value(bool).init(false);
+
+    var outcome = initBackend(failing_gpa, io, cwd_duped, &done);
+    defer outcome.deinit(failing_gpa);
+
+    try std.testing.expect(done.load(.monotonic));
+    switch (outcome) {
+        .failed => |msg| try std.testing.expectEqualStrings("", msg),
+        else => return error.TestExpectedFailedOutcome,
+    }
+}
