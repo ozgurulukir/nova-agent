@@ -29,6 +29,9 @@ const websocket_watchdog_poll_ms: u32 = 250;
 const codex_responses_config: core.ResponsesConfig = .{
     .base_url_mode = .raw,
     .endpoint_path = "/codex/responses",
+    // The ChatGPT Codex backend rejects replayed encrypted reasoning blobs
+    // with a misleading 400 (see include_encrypted_reasoning doc comment).
+    .include_encrypted_reasoning = false,
     .headers = &.{
         .{ .name = "accept", .value = .{ .literal = http.media_type_event_stream } },
         .{ .name = "chatgpt-account-id", .value = .account_id },
@@ -124,7 +127,7 @@ pub const Client = struct {
         try body.writer.writeAll("{\"type\":\"response.create\",");
         var payload: std.Io.Writer.Allocating = .init(gpa);
         defer payload.deinit();
-        try core.writeRequestPayload(&payload.writer, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
+        try core.writeRequestPayload(&payload.writer, self.core_client.gpa, self.core_client.config, self.core_client.responses_config, messages, self.core_client.tools_json);
         try body.writer.writeAll(payload.written()[1..]);
         log.info("codex.websocket.request.body {s}", .{http.logBytesHead(body.written())});
         try client.writeText(body.written());

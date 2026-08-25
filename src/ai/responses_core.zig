@@ -53,6 +53,13 @@ pub const ResponsesConfig = struct {
     user_agent: ?[]const u8 = null,
     text_verbosity: ?[]const u8 = null,
     parallel_tool_calls: ?bool = null,
+    /// Request `reasoning.encrypted_content` in the include array. Keep true
+    /// for the plain Responses API (stateless replay needs the blob). The
+    /// ChatGPT Codex backend rejects replayed encrypted reasoning items with
+    /// a confusing 400 ("expected an object, but got an integer"), and
+    /// upstream clients never re-send them (openai/codex#25290, pi#6023) —
+    /// so this transport opts out and relies on summaries only.
+    include_encrypted_reasoning: bool = true,
     log_name: []const u8 = "standard",
 };
 
@@ -159,7 +166,7 @@ pub const Client = struct {
 
         var payload: std.Io.Writer.Allocating = .init(self.gpa);
         defer payload.deinit();
-        try writeRequestPayload(&payload.writer, self.config, self.responses_config, messages, self.tools_json);
+        try writeRequestPayload(&payload.writer, self.gpa, self.config, self.responses_config, messages, self.tools_json);
         log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, http.logBytesHead(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;

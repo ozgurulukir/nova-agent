@@ -13,8 +13,11 @@ const stream_parser = @import("stream_parser.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_mod = @import("../tools.zig");
 
+const log = std.log.scoped(.ai);
+
 pub fn writeRequestPayload(
     out: *std.Io.Writer,
+    gpa: std.mem.Allocator,
     config: ai.Config,
     responses_config: responses_core.ResponsesConfig,
     messages: []const ai.MessageView,
@@ -27,7 +30,7 @@ pub fn writeRequestPayload(
     for (messages) |*view| {
         if (config.system_prompt.len > 0 and view.message().* == .system) continue;
         if (written > 0) try out.writeByte(',');
-        try writeInputMessage(out, view.message().*);
+        try writeInputMessage(out, view.message().*, gpa, responses_config.log_name);
         written += 1;
     }
     try out.writeAll("],\"stream\":true,\"store\":false,\"tools\":");
@@ -76,16 +79,26 @@ pub fn writeRequestPayload(
             try std.json.Stringify.value(summary.label(), .{}, out);
         }
         // When effort is `.default` and summary is null, this object is empty
-        // ("reasoning":{}). That is expected: the include array below is the
-        // only reason the reasoning block is emitted at all.
-        try out.writeAll("},\"include\":[\"reasoning.encrypted_content\"]");
+        // ("reasoning":{}). With include_encrypted_reasoning=false (Codex) the
+        // include array is omitted — the reasoning object itself (effort and
+        // summary) is still sent, only the encrypted blob is never requested.
+        if (responses_config.include_encrypted_reasoning) {
+            try out.writeAll("},\"include\":[\"reasoning.encrypted_content\"]");
+        } else {
+            try out.writeByte('}');
+        }
     }
     try out.writeByte('}');
 }
 
-fn writeInputMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+fn writeInputMessage(
+    out: *std.Io.Writer,
+    message: ai.ChatMessage,
+    gpa: std.mem.Allocator,
+    log_name: []const u8,
+) !void {
     switch (message) {
-        .assistant => return writeAssistantItems(out, message),
+        .assistant => return writeAssistantItems(out, message, gpa, log_name),
         .tool => return writeToolOutput(out, message),
         .system => {
             try out.writeAll("{\"type\":\"message\",\"role\":\"system\",\"content\":");
@@ -100,7 +113,53 @@ fn writeInputMessage(out: *std.Io.Writer, message: ai.ChatMessage) !void {
     }
 }
 
-fn writeAssistantItems(out: *std.Io.Writer, message: ai.ChatMessage) !void {
+/// Copy `json` with any top-level `"encrypted_content"` field removed.
+/// Returns null when the input carries no such field (caller falls back to
+/// writing the original bytes) or on any parse/serialize failure (never
+/// reject replayed history over a scrub failure — upstream guidance is
+/// skip-not-fail, openai/codex#25290).
+fn scrubEncryptedContent(
+    gpa: std.mem.Allocator,
+    json: []const u8,
+) ?[]u8 {
+    return scrubEncryptedContentOrError(gpa, json) catch null;
+}
+
+fn scrubEncryptedContentOrError(
+    gpa: std.mem.Allocator,
+    json: []const u8,
+) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    if (!obj.contains("encrypted_content")) return null;
+    // Re-serialize by iteration instead of removing through a map copy:
+    // mutating a copied ArrayHashMap corrupts state shared with the original.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    errdefer buf.deinit();
+    const w = &buf.writer;
+    try w.writeByte('{');
+    var it = obj.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "encrypted_content")) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, w);
+        try w.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, w);
+    }
+    try w.writeByte('}');
+    return try buf.toOwnedSlice();
+}
+
+fn writeAssistantItems(
+    out: *std.Io.Writer,
+    message: ai.ChatMessage,
+    gpa: std.mem.Allocator,
+    log_name: []const u8,
+) !void {
     var first = true;
     for (message.assistant.content) |block| {
         if (!first) try out.writeByte(',');
@@ -118,7 +177,13 @@ fn writeAssistantItems(out: *std.Io.Writer, message: ai.ChatMessage) !void {
             },
             .reasoning => |reasoning| {
                 if (reasoning.responses_item_json) |json| {
-                    try out.writeAll(json);
+                    if (scrubEncryptedContent(gpa, json)) |clean| {
+                        defer gpa.free(clean);
+                        log.info("responses.replay.scrubbed_encrypted_content client={s}", .{log_name});
+                        try out.writeAll(clean);
+                    } else {
+                        try out.writeAll(json);
+                    }
                 } else {
                     try out.writeAll("{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":");
                     try std.json.Stringify.value(reasoning.text, .{}, out);
@@ -200,7 +265,7 @@ test "writeRequestPayload puts system prompt in instructions for standard mode" 
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{.{ .borrowed = &system_message }}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{.{ .borrowed = &system_message }}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-abc\"") != null);
@@ -221,7 +286,7 @@ test "writeRequestPayload keeps configured verbosity hint" {
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{ .text_verbosity = "low", .parallel_tool_calls = true }, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{ .text_verbosity = "low", .parallel_tool_calls = true }, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-xyz\"") != null);
@@ -241,7 +306,7 @@ test "writeRequestPayload emits reasoning effort none" {
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"effort\":\"none\"}") != null);
 }
@@ -258,7 +323,7 @@ test "writeRequestPayload omits reasoning effort when set to default" {
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\"") == null);
 }
@@ -275,7 +340,7 @@ test "writeRequestPayload emits reasoning summary even with default effort (Resp
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{\"summary\":\"detailed\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "effort") == null);
@@ -293,7 +358,7 @@ test "writeRequestPayload omits prompt_cache_key when no session id is set" {
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"You are Nova.\"") != null);
@@ -315,7 +380,7 @@ test "writeRequestPayload omits prompt_cache_key when disable_prompt_cache is tr
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "prompt_cache_key") == null);
 }
@@ -355,7 +420,7 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &views, "[{\"type\":\"function\"}]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[{\"type\":\"function\"}]");
     const body = payload.written();
 
     // function_call call_id must be a string
@@ -382,7 +447,7 @@ test "writeRequestPayload clips xhigh reasoning effort for minimal dialect (Resp
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"max\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "xhigh") == null);
@@ -400,7 +465,7 @@ test "writeRequestPayload preserves xhigh reasoning effort for openai dialect (R
     };
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"xhigh\"") != null);
 }
@@ -482,7 +547,7 @@ test "writeRequestPayload handles empty messages and empty tools array" {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
 
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\":[]") != null);
@@ -508,7 +573,7 @@ test "writeRequestPayload skips system messages in history when config system_pr
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
 
-    try writeRequestPayload(&payload.writer, config, .{}, &views, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"instructions\":\"Global system instruction\"") != null);
     // History system message is skipped from input array
@@ -541,7 +606,7 @@ test "writeRequestPayload sanitizes empty tool call arguments to empty object" {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
 
-    try writeRequestPayload(&payload.writer, config, .{}, &views, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"arguments\":\"{}\"") != null);
 }
@@ -558,7 +623,62 @@ test "writeRequestPayload clips minimal reasoning effort for minimal dialect" {
     var payload: std.Io.Writer.Allocating = .init(gpa);
     defer payload.deinit();
 
-    try writeRequestPayload(&payload.writer, config, .{}, &.{}, "[]");
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &.{}, "[]");
     const body = payload.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"low\"") != null);
+}
+
+test "writeRequestPayload omits encrypted reasoning include when disabled" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-5.6-sol",
+        .reasoning = .{ .effort = .medium },
+    };
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    try writeRequestPayload(&payload.writer, gpa, config, .{ .include_encrypted_reasoning = false }, &.{}, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "encrypted_content") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"include\"") == null);
+    // The reasoning object itself must still be emitted for effort.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning\":{") != null);
+}
+
+test "writeRequestPayload scrubs encrypted_content from replayed reasoning items" {
+    const gpa = std.testing.allocator;
+    const config: ai.Config = .{
+        .base_url = "",
+        .api_key = "",
+        .model = "gpt-5.6-sol",
+        .reasoning = null,
+    };
+
+    const reasoning_blocks = try gpa.alloc(ai.ContentBlock, 1);
+    reasoning_blocks[0] = .{ .reasoning = .{
+        .text = try gpa.dupe(u8, "**Planning**"),
+        .responses_item_json = try gpa.dupe(u8, "{\"id\":\"rs_x\",\"type\":\"reasoning\",\"content\":[],\"encrypted_content\":\"gAAAAABsecret\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"**Planning**\"}]}"),
+    } };
+
+    var message = ai.ChatMessage{ .assistant = .{ .content = reasoning_blocks } };
+    // Owns the blocks array and every duped field — single teardown path.
+    defer message.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &message }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+
+    try writeRequestPayload(&payload.writer, gpa, config, .{}, &views, "[]");
+    const body = payload.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "gAAAAABsecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"rs_x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "**Planning**") != null);
+}
+
+test "scrubEncryptedContent passes through malformed json as null" {
+    const gpa = std.testing.allocator;
+    const clean = scrubEncryptedContent(gpa, "{not json at all");
+    try std.testing.expect(clean == null);
 }
