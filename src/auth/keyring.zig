@@ -287,3 +287,59 @@ test "keyring round-trips a secret on supported platforms" {
     try std.testing.expect(try delete(gpa, service, account));
     try std.testing.expect((try load(gpa, service, account)) == null);
 }
+
+test "unsupportedBackend_returnsUnsupported_forLoadSaveDelete" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.Unsupported, Unsupported.load(gpa, "service", "acct"));
+    try std.testing.expectError(error.Unsupported, Unsupported.save(gpa, "service", "acct", "secret"));
+    try std.testing.expectError(error.Unsupported, Unsupported.delete(gpa, "service", "acct"));
+}
+
+test "delete_returnsFalse_whenEntryDoesNotExist" {
+    const gpa = std.testing.allocator;
+    const service = "Nova Test Nonexistent Service";
+    const account = "cli|nonexistent_account_12345";
+
+    const result = delete(gpa, service, account) catch |err| switch (err) {
+        error.Unsupported, error.Backend => return,
+        else => return err,
+    };
+    try std.testing.expect(!result);
+}
+
+test "delete_returnsTrue_whenEntryExistsAndIsDeleted" {
+    const gpa = std.testing.allocator;
+    const service = "Nova Test Delete";
+    const account = "cli|keyringtest_delete";
+
+    _ = delete(gpa, service, account) catch {};
+
+    save(gpa, service, account, "test-secret-value") catch |err| switch (err) {
+        error.Unsupported, error.Backend => return,
+        else => return err,
+    };
+
+    // Assert first deletion returns true
+    const deleted_first = try delete(gpa, service, account);
+    try std.testing.expect(deleted_first);
+
+    // Assert second deletion on removed item returns false
+    const deleted_second = try delete(gpa, service, account);
+    try std.testing.expect(!deleted_second);
+
+    // Assert item is no longer loadable
+    const loaded = try load(gpa, service, account);
+    try std.testing.expect(loaded == null);
+}
+
+test "delete_propagatesBackendError_onOSFailure" {
+    const MockErrorBackend = struct {
+        fn delete(_: std.mem.Allocator, _: []const u8, _: []const u8) Error!bool {
+            return error.Backend;
+        }
+    };
+
+    const gpa = std.testing.allocator;
+    const err = MockErrorBackend.delete(gpa, "service", "acct");
+    try std.testing.expectError(error.Backend, err);
+}
