@@ -15,6 +15,11 @@ pub const default_codex_endpoint = "https://chatgpt.com/backend-api";
 /// the websocket handshake headers. The `originator` header below carries the
 /// same name as a separate literal — change them together.
 const codex_user_agent = "nova";
+
+/// Upstream Codex CLI identifies itself with a `version` request/handshake
+/// header alongside `originator`; send ours too so a future server-side
+/// enforcement of that field cannot 403 the whole transport.
+const codex_version = @import("build").version;
 const websocket_idle_timeout_seconds: u32 = 90;
 const websocket_handshake_timeout_ms: u32 = 10_000;
 const websocket_message_bytes_max: usize = 8 * 1024 * 1024;
@@ -28,6 +33,7 @@ const codex_responses_config: core.ResponsesConfig = .{
         .{ .name = "accept", .value = .{ .literal = http.media_type_event_stream } },
         .{ .name = "chatgpt-account-id", .value = .account_id },
         .{ .name = "originator", .value = .{ .literal = "nova" } },
+        .{ .name = "version", .value = .{ .literal = codex_version } },
         .{ .name = "OpenAI-Beta", .value = .{ .literal = "responses=experimental" } },
         .{ .name = "session_id", .value = .session_id },
         .{ .name = "x-client-request-id", .value = .session_id },
@@ -329,7 +335,7 @@ fn buildHandshakeHeaders(
 ) ![]u8 {
     return try std.fmt.allocPrint(
         gpa,
-        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: nova\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
+        "Host: {s}\r\nAuthorization: {s}\r\nUser-Agent: " ++ codex_user_agent ++ "\r\nchatgpt-account-id: {s}\r\noriginator: nova\r\nversion: " ++ codex_version ++ "\r\nOpenAI-Beta: responses_websockets=2026-02-06\r\nsession_id: {s}\r\nx-client-request-id: {s}\r\n",
         .{
             host_header,
             authorization,
@@ -358,6 +364,38 @@ test "codex websocket endpoint includes non-default port in host header" {
     try std.testing.expectEqualStrings("localhost:9224", endpoint.host_header);
     try std.testing.expectEqual(@as(u16, 9224), endpoint.port);
     try std.testing.expect(!endpoint.tls);
+}
+
+test "codex version header present on websocket handshake and sse request headers" {
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = ai.codex_responses.default_codex_endpoint,
+        .account_id = "acc",
+        .session_id = "sess",
+        .api_key = "tok",
+        .model = "gpt-5.2",
+        // system_prompt is asserted non-empty in init; account/session too.
+        .system_prompt = "sp",
+    });
+    defer client.core_client.deinit();
+
+    // WebSocket handshake carries the version header (upstream CLI parity).
+    const headers = try buildHandshakeHeaders(gpa, "chatgpt.com:443", "Bearer tok", client.core_client.config);
+    defer gpa.free(headers);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "\r\nversion: " ++ codex_version ++ "\r\n") != null);
+
+    // HTTP/SSE request headers carry exactly one version entry with the same
+    // value, and the array stays within extraHeaders' fixed buffer bound.
+    var found: usize = 0;
+    for (codex_responses_config.headers) |h| {
+        if (std.mem.eql(u8, h.name, "version")) {
+            found += 1;
+            try std.testing.expectEqualStrings(codex_version, h.value.literal);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), found);
+    try std.testing.expect(codex_responses_config.headers.len <= 8);
 }
 
 test {
