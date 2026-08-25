@@ -102,7 +102,7 @@ pub fn login(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Credenti
     var flow = try createAuthorizationFlow(gpa, io);
     defer flow.deinit(gpa);
     try openBrowser(gpa, io, flow.url);
-    const code = try waitForAuthorizationCode(gpa, io, flow.state);
+    const code = try waitForAuthorizationCode(gpa, io, auth_port, callback_wait_timeout_ms, flow.state);
     defer gpa.free(code);
     var credentials = try exchangeAuthorizationCode(gpa, io, code, flow.verifier);
     errdefer credentials.deinit(gpa);
@@ -176,11 +176,60 @@ fn openBrowser(gpa: std.mem.Allocator, io: std.Io, url: []const u8) !void {
     defer gpa.free(result.stderr);
 }
 
-fn waitForAuthorizationCode(gpa: std.mem.Allocator, io: std.Io, state: []const u8) ![]u8 {
-    var address = try std.Io.net.IpAddress.parseIp4(auth_host, auth_port);
+/// Upper bound on how long `waitForAuthorizationCode` blocks waiting for the
+/// browser callback before it gives up. The login flow can simply be retried.
+const callback_wait_timeout_ms: u64 = 120_000;
+
+/// Cancellation signal shared with the watchdog thread. `fired` is set when
+/// the real callback arrives or on any exit path, so the watchdog never pokes
+/// a listener that is already gone. On expiry it completes one throwaway
+/// loopback connection so the main thread's blocking `accept` returns.
+const AcceptWatchdog = struct {
+    fired: std.atomic.Value(bool),
+    port: u16,
+
+    fn arm(port: u16) AcceptWatchdog {
+        return .{ .fired = .init(false), .port = port };
+    }
+
+    /// Runs on the watchdog thread: sleep until the deadline, then force the
+    /// main thread's `accept` to unblock with a loopback connection. Bounded:
+    /// one poke, then done.
+    fn watch(self: *AcceptWatchdog, io: std.Io, timeout_ms: u64) void {
+        var waited_ms: u64 = 0;
+        while (waited_ms < timeout_ms) : (waited_ms += 100) {
+            if (self.fired.load(.acquire)) return;
+            io.sleep(.fromMilliseconds(100), .awake) catch {};
+        }
+        if (self.fired.load(.acquire)) return;
+        var address = std.Io.net.IpAddress.parseIp4(auth_host, self.port) catch return;
+        if (address.connect(io, .{ .mode = .stream })) |stream| {
+            var local_stream = stream;
+            defer local_stream.close(io);
+        } else |_| {}
+    }
+};
+
+fn waitForAuthorizationCode(gpa: std.mem.Allocator, io: std.Io, port: u16, timeout_ms: u64, state: []const u8) ![]u8 {
+    var address = try std.Io.net.IpAddress.parseIp4(auth_host, port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
-    var stream = try server.accept(io);
+
+    // A hung browser hand-off must not hang the whole process forever: a
+    // watchdog thread bounds the wait and forces `accept` to return when the
+    // deadline passes (the throwaway connection yields an empty request,
+    // surfaced as error.Timeout below).
+    var watchdog = AcceptWatchdog.arm(port);
+    var watchdog_thread = try std.Thread.spawn(.{}, AcceptWatchdog.watch, .{ &watchdog, io, timeout_ms });
+    defer {
+        watchdog.fired.store(true, .release);
+        watchdog_thread.join();
+    }
+
+    // The watchdog poke completes as an ordinary loopback connection whose
+    // client immediately hangs up; the empty request below surfaces the
+    // deadline as error.Timeout.
+    const stream = try server.accept(io);
     defer stream.close(io);
 
     var read_buffer: [8192]u8 = undefined;
@@ -188,7 +237,11 @@ fn waitForAuthorizationCode(gpa: std.mem.Allocator, io: std.Io, state: []const u
     var reader = stream.reader(io, &read_buffer);
     var writer = stream.writer(io, &write_buffer);
     var http_server = std.http.Server.init(&reader.interface, &writer.interface);
-    var request = try http_server.receiveHead();
+    var request = http_server.receiveHead() catch |err| switch (err) {
+        // Watchdog poke: the loopback client hung up without sending anything.
+        error.HttpConnectionClosing => return error.Timeout,
+        else => return err,
+    };
     const code = parseCallbackTarget(gpa, request.head.target, state) catch |err| {
         try request.respond("OpenAI authentication failed.", .{ .status = .bad_request });
         return err;
@@ -559,6 +612,16 @@ const MockCallbackClient = struct {
     }
 };
 
+test "watchdog_forcesAcceptToReturn_withTimeout_whenNoClientConnects" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A port nothing will ever connect to during this test.
+    try std.testing.expectError(
+        error.Timeout,
+        waitForAuthorizationCode(gpa, io, 14550, 200, "no_client_will_come"),
+    );
+}
+
 test "waitForAuthorizationCode accepts valid callback and returns authorization code" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -569,7 +632,7 @@ test "waitForAuthorizationCode accepts valid callback and returns authorization 
     const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
     defer thread.join();
 
-    const code = try waitForAuthorizationCode(gpa, io, expected_state);
+    const code = try waitForAuthorizationCode(gpa, io, auth_port, 10_000, expected_state);
     defer gpa.free(code);
     try std.testing.expectEqualStrings("test_code_xyz", code);
 }
@@ -584,7 +647,7 @@ test "waitForAuthorizationCode rejects state mismatch and invalid path" {
         const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
         defer thread.join();
 
-        try std.testing.expectError(error.StateMismatch, waitForAuthorizationCode(gpa, io, "expected_state"));
+        try std.testing.expectError(error.StateMismatch, waitForAuthorizationCode(gpa, io, auth_port, 10_000, "expected_state"));
     }
 
     // Invalid Path case
@@ -593,7 +656,7 @@ test "waitForAuthorizationCode rejects state mismatch and invalid path" {
         const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
         defer thread.join();
 
-        try std.testing.expectError(error.InvalidCallback, waitForAuthorizationCode(gpa, io, "expected_state"));
+        try std.testing.expectError(error.InvalidCallback, waitForAuthorizationCode(gpa, io, auth_port, 10_000, "expected_state"));
     }
 }
 
