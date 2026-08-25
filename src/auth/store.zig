@@ -497,6 +497,82 @@ test "freeApiKeyMap frees key and value memory for populated map" {
     freeApiKeyMap(gpa, &map);
 }
 
+test "loadCredentials returns null when auth blob is absent" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-load-credentials-absent-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try deleteBlob(gpa, io, home_dir);
+
+    // Act
+    const result = try loadCredentials(gpa, io, home_dir);
+
+    // Assert
+    try std.testing.expect(result == null);
+}
+
+test "loadCredentials parses valid credentials from saved file" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-load-credentials-valid-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    var creds_to_save: Credentials = .{
+        .access = try gpa.dupe(u8, "access-token-123"),
+        .refresh = try gpa.dupe(u8, "refresh-token-456"),
+        .account_id = try gpa.dupe(u8, "acct-789"),
+        .expires = 1700000000,
+    };
+    defer creds_to_save.deinit(gpa);
+
+    try saveCredentials(gpa, io, home_dir, creds_to_save);
+
+    // Act
+    const loaded = try loadCredentials(gpa, io, home_dir);
+
+    // Assert
+    try std.testing.expect(loaded != null);
+    var credentials = loaded.?;
+    defer credentials.deinit(gpa);
+
+    try std.testing.expectEqualStrings("access-token-123", credentials.access);
+    try std.testing.expectEqualStrings("refresh-token-456", credentials.refresh);
+    try std.testing.expectEqualStrings("acct-789", credentials.account_id);
+    try std.testing.expectEqual(@as(i64, 1700000000), credentials.expires);
+}
+
+test "loadCredentials returns null when auth blob contains no openaiCodex section" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-load-credentials-no-codex-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try saveProviderApiKey(gpa, io, home_dir, "cerebras", "csk-123");
+
+    // Act
+    const loaded = try loadCredentials(gpa, io, home_dir);
+
+    // Assert
+    try std.testing.expect(loaded == null);
+}
+
+test "loadCredentials propagates InvalidCredentials error on malformed JSON" {
+    // Arrange
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const home_dir = "/tmp/nova-load-credentials-malformed-test";
+    defer deleteBlob(gpa, io, home_dir) catch {};
+
+    try writeBlob(gpa, io, home_dir, "{invalid json content");
+
+    // Act & Assert
+    try std.testing.expectError(error.InvalidCredentials, loadCredentials(gpa, io, home_dir));
+}
+
 test "writeBlob falls back to auth.json when keyring save fails or is unsupported" {
     // Arrange
     const gpa = std.testing.allocator;
