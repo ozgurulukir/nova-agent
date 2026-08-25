@@ -1440,7 +1440,7 @@ test "active model appears at display position 0 without mutating storage" {
     defer agent.deinit();
     var app = try App.init(std.testing.io, gpa, &agent);
     defer app.deinit();
-    const active_model_id = try gpa.dupe(u8, "gpt-5.4-mini");
+    const active_model_id = try gpa.dupe(u8, "gpt-5.6-terra");
     defer gpa.free(active_model_id);
     app.cached_config.model_selection = .{
         .builtin = .{
@@ -1452,9 +1452,9 @@ test "active model appears at display position 0 without mutating storage" {
 
     try provider_model.reloadModelCatalog(&app, .openai_codex);
 
-    const active_storage_idx = app.pickers.models.activeStorageIdx("gpt-5.4-mini");
+    const active_storage_idx = app.pickers.models.activeStorageIdx("gpt-5.6-terra");
     const storage_idx = model_picker.displayToStorage(active_storage_idx, 0);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", app.pickers.models.entries.items[storage_idx].model.id);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", app.pickers.models.entries.items[storage_idx].model.id);
 }
 
 test "explicit codex catalog loads before runtime is connected" {

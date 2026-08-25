@@ -374,7 +374,7 @@ test "codex version header present on websocket handshake and sse request header
         .account_id = "acc",
         .session_id = "sess",
         .api_key = "tok",
-        .model = "gpt-5.2",
+        .model = "gpt-5.6-sol",
         // system_prompt is asserted non-empty in init; account/session too.
         .system_prompt = "sp",
     });

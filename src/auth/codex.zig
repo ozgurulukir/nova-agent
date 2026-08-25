@@ -52,13 +52,19 @@ pub const Model = struct {
 
 const StaticModel = struct { id: []const u8, label: []const u8 };
 
+/// ChatGPT-account Codex models selectable today (verified 2026-08-25,
+/// openai.com GPT-5.6 price-performance announcement + learn.chatgpt.com
+/// /docs/models):
+/// Plus/Pro/Business/Enterprise choose Sol, Terra, Luna. Everything older is
+/// deprecated or retired for ChatGPT sign-in — gpt-5.2/gpt-5.3-codex reject
+/// with HTTP 400 ("model is not supported when using Codex with a ChatGPT
+/// account"), gpt-5.4/gpt-5.4-mini retire 2026-08-31, gpt-5.3-codex-spark
+/// never left the Pro research preview. API-key workflows can still reach
+/// other models via their own provider entries.
 const static_models = [_]StaticModel{
-    .{ .id = "gpt-5.2", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.2" },
-    .{ .id = "gpt-5.3-codex", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex" },
-    .{ .id = "gpt-5.3-codex-spark", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex Spark" },
-    .{ .id = "gpt-5.4", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4" },
-    .{ .id = "gpt-5.4-mini", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4 mini" },
-    .{ .id = "gpt-5.5", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.5" },
+    .{ .id = "gpt-5.6-sol", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol" },
+    .{ .id = "gpt-5.6-terra", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Terra" },
+    .{ .id = "gpt-5.6-luna", .label = "OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna" },
 };
 
 pub fn loadStaticModels(gpa: std.mem.Allocator) ![]Model {
@@ -480,19 +486,13 @@ test "static models match openai codex catalog" {
         for (loaded) |*model| model.deinit(gpa);
         gpa.free(loaded);
     }
-    try std.testing.expectEqual(@as(usize, 6), loaded.len);
-    try std.testing.expectEqualStrings("gpt-5.2", loaded[0].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.2", loaded[0].label);
-    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded[1].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex", loaded[1].label);
-    try std.testing.expectEqualStrings("gpt-5.3-codex-spark", loaded[2].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.3 Codex Spark", loaded[2].label);
-    try std.testing.expectEqualStrings("gpt-5.4", loaded[3].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4", loaded[3].label);
-    try std.testing.expectEqualStrings("gpt-5.4-mini", loaded[4].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.4 mini", loaded[4].label);
-    try std.testing.expectEqualStrings("gpt-5.5", loaded[5].id);
-    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.5", loaded[5].label);
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded[0].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Sol", loaded[0].label);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", loaded[1].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Terra", loaded[1].label);
+    try std.testing.expectEqualStrings("gpt-5.6-luna", loaded[2].id);
+    try std.testing.expectEqualStrings("OpenAI Codex" ++ symbols.separator_dot_padded ++ "GPT-5.6 Luna", loaded[2].label);
 }
 
 test "loadStaticModels handles allocation failures gracefully" {
