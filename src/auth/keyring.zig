@@ -260,82 +260,62 @@ const Macos = struct {
     }
 };
 
-test "save_returnsErrorUnsupported_whenBackendIsUnsupported" {
-    // Arrange
-    const gpa = std.testing.allocator;
-    const service = "NovaTest";
-    const account = "account";
-    const secret = "secret";
+// The Windows-backend limit test is gated behind a comptime-known `os.tag`
+// check so the `Windows` body (and its C externs) is never analyzed on other
+// platforms -- referencing it unconditionally breaks the Linux link.
+// The `Unsupported` stub cases are covered by store.zig fallback tests and
+// the delete() suite; they are not repeated here.
 
-    // Act
-    const err = Unsupported.save(gpa, service, account, secret);
+test "windowsBackend_rejectsOversizedSecret_withBackendError" {
+    if (os.tag != .windows) return error.SkipZigTest;
 
-    // Assert
-    try std.testing.expectError(error.Unsupported, err);
-}
-
-test "loadAndDelete_returnsErrorUnsupported_whenBackendIsUnsupported" {
-    // Arrange
     const gpa = std.testing.allocator;
     const service = "NovaTest";
     const account = "account";
 
-    // Act & Assert
-    try std.testing.expectError(error.Unsupported, Unsupported.load(gpa, service, account));
-    try std.testing.expectError(error.Unsupported, Unsupported.delete(gpa, service, account));
-}
-
-test "save_returnsBackendError_whenWindowsSecretExceedsMaxSize" {
-    // Arrange
-    const gpa = std.testing.allocator;
-    const service = "NovaTest";
-    const account = "account";
+    // CRED_MAX_CREDENTIAL_BLOB_SIZE (Vista+) is 5 * 512 bytes; the OS rejects
+    // anything larger and the backend must surface `error.Backend` so the
+    // caller falls back to auth.json storage.
     const oversized_secret = "x" ** (Windows.max_blob_bytes + 1);
-
-    // Act
-    const err = Windows.save(gpa, service, account, oversized_secret);
-
-    // Assert
-    try std.testing.expectError(error.Backend, err);
+    try std.testing.expectError(error.Backend, Windows.save(gpa, service, account, oversized_secret));
 }
 
-test "save_overwritesExistingSecret_whenSavingSameServiceAndAccount" {
-    // Arrange
+test "save_upsertsSecret_whenCalledTwiceForSameServiceAndAccount" {
+    // Exercises the public dispatch so the upsert path stays reachable from
+    // production call sites; skips cleanly on platforms without a keychain.
     const gpa = std.testing.allocator;
     const service = "Nova Test";
     const account = "cli|keyringtest_overwrite";
     _ = delete(gpa, service, account) catch {};
-    defer _ = delete(gpa, service, account) catch {};
 
     save(gpa, service, account, "initial-secret") catch |err| switch (err) {
-        error.Unsupported, error.Backend => return,
+        error.Unsupported => return error.SkipZigTest,
         else => return err,
     };
+    defer _ = delete(gpa, service, account) catch {};
 
-    // Act
     try save(gpa, service, account, "updated-secret");
 
-    // Assert
     const loaded = (try load(gpa, service, account)) orelse return error.TestUnexpectedResult;
     defer gpa.free(loaded);
     try std.testing.expectEqualStrings("updated-secret", loaded);
 }
 
-test "save_succeedsWithEmptySecret_whenEmptyStringProvided" {
-    // Arrange
+test "save_acceptsEmptySecret_whenEmptyStringProvided" {
     const gpa = std.testing.allocator;
     const service = "Nova Test";
     const account = "cli|keyringtest_empty";
     _ = delete(gpa, service, account) catch {};
-    defer _ = delete(gpa, service, account) catch {};
 
-    // Act
     save(gpa, service, account, "") catch |err| switch (err) {
-        error.Unsupported, error.Backend => return,
+        error.Unsupported => return error.SkipZigTest,
+        // Some platforms legitimately refuse empty payloads; that is policy,
+        // not a bug -- nothing further to assert beyond "it did not crash".
+        error.Backend => return,
         else => return err,
     };
+    defer _ = delete(gpa, service, account) catch {};
 
-    // Assert
     const loaded = (try load(gpa, service, account)) orelse return error.TestUnexpectedResult;
     defer gpa.free(loaded);
     try std.testing.expectEqualStrings("", loaded);
