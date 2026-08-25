@@ -81,6 +81,7 @@ pub fn processEvent(
             usage.* = parseResponseUsage(parsed.value);
             return;
         },
+        .lifecycle => return,
         .output_item_added => return onItemAdded(gpa, parsed.value, blocks, tools, call_seq),
         .content_part_added => return onContentPartAdded(gpa, parsed.value, blocks),
         .output_text_delta => return onTextDelta(gpa, parsed.value, blocks, observer),
@@ -129,6 +130,7 @@ fn usageNestedInteger(usage: std.json.Value, object_name: []const u8, field_name
 pub const ResponseEvent = enum {
     provider_error,
     completed,
+    lifecycle,
     output_item_added,
     content_part_added,
     output_text_delta,
@@ -150,6 +152,17 @@ pub const response_event_specs = [_]ResponseEventSpec{
     .{ .name = "error", .event = .provider_error },
     .{ .name = "response.failed", .event = .provider_error },
     .{ .name = "response.completed", .event = .completed },
+    // Lifecycle/telemetry events carry no assistant content. Recognize them so
+    // Codex does not turn normal WebSocket protocol traffic into warnings.
+    .{ .name = "response.created", .event = .lifecycle },
+    .{ .name = "response.in_progress", .event = .lifecycle },
+    .{ .name = "response.content_part.done", .event = .lifecycle },
+    .{ .name = "response.output_text.done", .event = .lifecycle },
+    .{ .name = "response.reasoning_summary_part.added", .event = .lifecycle },
+    .{ .name = "response.reasoning_summary_text.done", .event = .lifecycle },
+    .{ .name = "codex.rate_limits", .event = .lifecycle },
+    .{ .name = "codex.response.metadata", .event = .lifecycle },
+    .{ .name = "responsesapi.websocket_timing", .event = .lifecycle },
     .{ .name = "response.output_item.added", .event = .output_item_added },
     .{ .name = "response.content_part.added", .event = .content_part_added },
     .{ .name = "response.output_text.delta", .event = .output_text_delta },
@@ -619,6 +632,37 @@ test "processEvent ignores unknown event types without error" {
 
     try processEvent(gpa, "{\"type\": \"custom_vendor.telemetry_heartbeat\"}", &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
     try std.testing.expectEqual(false, completed);
+    try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
+}
+
+test "processEvent treats Codex lifecycle events as recognized no-ops" {
+    const gpa = std.testing.allocator;
+    var blocks: std.ArrayList(ai.ContentBlock) = .empty;
+    defer blocks.deinit(gpa);
+    var tools: std.ArrayList(ToolBuilder) = .empty;
+    defer tools.deinit(gpa);
+    var completed = false;
+    var usage: ?ai.Usage = null;
+    var call_seq: u64 = 0;
+
+    const events = [_][]const u8{
+        "{\"type\":\"response.created\"}",
+        "{\"type\":\"response.in_progress\"}",
+        "{\"type\":\"response.reasoning_summary_part.added\"}",
+        "{\"type\":\"response.reasoning_summary_text.done\"}",
+        "{\"type\":\"response.output_text.done\"}",
+        "{\"type\":\"response.content_part.done\"}",
+        "{\"type\":\"codex.rate_limits\"}",
+        "{\"type\":\"codex.response.metadata\"}",
+        "{\"type\":\"responsesapi.websocket_timing\"}",
+    };
+    for (events) |event| {
+        const type_start = std.mem.indexOf(u8, event, "\"type\":\"").? + "\"type\":\"".len;
+        const type_end = std.mem.indexOfPos(u8, event, type_start, "\"").?;
+        try std.testing.expectEqual(ResponseEvent.lifecycle, responseEventFromString(event[type_start..type_end]).?);
+        try processEvent(gpa, event, &blocks, &tools, ai.streamNoop(), &call_seq, &completed, &usage);
+    }
+    try std.testing.expect(!completed);
     try std.testing.expectEqual(@as(usize, 0), blocks.items.len);
 }
 
