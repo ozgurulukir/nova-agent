@@ -193,7 +193,12 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
     if (env.get("NOVA_LOG_FILE")) |path| return gpa.dupe(u8, path);
     const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return error.HomeNotSet;
-    return std.fs.path.join(gpa, &.{ home, ".config", "nova", "nova.log" });
+    // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
+    const base = try paths.platformConfigDir(gpa, home);
+    errdefer gpa.free(base);
+    const log_path = try std.fs.path.join(gpa, &.{ base, "nova.log" });
+    gpa.free(base);
+    return log_path;
 }
 
 /// G1a: parse `NOVA_LOG_STDERR_LEVEL` (err|warn|info|debug). Defaults to

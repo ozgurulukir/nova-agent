@@ -2,21 +2,40 @@
 
 const std = @import("std");
 const db = @import("../db.zig");
+const paths = @import("../paths.zig");
 
 const assert = std.debug.assert;
 
 /// Current schema version for the sessions database.
 pub const schema_version: u32 = 5;
 
-/// Default path relative to the nova config directory.
+/// Default path relative to the nova config directory (POSIX layout).
 pub const default_db_relative_path = ".config/nova/sessions.sqlite";
 
 /// Resolve the default sessions database path under `home_dir`.
+/// Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
 pub fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     assert(home_dir.len > 0);
-    const path = try std.fs.path.join(gpa, &.{ home_dir, default_db_relative_path });
+    const base = try paths.platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(base);
+    const path = try std.fs.path.join(gpa, &.{ base, "sessions.sqlite" });
+    gpa.free(base);
     errdefer gpa.free(path);
     return path;
+}
+
+test "defaultPath: resolves to sessions.sqlite under the platform config dir" {
+    const gpa = std.testing.allocator;
+    const path = try defaultPath(gpa, "PREFIX");
+    defer gpa.free(path);
+    // Must end in sessions.sqlite and live under the platform config base
+    // (Windows: PREFIX/AppData/Roaming/nova, POSIX: PREFIX/.config/nova).
+    try std.testing.expect(std.mem.endsWith(u8, path, "sessions.sqlite"));
+    const base = try paths.platformConfigDir(gpa, "PREFIX");
+    defer gpa.free(base);
+    const expected = try std.fs.path.join(gpa, &.{ base, "sessions.sqlite" });
+    defer gpa.free(expected);
+    try std.testing.expect(paths.pathsEqual(path, expected));
 }
 
 /// Migrate the database to the latest schema version.

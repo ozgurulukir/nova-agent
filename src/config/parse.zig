@@ -12,6 +12,7 @@
 const std = @import("std");
 const ai = @import("../ai.zig");
 const platform = @import("platform");
+const paths = @import("../paths.zig");
 
 const config_mod = @import("config.zig");
 const provider_types = @import("provider.zig");
@@ -1717,16 +1718,35 @@ fn writeKey(writer: *std.Io.Writer, name: []const u8, wrote_any: *bool) !void {
 pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) ![]u8 {
     if (home_dir.len == 0) return error.HomeNotSet;
 
-    // Standard XDG path: ~/.config/nova/config.json
+    // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
+    // (See paths.platformConfigDir; matches the plugin-discovery probe.)
+    const base = try paths.platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(base);
+    const config_path = try std.fs.path.join(gpa, &.{ base, "config.json" });
+    gpa.free(base);
+    errdefer gpa.free(config_path);
+
+    // Prefer an existing platform-correct config file.
+    if (std.Io.Dir.access(.cwd(), io, config_path, .{})) |_| {
+        return config_path;
+    } else |_| {}
+
+    // Backward-compat: a legacy XDG layout (~/.config/nova/config.json) may exist
+    // on a POSIX system whose home prefix differs from platformConfigDir's base.
+    // (No-op on the common path — platformConfigDir already returns ~/.config/nova
+    // there — but harmless and keeps old installs readable.) Only probed when the
+    // platform-correct file is absent.
     const xdg_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "config.json" });
     errdefer gpa.free(xdg_path);
 
     if (std.Io.Dir.access(.cwd(), io, xdg_path, .{})) |_| {
+        gpa.free(config_path);
         return xdg_path;
     } else |_| {}
 
-    // Default to XDG path for new config writes
-    return xdg_path;
+    // No existing file: return the platform-correct path so new writes land there.
+    gpa.free(xdg_path);
+    return config_path;
 }
 
 fn projectConfigPath(gpa: std.mem.Allocator, cwd: []const u8) ![]u8 {
@@ -2203,16 +2223,17 @@ test "serialize writes strictOutputs even when model_selection is set" {
     try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"strictOutputs\": true") != null);
 }
 
-test "globalConfigPath resolves XDG .config/nova/config.json" {
+test "globalConfigPath resolves the platform-correct config.json path" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     const path = try globalConfigPath(gpa, io, "/home/testuser");
     defer gpa.free(path);
 
-    // Build the expected suffix with path.join so the separator matches the
-    // host platform (`\` on Windows instead of the hardcoded `/`).
-    const expected = try std.fs.path.join(gpa, &.{ ".config", "nova", "config.json" });
+    // The returned path must end in the platform-correct config file location.
+    // On POSIX that is ~/.config/nova/config.json; on Windows %APPDATA%\nova\config.json.
+    // Build the expected suffix with path.join so the separator matches the host.
+    const expected = try std.fs.path.join(gpa, &.{ "nova", "config.json" });
     defer gpa.free(expected);
     try std.testing.expect(std.mem.endsWith(u8, path, expected));
 }

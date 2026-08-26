@@ -20,6 +20,7 @@
 const std = @import("std");
 const platform = @import("platform");
 const os = @import("os.zig");
+const paths = @import("paths.zig");
 
 const assert = std.debug.assert;
 
@@ -388,9 +389,26 @@ pub fn worktreeRemove(gpa: std.mem.Allocator, io: std.Io, repo_dir: []const u8, 
 pub const worktree_retention_days: u64 = 7;
 pub const worktree_retention_ns: u64 = worktree_retention_days * 24 * 60 * 60 * std.time.ns_per_s;
 
-/// Resolve the global worktree directory path (<home>/.config/nova/worktrees).
+/// Resolve the global worktree directory path.
+/// Platform-correct base: Windows -> %APPDATA%\nova/worktrees, POSIX -> ~/.config/nova/worktrees.
 pub fn globalWorktreesDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
-    return std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "worktrees" });
+    const base = try paths.platformConfigDir(gpa, home_dir);
+    errdefer gpa.free(base);
+    const dir = try std.fs.path.join(gpa, &.{ base, "worktrees" });
+    gpa.free(base);
+    return dir;
+}
+
+test "globalWorktreesDir: resolves under the platform config dir" {
+    const gpa = std.testing.allocator;
+    const dir = try globalWorktreesDir(gpa, "PREFIX");
+    defer gpa.free(dir);
+    try std.testing.expect(std.mem.endsWith(u8, dir, "worktrees"));
+    const base = try paths.platformConfigDir(gpa, "PREFIX");
+    defer gpa.free(base);
+    const expected = try std.fs.path.join(gpa, &.{ base, "worktrees" });
+    defer gpa.free(expected);
+    try std.testing.expect(paths.pathsEqual(dir, expected));
 }
 
 /// Scans the global worktrees directory and deletes abandoned worktree checkouts
