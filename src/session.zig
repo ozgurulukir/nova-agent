@@ -10,6 +10,7 @@ const session_type = @import("session/types.zig");
 const session_migration = @import("session/migration.zig");
 const serialize = @import("session/serialize.zig");
 const session_writer = @import("session/writer.zig");
+const paths = @import("paths.zig");
 
 pub const SessionWriter = session_writer.SessionWriter;
 
@@ -1264,9 +1265,19 @@ test "initDefault creates directory and initializes database" {
     var manager = try SessionManager.initDefault(gpa, std.testing.io, home_dir);
     defer manager.deinit();
 
-    // Verify the file was actually created in the right spot
-    const expected_path = ".config/nova/sessions.sqlite";
-    try tmp.dir.access(std.testing.io, expected_path, .{});
+    // Verify the file was actually created in the right spot — under the
+    // platform config dir (Windows: AppData/Roaming/nova, POSIX: .config/nova),
+    // relative to the tmp home_dir.
+    const base = try paths.platformConfigDir(gpa, "");
+    defer gpa.free(base);
+    const expected_path = try std.fs.path.join(gpa, &.{ base, "sessions.sqlite" });
+    defer gpa.free(expected_path);
+    // Strip the leading separator so the access check is relative to tmp.dir.
+    const rel = if (expected_path[0] == '/' or expected_path[0] == '\\')
+        expected_path[1..]
+    else
+        expected_path;
+    try tmp.dir.access(std.testing.io, rel, .{});
 }
 
 test "create rejects session id with wrong length" {
