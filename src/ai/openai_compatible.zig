@@ -14,6 +14,9 @@ const tools_mod = @import("../tools.zig");
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const body_buffer_bytes = http.body_buffer_bytes;
+/// Upper bound on an error body we will decompress + log (matches the models
+/// client's cap). Prevents a hostile/garbage body from allocating unboundedly.
+const response_bytes_max: u32 = 1 * 1024 * 1024;
 /// Upper bound on exponential retry backoff, in milliseconds. A server-sent
 /// `Retry-After` header is honored verbatim (not capped here).
 const retry_max_delay_ms: u64 = 8000;
@@ -352,15 +355,23 @@ pub const Client = struct {
             if (isRetryableHeadStatus(status_code)) {
                 retry_after_secs.* = parseRetryAfterSeconds(http_response.head.bytes);
             }
+            // The error body (e.g. a 403 from a Cloudflare-fronted host) may be
+            // gzip/deflate-compressed (the only encodings this client
+            // advertises) — use the decompressing reader so the toaster logs
+            // real text instead of raw compressed bytes.
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
-            const error_reader = http_response.reader(&error_buffer);
-            var error_body: std.Io.Writer.Allocating = .init(self.gpa);
-            defer error_body.deinit();
-            _ = error_reader.streamRemaining(&error_body.writer) catch 0;
-            const err_body_log = try logBytes(self.gpa, error_body.written());
-            defer if (err_body_log.ptr != error_body.written().ptr) self.gpa.free(err_body_log);
+            var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress: std.http.Decompress = undefined;
+            const error_reader = http_response.readerDecompressing(&error_buffer, &decompress, &decompress_buffer);
+            const error_body = error_reader.allocRemaining(self.gpa, .limited(response_bytes_max)) catch |err| switch (err) {
+                error.StreamTooLong => return error.ResponseTooLarge,
+                else => |e| return e,
+            };
+            const err_body_log = try logBytes(self.gpa, error_body);
+            defer if (err_body_log.ptr != error_body.ptr) self.gpa.free(err_body_log);
+            defer self.gpa.free(error_body);
             log.warn("openai_compatible.response.error status={d} body={s}", .{ status_code, err_body_log });
-            self.recordErrorDetail(status_code, error_body.written());
+            self.recordErrorDetail(status_code, error_body);
             if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
@@ -388,7 +399,9 @@ pub const Client = struct {
         }
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-        const reader = http_response.reader(&transfer_buffer);
+        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
         return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model);
     }
 
@@ -1708,6 +1721,9 @@ const MockRetryServer = struct {
         status: std.http.Status,
         retry_after: ?[]const u8 = null,
         body: []const u8 = "",
+        // When true, `body` is gzip-compressed and served with
+        // `Content-Encoding: gzip` — exercises the decompressing reader.
+        gzip: bool = false,
     };
 
     io: std.Io,
@@ -1740,11 +1756,17 @@ const MockRetryServer = struct {
             var writer = stream.writer(self.io, &write_buf);
             var http_server = std.http.Server.init(&reader.interface, &writer.interface);
             var request = http_server.receiveHead() catch return;
-            var extra: [1]std.http.Header = undefined;
-            const headers: []const std.http.Header = if (resp.retry_after) |ra| blk: {
-                extra[0] = .{ .name = "Retry-After", .value = ra };
-                break :blk &extra;
-            } else &.{};
+            var extra: [2]std.http.Header = undefined;
+            var extra_count: usize = 0;
+            if (resp.retry_after) |ra| {
+                extra[extra_count] = .{ .name = "Retry-After", .value = ra };
+                extra_count += 1;
+            }
+            if (resp.gzip) {
+                extra[extra_count] = .{ .name = "Content-Encoding", .value = "gzip" };
+                extra_count += 1;
+            }
+            const headers = extra[0..extra_count];
             request.respond(resp.body, .{
                 .status = resp.status,
                 .keep_alive = false,
@@ -1925,4 +1947,34 @@ test "prompt exhausts retries on a persistent 5xx" {
 
     try std.testing.expectError(error.HttpServerError, client.prompt(&.{}, ai.streamNoop()));
     try std.testing.expectEqual(@as(u32, 3), server.connection_count.load(.monotonic));
+}
+
+test "prompt decompresses a Content-Encoding: gzip error body into the UI detail" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // gzip stream of `{"error":{"message":"invalid api key"}}`.
+    // Without the decompressing reader the toaster logs the raw compressed
+    // bytes (the `body=����...` garbage) instead of the JSON message.
+    const gzipped = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x04, 0x4b, 0x8f, 0x6a, 0x02, 0xff, 0xab, 0x56,
+        0x4a, 0x2d, 0x2a, 0xca, 0x2f, 0x52, 0xb2, 0xaa, 0x56, 0xca, 0x4d, 0x2d,
+        0x2e, 0x4e, 0x4c, 0x4f, 0x55, 0xb2, 0x52, 0xca, 0xcc, 0x2b, 0x4b, 0xcc,
+        0xc9, 0x4c, 0x51, 0x48, 0x2c, 0xc8, 0x54, 0xc8, 0x4e, 0xad, 0x54, 0xaa,
+        0xad, 0x05, 0x00, 0xaf, 0xdd, 0xf6, 0x03, 0x27, 0x00, 0x00, 0x00,
+    };
+
+    var server = try MockRetryServer.init(io, &.{
+        .{ .status = .forbidden, .body = &gzipped, .gzip = true },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockRetryServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail");
+    try std.testing.expectEqualStrings("HTTP 403: invalid api key", detail);
 }
