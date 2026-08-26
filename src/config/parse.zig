@@ -1720,32 +1720,21 @@ pub fn globalConfigPath(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8
 
     // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
     // (See paths.platformConfigDir; matches the plugin-discovery probe.)
+    // No separate XDG fallback: on POSIX platformConfigDir already returns
+    // ~/.config/nova, so a legacy ~/.config/nova/config.json IS the returned
+    // path. Linux installs are unaffected.
     const base = try paths.platformConfigDir(gpa, home_dir);
     errdefer gpa.free(base);
     const config_path = try std.fs.path.join(gpa, &.{ base, "config.json" });
     gpa.free(base);
-    errdefer gpa.free(config_path);
 
-    // Prefer an existing platform-correct config file.
+    // Prefer an existing file; otherwise return the platform-correct path so new
+    // writes land in the right place. (No free — returning it.)
     if (std.Io.Dir.access(.cwd(), io, config_path, .{})) |_| {
         return config_path;
     } else |_| {}
-
-    // Backward-compat: a legacy XDG layout (~/.config/nova/config.json) may exist
-    // on a POSIX system whose home prefix differs from platformConfigDir's base.
-    // (No-op on the common path — platformConfigDir already returns ~/.config/nova
-    // there — but harmless and keeps old installs readable.) Only probed when the
-    // platform-correct file is absent.
-    const xdg_path = try std.fs.path.join(gpa, &.{ home_dir, ".config", "nova", "config.json" });
-    errdefer gpa.free(xdg_path);
-
-    if (std.Io.Dir.access(.cwd(), io, xdg_path, .{})) |_| {
-        gpa.free(config_path);
-        return xdg_path;
-    } else |_| {}
-
-    // No existing file: return the platform-correct path so new writes land there.
-    gpa.free(xdg_path);
+    // access failed: config_path is still the correct write target, just return it.
+    // It was allocated without an errdefer, so the caller owns it.
     return config_path;
 }
 

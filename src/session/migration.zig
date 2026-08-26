@@ -9,12 +9,11 @@ const assert = std.debug.assert;
 /// Current schema version for the sessions database.
 pub const schema_version: u32 = 5;
 
-/// Default path relative to the nova config directory (POSIX layout).
-pub const default_db_relative_path = ".config/nova/sessions.sqlite";
-
 /// Resolve the default sessions database path under `home_dir`.
 /// Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
-pub fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
+/// Caller must pass a non-empty home_dir (the `assert` guards the contract;
+/// `initDefault` validates upstream).
+pub fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) Error![]u8 {
     assert(home_dir.len > 0);
     const base = try paths.platformConfigDir(gpa, home_dir);
     errdefer gpa.free(base);

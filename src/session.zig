@@ -31,11 +31,6 @@ pub const CompactionCut = session_type.CompactionCut;
 pub const EntryKind = session_type.EntryKind;
 pub const EntrySummary = session_type.EntrySummary;
 
-const schema_version = session_migration.schema_version;
-const default_db_relative_path = session_migration.default_db_relative_path;
-fn defaultPath(gpa: std.mem.Allocator, home_dir: []const u8) session_migration.Error![]u8 {
-    return session_migration.defaultPath(gpa, home_dir);
-}
 fn migrate(connection: *db.Connection, io: std.Io) !void {
     try session_migration.migrate(connection, io);
 }
@@ -68,7 +63,7 @@ pub const SessionManager = struct {
 
     pub fn initDefault(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) Error!SessionManager {
         assert(home_dir.len > 0);
-        const db_path = try defaultPath(gpa, home_dir);
+        const db_path = try session_migration.defaultPath(gpa, home_dir);
         defer gpa.free(db_path);
         return init(gpa, io, db_path);
     }
@@ -1267,17 +1262,15 @@ test "initDefault creates directory and initializes database" {
 
     // Verify the file was actually created in the right spot — under the
     // platform config dir (Windows: AppData/Roaming/nova, POSIX: .config/nova),
-    // relative to the tmp home_dir.
-    const base = try paths.platformConfigDir(gpa, "");
-    defer gpa.free(base);
-    const expected_path = try std.fs.path.join(gpa, &.{ base, "sessions.sqlite" });
+    // relative to the tmp home_dir. Resolve the expected path against cwd so the
+    // access check is absolute and host-separator agnostic (no fragile strip).
+    const cwd = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd);
+    const abs_home = try std.fs.path.join(gpa, &.{ cwd, home_dir });
+    defer gpa.free(abs_home);
+    const expected_path = try session_migration.defaultPath(gpa, abs_home);
     defer gpa.free(expected_path);
-    // Strip the leading separator so the access check is relative to tmp.dir.
-    const rel = if (expected_path[0] == '/' or expected_path[0] == '\\')
-        expected_path[1..]
-    else
-        expected_path;
-    try tmp.dir.access(std.testing.io, rel, .{});
+    try std.Io.Dir.accessAbsolute(std.testing.io, expected_path, .{});
 }
 
 test "create rejects session id with wrong length" {

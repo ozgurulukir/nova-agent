@@ -112,6 +112,10 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 ///   - Windows: <USERPROFILE>/AppData/Roaming/nova   (== %APPDATA%\nova)
 ///   - POSIX:   <home>/.config/nova                  (XDG base directory)
 ///
+/// Callers must pass a non-empty `home_dir`: every caller validates this
+/// upstream (`globalConfigPath` early-returns, `resolveLogPath` requires
+/// HOME/USERPROFILE, `defaultPath` asserts) so an empty home never reaches
+/// here. The returned path is therefore always rooted under a real home.
 /// Caller owns the returned slice.
 pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (os.is_windows) {
@@ -144,4 +148,24 @@ test "platformConfigDir: appends the nova segment under the platform base" {
     try std.testing.expect(std.mem.endsWith(u8, dir, "nova"));
     try std.testing.expect(!std.mem.endsWith(u8, dir, "nova/"));
     try std.testing.expect(!std.mem.endsWith(u8, dir, "nova\\"));
+}
+
+test "platformConfigDir: rejects a path that drifts from the platform layout" {
+    const gpa = std.testing.allocator;
+    const dir = try platformConfigDir(gpa, "HOME");
+    defer gpa.free(dir);
+    // Regression guard: the second-to-last segment must be the platform base
+    // (AppData/Roaming on Windows, .config on POSIX), never a typo'd variant.
+    // pathsEqual is separator-agnostic, so assert the canonical suffix shape.
+    const want_base = if (os.is_windows) "AppData/Roaming" else ".config";
+    const expected = try std.fmt.allocPrint(gpa, "HOME/{s}/nova", .{want_base});
+    defer gpa.free(expected);
+    try std.testing.expect(pathsEqual(dir, expected));
+    // The literal 'nova' must appear exactly once, as the final segment.
+    var count: u32 = 0;
+    var it = std.mem.splitScalar(u8, dir, if (os.is_windows) '\\' else '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "nova")) count += 1;
+    }
+    try std.testing.expectEqual(count, 1);
 }
