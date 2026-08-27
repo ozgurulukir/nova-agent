@@ -963,3 +963,23 @@ test "queryAsync_whenConcurrentFails_returnsError" {
         queryAsync(gpa, failing_io, .{ .op = .find, .query = "main" }),
     );
 }
+
+test "initBackend returns failed outcome when walkSelectively allocation fails" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var failing_allocator = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    const failing_gpa = failing_allocator.allocator();
+
+    const cwd_duped = try failing_gpa.dupe(u8, ".");
+    var done = std.atomic.Value(bool).init(false);
+
+    var outcome = initBackend(failing_gpa, io, cwd_duped, &done);
+    defer outcome.deinit(failing_gpa);
+
+    try std.testing.expect(done.load(.monotonic));
+    switch (outcome) {
+        .failed => |msg| try std.testing.expectEqualStrings("", msg),
+        else => return error.TestExpectedFailedOutcome,
+    }
+}
