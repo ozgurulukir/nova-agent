@@ -83,7 +83,77 @@ fn localClassify(command: []const u8) Verdict {
     // Overwriting critical system files.
     if (isDangerousRedirect(trimmed)) return .unsafe;
 
+    // Privileged package management (e.g. `sudo apt install`, `doas pacman -S`).
+    // These mutate the system-wide install state and must surface for approval
+    // rather than running unattended — a model should never be able to attempt
+    // `sudo apt install` without the interactive gate (TD-3).
+    if (isPrivilegedPackageManagement(trimmed)) return .unsafe;
+
     return .safe;
+}
+
+/// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
+/// system package manager (`apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `pacman`,
+/// `apk`, `brew`, `pip install`). The match is prefix/case-insensitive on the
+/// first token so `--option sudo apt` noise is not required to trigger it.
+fn isPrivilegedPackageManagement(command: []const u8) bool {
+    // Tokens that escalate privileges: any of these at the head (possibly after
+    // a leading env assignment or `exec`) mean the remainder must be vetted.
+    const escalators = [_][]const u8{ "sudo", "doas", "runas" };
+    for (escalators) |esc| {
+        if (startsWithToken(command, esc)) return true;
+    }
+    // Package managers invoked directly (no privilege escalation needed to flag —
+    // a system-wide install/remove is destructive regardless of user). Single
+    // tokens match exactly; multi-word phrases (e.g. `pip install`) match only
+    // at word boundaries so `apt-cache` does not false-positive on `apt`.
+    const managers = [_][]const u8{
+        "apt", "apt-get", "dpkg", "dnf", "yum", "pacman", "apk", "brew",
+    };
+    for (managers) |mgr| {
+        if (containsExactToken(command, mgr)) return true;
+    }
+    const phrases = [_][]const u8{
+        "pip install", "pip3 install", "npm install -g", "npm i -g",
+    };
+    for (phrases) |phrase| {
+        if (containsPhrase(command, phrase)) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive prefix match against the first whitespace-delimited token.
+fn startsWithToken(command: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, command, ' ');
+    const first = it.next() orelse return false;
+    return containsIgnoreCase(first, token);
+}
+
+/// Case-insensitive exact match against any whitespace-delimited token, so
+/// `apt` matches `sudo apt install` but not `apt-cache show nginx`.
+fn containsExactToken(command: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, command, ' ');
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, token)) return true;
+    }
+    return false;
+}
+
+/// Case-insensitive match of `phrase` (which may contain spaces) only when
+/// bounded by word boundaries (string edges or whitespace), so `pip install`
+/// inside `pip install --user x` matches but `equip installation` does not.
+fn containsPhrase(command: []const u8, phrase: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < command.len) {
+        const at = std.mem.indexOf(u8, command[idx..], phrase) orelse return false;
+        const abs = idx + at;
+        const before_ok = abs == 0 or std.ascii.isWhitespace(command[abs - 1]);
+        const after = abs + phrase.len;
+        const after_ok = after >= command.len or std.ascii.isWhitespace(command[after]);
+        if (before_ok and after_ok) return true;
+        idx = after;
+    }
+    return false;
 }
 
 /// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
@@ -496,4 +566,30 @@ test "local classifier flags pwsh dangerous redirect" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("Something > 'C:\\Program Files\\x.txt'"));
     try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output 'x' > .\\out.txt"));
     try std.testing.expectEqual(Verdict.safe, localClassify("Write-Output 'x' > C:\\repo\\out.txt"));
+}
+
+test "local classifier flags sudo apt install as unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sudo apt install nginx"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sudo apt-get install -y curl"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("doas pacman -S htop"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("runas /user:admin winget install foo"));
+}
+
+test "local classifier flags direct package managers as unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("apt-get update"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("dpkg -i package.deb"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("dnf install vim"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("yum remove git"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("pacman -Syu"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("apk add wget"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("pip install --user requests"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("npm install -g typescript"));
+}
+
+test "local classifier still allows safe reads" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("ls -la"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("apt-cache show nginx"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
+    // `apt` substring inside an unrelated word must not false-positive.
+    try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
 }
