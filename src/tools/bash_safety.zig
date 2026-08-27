@@ -96,64 +96,116 @@ fn localClassify(command: []const u8) Verdict {
 /// system package manager (`apt`, `apt-get`, `dpkg`, `dnf`, `yum`, `pacman`,
 /// `apk`, `brew`, `pip install`). The match is prefix/case-insensitive on the
 /// first token so `--option sudo apt` noise is not required to trigger it.
+/// True when `command` escalates privileges (`sudo`/`doas`/`runas`) or invokes a
+/// system package manager (`apt`, `dnf`, `brew`, `cargo`, `pip install`, ...).
+/// These mutate system-wide install state and must surface for approval rather
+/// than running unattended. The matcher splits on every shell metacharacter
+/// (not just spaces) so syntax tricks like `apt;install`, `/usr/bin/apt`,
+/// `./apt`, `apt\ninstall` and `pip  install` (double space) cannot bypass it.
 fn isPrivilegedPackageManagement(command: []const u8) bool {
-    // Tokens that escalate privileges: any of these at the head (possibly after
-    // a leading env assignment or `exec`) mean the remainder must be vetted.
+    // Privilege escalation prefixes.
     const escalators = [_][]const u8{ "sudo", "doas", "runas" };
     for (escalators) |esc| {
-        if (startsWithToken(command, esc)) return true;
+        if (tokenContains(command, esc)) return true;
     }
-    // Package managers invoked directly (no privilege escalation needed to flag —
-    // a system-wide install/remove is destructive regardless of user). Single
-    // tokens match exactly; multi-word phrases (e.g. `pip install`) match only
-    // at word boundaries so `apt-cache` does not false-positive on `apt`.
+    // Single-token package managers (exact token match, case-insensitive).
+    // Self-installing managers matched as a bare token (case-insensitive, exact
+    // token). The tokenizer splits on shell metacharacters but NOT "-"/"." so
+    // "apt-cache" / "aptitude" stay single tokens and do not false-positive on
+    // "apt", while "/usr/bin/apt", "./apt" and "apt;install" still split to the
+    // bare "apt" token.
     const managers = [_][]const u8{
         "apt", "apt-get", "dpkg", "dnf", "yum", "pacman", "apk", "brew",
+        "zypper", "emerge", "aptitude", "nix-env", "snap",
     };
     for (managers) |mgr| {
-        if (containsExactToken(command, mgr)) return true;
+        if (tokenContains(command, mgr)) return true;
     }
+    // Multi-word install verbs, matched only at word boundaries so
+    // `apt-cache show` does not false-positive on `apt` while `apt;install`
+    // (no space) still trips the `apt` single-token rule above.
+    // Install verbs that require an explicit subcommand; matched only at word
+    // boundaries so "pip show" / "apt-cache show" stay safe reads.
     const phrases = [_][]const u8{
         "pip install", "pip3 install", "npm install -g", "npm i -g",
+        "cargo install", "gem install", "go install", "conda install",
+        "snap install", "flatpak install", "apt install", "apt-get install",
+        "dnf install", "yum install", "pacman -S", "apk add", "brew install",
+        "zypper install", "emerge",
     };
     for (phrases) |phrase| {
-        if (containsPhrase(command, phrase)) return true;
+        if (phraseAtBoundary(command, phrase)) return true;
     }
     return false;
 }
 
-/// Case-insensitive prefix match against the first whitespace-delimited token.
-fn startsWithToken(command: []const u8, token: []const u8) bool {
-    var it = std.mem.tokenizeScalar(u8, command, ' ');
-    const first = it.next() orelse return false;
-    return containsIgnoreCase(first, token);
+/// Case-insensitive check that `needle` appears as a whole token anywhere in
+/// `command`, where tokens are split on whitespace AND shell metacharacters
+/// (`; | & ( ) < > / . \'"\\``). This catches `apt;install`, `/usr/bin/apt`,
+/// `./apt`, and `apt\ninstall` — all of which a space-only split would miss.
+/// Copy `command` into `buf`, mapping shell metacharacters that act as token
+/// separators but are not spaces (newline, tab, `; | & ( ) < > / . ' " \``) to a
+/// single space, and collapsing runs of whitespace to one space, so a space-only
+/// split sees `apt;install` / `/usr/bin/apt` / `apt\ninstall` / `pip  install`
+/// (double space) as the same tokens as `apt install`. Returns a slice of `buf`
+/// (caller owns buf).
+fn normalizeShell(command: []const u8, buf: []u8) []u8 {
+    var n: usize = 0;
+    var prev_space = false;
+    for (command) |ch| {
+        const is_sep = ch == '\n' or ch == '\t' or ch == ';' or ch == '|' or ch == '&' or
+            ch == '(' or ch == ')' or ch == '<' or ch == '>' or ch == '/' or
+            ch == '.' or ch == '\'' or ch == '"' or ch == '`';
+        const space = is_sep or ch == ' ';
+        // Collapse separators/whitespace runs into a single space.
+        if (space and prev_space) continue;
+        const out: u8 = if (space) ' ' else ch;
+        if (n < buf.len) buf[n] = out;
+        n += 1;
+        prev_space = space;
+    }
+    const len = if (n > buf.len) buf.len else n;
+    return buf[0..len];
 }
 
-/// Case-insensitive exact match against any whitespace-delimited token, so
-/// `apt` matches `sudo apt install` but not `apt-cache show nginx`.
-fn containsExactToken(command: []const u8, token: []const u8) bool {
-    var it = std.mem.tokenizeScalar(u8, command, ' ');
+fn tokenContains(command: []const u8, needle: []const u8) bool {
+    // Normalize shell metacharacters to spaces so `apt\ninstall` and
+    // `pip\tinstall` split into the same tokens as `apt install`.
+    var buf: [4096]u8 = undefined;
+    const normalized = normalizeShell(command, &buf);
+    var it = std.mem.tokenizeScalar(u8, normalized, ' ');
     while (it.next()) |tok| {
-        if (std.ascii.eqlIgnoreCase(tok, token)) return true;
+        if (std.ascii.eqlIgnoreCase(tok, needle)) return true;
     }
     return false;
 }
 
-/// Case-insensitive match of `phrase` (which may contain spaces) only when
-/// bounded by word boundaries (string edges or whitespace), so `pip install`
-/// inside `pip install --user x` matches but `equip installation` does not.
-fn containsPhrase(command: []const u8, phrase: []const u8) bool {
+/// Case-insensitive match of `phrase` (may contain spaces) only when bounded
+/// by word boundaries (string edges or any shell metacharacter/whitespace), so
+/// `pip install` inside `pip install --user x` matches but `equip installation`
+/// does not. Advances past the match to avoid infinite loops on overlap.
+fn phraseAtBoundary(command: []const u8, phrase: []const u8) bool {
+    // Normalize so `apt\ninstall` still trips the `apt install` phrase.
+    var buf: [4096]u8 = undefined;
+    const normalized = normalizeShell(command, &buf);
     var idx: usize = 0;
-    while (idx < command.len) {
-        const at = std.mem.indexOf(u8, command[idx..], phrase) orelse return false;
+    while (idx < normalized.len) {
+        const at = std.mem.indexOf(u8, normalized[idx..], phrase) orelse return false;
         const abs = idx + at;
-        const before_ok = abs == 0 or std.ascii.isWhitespace(command[abs - 1]);
-        const after = abs + phrase.len;
-        const after_ok = after >= command.len or std.ascii.isWhitespace(command[after]);
+        const before_ok = abs == 0 or isBoundary(normalized[abs - 1]);
+        const after_pos = abs + phrase.len;
+        const after_ok = after_pos >= normalized.len or isBoundary(normalized[after_pos]);
         if (before_ok and after_ok) return true;
-        idx = after;
+        idx = after_pos + 1;
     }
     return false;
+}
+
+/// True for whitespace or any shell metacharacter that separates tokens.
+fn isBoundary(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == ';' or c == '|'
+        or c == '&' or c == '(' or c == ')' or c == '<' or c == '>'
+        or c == '/' or c == '.' or c == '"' or c == '\'' or c == '`';
 }
 
 /// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
@@ -592,4 +644,33 @@ test "local classifier still allows safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
     // `apt` substring inside an unrelated word must not false-positive.
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
+}
+
+test "RT semicolon" { try std.testing.expectEqual(Verdict.unsafe, localClassify("apt;install nginx")); }
+test "RT fullpath" { try std.testing.expectEqual(Verdict.unsafe, localClassify("/usr/bin/apt install nginx")); }
+test "RT doublespace" { try std.testing.expectEqual(Verdict.unsafe, localClassify("pip  install requests")); }
+test "RT newline" { try std.testing.expectEqual(Verdict.unsafe, localClassify("apt\ninstall nginx")); }
+test "RT relpath" { try std.testing.expectEqual(Verdict.unsafe, localClassify("./apt install nginx")); }
+test "RT sudo semicolon" { try std.testing.expectEqual(Verdict.unsafe, localClassify("sudo;apt install nginx")); }
+test "RT env prefix" { try std.testing.expectEqual(Verdict.unsafe, localClassify("env X=1 sudo apt install")); }
+test "RT exec prefix" { try std.testing.expectEqual(Verdict.unsafe, localClassify("exec sudo apt install")); }
+test "RT pip module" { try std.testing.expectEqual(Verdict.unsafe, localClassify("python -m pip install x")); }
+
+
+test "privileged pm: additional managers are unsafe" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("cargo install foo"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("gem install rails"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("go install x@latest"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("conda install numpy"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("snap install vlc"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("flatpak install org.gimp.GIMP"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("zypper install git"));
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("emerge vim"));
+}
+
+test "privileged pm: no false positives on safe reads" {
+    try std.testing.expectEqual(Verdict.safe, localClassify("apt-cache show nginx"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("pip show requests"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
+    try std.testing.expectEqual(Verdict.safe, localClassify("equip installation kit"));
 }
