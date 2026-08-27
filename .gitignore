@@ -28,3 +28,14 @@ zig-cache-session/
 .soloncode/
 .opencode/
 test_venv
+
+## Scratch / plan / review artifacts (keep out of commits)
+.rubik/
+_plan/
+grep-comparison-test/
+scratch/
+vendor/local-models/
+pr-68-review.md
+proposal-lua-plugin-sdk-bridge-2026-08-20.md
+redteam_test
+resolve_test
