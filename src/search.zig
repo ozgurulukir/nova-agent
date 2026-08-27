@@ -968,6 +968,9 @@ test "initBackend returns failed outcome when walkSelectively allocation fails" 
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
+    // fail_index = 1: alloc #0 (cwd_duped) succeeds; alloc #1
+    // (dir.walkSelectively) fails with OutOfMemory. openDir does not
+    // use the user-supplied allocator, so the sequence is deterministic.
     var failing_allocator = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
     const failing_gpa = failing_allocator.allocator();
 
