@@ -16,8 +16,11 @@ const skill_mod = @import("skill.zig");
 
 const log = std.log.scoped(.plugin_prompt);
 
-/// Per-plugin limit on a `prompt.md` body, matching the SKILL.md cap.
-const max_body_bytes: u32 = 256 * 1024;
+/// Per-plugin limit on a `prompt.md` body (32 KB per plugin).
+pub const max_body_bytes: u32 = 32 * 1024;
+
+/// Maximum aggregate bytes of all plugin prompt bodies combined (64 KB).
+pub const max_aggregate_prompt_bytes: usize = 64 * 1024;
 
 /// One plugin's prompt text, ready to render into the system prompt.
 ///
@@ -74,7 +77,7 @@ pub fn loadAll(
 /// Returns an empty string when there are no prompts so callers can append
 /// unconditionally. The output opens with a one-line preamble and wraps each
 /// prompt in `<plugin_prompts>` / `<plugin>` tags, parallel to
-/// `skill_mod.formatForPrompt`.
+/// `skill_mod.formatForPrompt`. Enforces the aggregate plugin prompt budget (64 KB).
 pub fn formatForPrompt(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![]u8 {
     if (prompts.len == 0) return gpa.alloc(u8, 0);
 
@@ -83,15 +86,25 @@ pub fn formatForPrompt(gpa: std.mem.Allocator, prompts: []const PluginPrompt) ![
 
     try out.writer.writeAll("\n\nThe following plugins provide tools. Use their instructions to call the tools correctly.\n\n");
     try out.writer.writeAll("<plugin_prompts>\n");
+    var total_bytes: usize = 0;
     for (prompts) |prompt| {
+        assert(prompt.name.len > 0);
         assert(prompt.body.len > 0);
-        try out.writer.writeAll("  <plugin name=\"");
-        try skill_mod.writeXmlEscaped(&out.writer, prompt.name);
-        try out.writer.writeAll("\">\n");
-        // The body is untrusted (a plugin author's prompt.md); escape it so a
-        // `</plugin>` / `</plugin_prompts>` inside cannot break out of the block.
-        try skill_mod.writeXmlEscaped(&out.writer, prompt.body);
-        try out.writer.writeAll("\n  </plugin>\n");
+        if (total_bytes + prompt.body.len <= max_aggregate_prompt_bytes) {
+            try out.writer.writeAll("  <plugin name=\"");
+            try skill_mod.writeXmlEscaped(&out.writer, prompt.name);
+            try out.writer.writeAll("\">\n");
+            // The body is untrusted (a plugin author's prompt.md); escape it so a
+            // `</plugin>` / `</plugin_prompts>` inside cannot break out of the block.
+            try skill_mod.writeXmlEscaped(&out.writer, prompt.body);
+            try out.writer.writeAll("\n  </plugin>\n");
+            total_bytes += prompt.body.len;
+        } else {
+            try out.writer.writeAll("  <plugin name=\"");
+            try skill_mod.writeXmlEscaped(&out.writer, prompt.name);
+            try out.writer.writeAll("\" error=\"aggregate plugin prompt budget exhausted (64 KB)\"></plugin>\n");
+            total_bytes = max_aggregate_prompt_bytes;
+        }
     }
     try out.writer.writeAll("</plugin_prompts>");
     return out.toOwnedSlice();
@@ -379,4 +392,75 @@ test "cloneAll produces independent copies" {
     try std.testing.expectEqual(@as(usize, 1), clone.len);
     try std.testing.expectEqualStrings("p", clone[0].name);
     try std.testing.expect(clone[0].body.ptr != src[0].body.ptr);
+}
+
+test "loadOne rejects prompt.md exceeding max_body_bytes (32 KB)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+
+    const rel_dir = ".zig-cache/plugin-prompt-oversized-test";
+    const plugins_dir = rel_dir ++ "/.nova/plugins/big-plugin";
+    try std.Io.Dir.createDirPath(.cwd(), io, plugins_dir);
+
+    const prompt_path = plugins_dir ++ "/prompt.md";
+    var file = try std.Io.Dir.createFile(.cwd(), io, prompt_path, .{ .truncate = true });
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    const chunk = "a" ** 1024;
+    var written: usize = 0;
+    while (written <= max_body_bytes) : (written += chunk.len) {
+        try writer.interface.writeAll(chunk);
+    }
+    try writer.interface.flush();
+    file.close(io);
+
+    const full_path = try std.fs.path.join(gpa, &.{ root, prompt_path });
+    defer gpa.free(full_path);
+
+    try std.testing.expectError(error.FileTooBig, loadOne(gpa, io, full_path, "big-plugin"));
+}
+
+test "formatForPrompt enforces 64 KB aggregate cap and emits omission notice" {
+    const gpa = std.testing.allocator;
+
+    var prompts = try gpa.alloc(PluginPrompt, 3);
+    defer deinitAll(gpa, prompts);
+
+    // Plugin 1: 30 KB
+    const body1 = try gpa.alloc(u8, 30 * 1024);
+    @memset(body1, 'a');
+    prompts[0] = .{
+        .name = try gpa.dupe(u8, "plugin-1"),
+        .body = body1,
+        .path = try gpa.dupe(u8, "/tmp/p1.md"),
+    };
+
+    // Plugin 2: 30 KB (cumulative = 60 KB <= 64 KB)
+    const body2 = try gpa.alloc(u8, 30 * 1024);
+    @memset(body2, 'b');
+    prompts[1] = .{
+        .name = try gpa.dupe(u8, "plugin-2"),
+        .body = body2,
+        .path = try gpa.dupe(u8, "/tmp/p2.md"),
+    };
+
+    // Plugin 3: 10 KB (cumulative would be 70 KB > 64 KB -> omitted with error)
+    const body3 = try gpa.alloc(u8, 10 * 1024);
+    @memset(body3, 'c');
+    prompts[2] = .{
+        .name = try gpa.dupe(u8, "plugin-3"),
+        .body = body3,
+        .path = try gpa.dupe(u8, "/tmp/p3.md"),
+    };
+
+    const text = try formatForPrompt(gpa, prompts);
+    defer gpa.free(text);
+
+    // Plugin 1 and Plugin 2 are rendered with content
+    try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"plugin-1\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"plugin-2\">") != null);
+    // Plugin 3 is omitted with error attribute
+    try std.testing.expect(std.mem.indexOf(u8, text, "<plugin name=\"plugin-3\" error=\"aggregate plugin prompt budget exhausted (64 KB)\"></plugin>") != null);
 }

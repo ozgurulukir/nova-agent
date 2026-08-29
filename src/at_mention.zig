@@ -263,7 +263,7 @@ fn appendFileTag(
     defer gpa.free(pruned);
     try writer.print("\">\n", .{});
     try skill_mod.writeXmlEscaped(writer, pruned);
-    try writer.print("\n[file truncated: {d} bytes — re-read with read_file if you need the rest]\n</file>", .{size});
+    try writer.print("\n[file truncated: {d} bytes — re-read via shell if you need the rest]\n</file>", .{size});
     remaining.* -= @min(cap, remaining.*);
 }
 
@@ -445,7 +445,7 @@ test "mention inlining truncates a per-file oversized file with a notice" {
     defer gpa.free(text);
     // The truncation notice and the recovery hint are present.
     try std.testing.expect(std.mem.indexOf(u8, text, "file truncated") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "re-read with read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "re-read via shell") != null);
     // The sandwich keeps the head AND the conclusion tail.
     try std.testing.expect(std.mem.indexOf(u8, text, "HEAD_MARKER") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "TAIL_MARKER") != null);

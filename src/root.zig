@@ -244,14 +244,15 @@ fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error!
     return gpa.dupe(u8, "");
 }
 
-/// The default system prompt, selected at comptime for the host shell: the
-/// `pwsh` variant on Windows, the `bash` variant elsewhere. `system.md` on
-/// POSIX is byte-identical to before this change.
-fn defaultSystemPrompt() []const u8 {
-    return comptime if (os.is_windows)
-        @embedFile("prompts/system-windows.md")
-    else
-        @embedFile("prompts/system.md");
+/// The default system prompt, composed at comptime from the shared
+/// system-common.md template and the platform shell fragment (system-pwsh.md
+/// on Windows, system-bash.md elsewhere).
+pub fn defaultSystemPrompt() []const u8 {
+    return comptime @embedFile("prompts/system-common.md") ++ "\n\n" ++
+        (if (os.is_windows)
+            @embedFile("prompts/system-pwsh.md")
+        else
+            @embedFile("prompts/system-bash.md"));
 }
 
 /// Handle `nova --version`. Returns true when the flag was present and the
