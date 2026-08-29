@@ -8,6 +8,7 @@ const background = @import("background.zig");
 const background_tool = @import("tools/background.zig");
 const bash_tool = @import("tools/bash.zig");
 const lane_bridge = @import("tools/lane_bridge.zig");
+const lane_tool = @import("tools/lane.zig");
 const lua_mod = @import("lua/root.zig");
 const mcp_client_mod = @import("mcp/client.zig");
 const mcp_mod = @import("mcp/manager.zig");
@@ -21,6 +22,10 @@ const tools = @import("tools.zig");
 const tool_display = @import("tools/display.zig");
 const executor_safety = @import("tools/executor_safety.zig");
 const executor_validation = @import("tools/executor_validation.zig");
+
+// The public builtin registry intentionally blocks workspace commands. These
+// tests exercise the retained internal lifecycle path explicitly instead.
+const internal_lane_test_tools = [_]tools.Tool{ lane_tool.internal_tool, tools.shell_tool };
 
 const assert = std.debug.assert;
 
@@ -1284,6 +1289,8 @@ test "executor re-roots mid-batch after lane enter" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, cwd_abs, .none);
     defer agent.deinit();
     var bridge: lane_bridge.LaneBridge = .{};
+    var registry = try tools.ToolRegistry.init(gpa, &internal_lane_test_tools);
+    defer registry.deinit(gpa);
 
     const Handler = struct {
         fn handle(ctx: *anyopaque, req: *const lane_bridge.Request) ?lane_bridge.Response {
@@ -1319,6 +1326,7 @@ test "executor re-roots mid-batch after lane enter" {
         .cwd = cwd_abs,
         .lane_bridge = &bridge,
         .lane_requester = &agent,
+        .tool_registry = &registry,
     });
 
     const Worker = struct {
@@ -1372,6 +1380,8 @@ test "executor re-roots back on lane leave" {
     var agent = agent_mod.Agent.init(gpa, std.testing.io, cwd_abs, .none);
     defer agent.deinit();
     var bridge: lane_bridge.LaneBridge = .{};
+    var registry = try tools.ToolRegistry.init(gpa, &internal_lane_test_tools);
+    defer registry.deinit(gpa);
 
     const Handler = struct {
         fn handle(ctx: *anyopaque, req: *const lane_bridge.Request) ?lane_bridge.Response {
@@ -1401,6 +1411,7 @@ test "executor re-roots back on lane leave" {
         .cwd = cwd_abs,
         .lane_bridge = &bridge,
         .lane_requester = &agent,
+        .tool_registry = &registry,
     });
 
     const Worker = struct {

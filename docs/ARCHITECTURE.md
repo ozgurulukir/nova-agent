@@ -27,14 +27,21 @@ Nova exposes the following tools:
 - `bash` (on Linux/macOS) / `pwsh` (on Windows)
 - `lane`
 
-`bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Bash auto-review](#bash-auto-review) below.
+`bash` has some middleware written for it that makes it friendlier for agent use. For example, large outputs from a `cat` command are written to a temp file and the agent is told the full is in that file if needed. See [Shell Safety & Auto-Review](#shell-safety--auto-review) below.
 
-`lane` gives the model first-class access to Nova's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. Two modes:
+`lane` gives the model first-class access to Nova's parallel-lane substrate: isolated git worktrees the TUI tiles side-by-side. It is a *bridge* tool — the tool runs on the lane's worker thread, so every action is posted across a `LaneBridge` (`src/tools/lane_bridge.zig`) and resolved by the UI on its tick. The model-facing surface is orchestration-only: `list`, `spawn`, `read`, `await`, `steer`, `cancel`, `merge`, and `delete`.
 
-- **Workspace mode** (`lane create`/`enter`/`leave`/`merge`): the driver's `Agent.workspace` is set to the lane's worktree path, and the per-batch executor re-roots at it (`effectiveCwd`) — bash/file/python calls then run inside the lane, and the lane branch folds back with `lane merge`.
-- **Orchestration mode** (`lane spawn`/`read`/`await`/`cancel`/`steer`): the driver spawns independent worker agents into fresh live lanes that run concurrently on their own worker threads; completion is delivered back to the driver (`deliverPendingLaneCompletions`) and finished workers are auto-parked (runtime freed, transcript kept).
+The primary driver remains rooted in the repository and supervises independent
+worker agents. Workers run concurrently on their own threads; completion is
+delivered back to the driver (`deliverPendingLaneCompletions`) and finished
+workers are auto-parked (runtime freed, transcript kept). Internal workspace
+state (`Agent.workspace` and executor `effectiveCwd` re-rooting) remains for
+compatibility with lifecycle code and tests, but model commands cannot reach it.
 
-Only the driver lane may `spawn`/`enter`/`merge` — a worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s containment guarantees are unchanged (lane roots are valid only because Nova owns them).
+Only the primary driver may supervise workers or integrate their branches; a
+worker gets `list`/`read` only. The 4-lane cap applies; `validateCwd`'s
+containment guarantees are unchanged (lane roots are valid only because Nova
+owns them).
 
 See [Parallel](#parallel) for the user-facing lane model.
 
@@ -63,7 +70,15 @@ The session store (`sessions.sqlite`) records the active `model_provider`, `mode
 
 ## Parallel
 
-Subagent workflows are achieved by the `/parallel` command which creates a separate git worktree for your agent to work in. The TUI supports tiling so you can have multiple agents on the screen at any time. We call each tile a `lane`. The maximum number of lanes that can be active is currently 4, because that is the empirical limit for the mental load required to manage all agents effectively.
+Subagent workflows are achieved by the `/parallel` command which creates a
+separate git worktree and live runtime for a user-selected agent. The TUI
+supports tiling so multiple agents can be on the screen at any time. We call
+each tile a `lane`. In `grid` or `tab` mode the selected lane receives user
+prompts; `dual` keeps the primary as the input target. `/close` parks the
+selected lane, while the user can open the UI merge flow from an idle lane or
+the primary driver can merge/delete it by lane id. The maximum number of lanes
+that can be active is currently 4, because that is the empirical limit for the
+mental load required to manage all agents effectively.
 
 A lane starts on a random `nova/<hex>` branch. On its first prompt, the session's own model is asked (in parallel with the turn) for a descriptive branch name based on that prompt and the last few messages of the parent lane. When the answer lands, the branch is renamed in place (`nova/<name>`) and becomes the lane's label. If the request fails or the name is unusable, the hex branch simply stays.
 

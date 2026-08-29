@@ -275,9 +275,22 @@ Chat-completions `stream_parser.zig` carries a **hard** cap (`tool_call_array_ca
 
 
 
-### Lane driver-enter visibility rule
+### Lane workspace boundary
 
-The driver must **not** use `lane enter` as a work surface. `drawLaneColumn` (`src/tui/lane_column.zig`) renders activity purely from the lane's own turn state — the spinner only spins when a **worker** runs a turn in that lane. When the driver enters a lane and edits its worktree via `bash`/`file-tools`, the driver's tool-call activity flows to the driver's thread and pane, never to the lane's thread, so the lane pane stays visually idle (`·`) while real work happens inside it. The user sees an empty lane pane in the split grid. Isolated work should therefore go through `lane spawn` (a real worker, which makes the lane pane live) or directly in the main tree; `lane enter` is only for inspecting a lane's files, not as a work surface. See issue #23 for the full analysis and follow-up options.
+The model-facing `lane` tool is orchestration-only: the primary driver
+supervises workers with `spawn`, `read`, `await`, `steer`, `cancel`, `merge`,
+and `delete`. Internal workspace state (`Agent.workspace` and executor
+`effectiveCwd` re-rooting) remains for lifecycle compatibility and tests, but
+is not reachable through the model parser. This prevents driver tool calls from
+running in a worker worktree while preserving the existing cleanup path.
+
+`/parallel` creates a live user-selected lane. `drawLaneColumn`
+(`src/tui/lane_column.zig`) renders activity from that lane's own turn state,
+so prompts submitted in `grid` or `tab` run in the selected lane's worktree.
+`dual` keeps the primary as the input target. After the lane is idle and clean,
+the user can open `/merge` directly from the selected lane, or the primary
+driver can merge/delete it by lane id. See issue #23 for the original activity
+visibility analysis.
 
 ### Windows portability pattern
 
@@ -332,4 +345,3 @@ There is exactly **one** mid-session exception: a guarded cross-project `/resume
 Global plugins (loaded from `~/.config/nova/plugins/` or `%APPDATA%/nova/plugins/`) are never touched during a repoint — their Lua states, event subscriptions, and `require` caches survive the switch. New-project plugins that share a name with a global override the global (mirroring `loadAll` semantics).
 
 Known limitation: live lane clients keep their spawn-time `tools_json` until their client is rebuilt, matching the existing MCP-config change behavior on session switch.
-

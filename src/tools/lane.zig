@@ -3,18 +3,24 @@
 //! (threads, split, parked lanes) directly; every action is posted across the
 //! `LaneBridge` and resolved by the UI on its tick (see `lane_bridge.zig`).
 //!
-//! Workspace scoping (S5/S6): `lane enter`/`leave` mutate `Agent.workspace`
-//! (via `setWorkspace`) on this worker thread. The re-root takes effect from
-//! the next tool call — the executor refreshes its cwd from `effectiveCwd()`
-//! after every `lane` call mid-batch, so sibling calls in the same batch
-//! already run at the new root. `enter` borrows the lane's path (owned by
-//! that lane's `Thread`), never copies it.
+//! Internal workspace scoping remains covered below for lifecycle compatibility
+//! and tests, but the model-facing parser admits worker orchestration commands
+//! only. The primary model cannot re-root its own tools into another lane.
 
 const std = @import("std");
 
 const agent_mod = @import("../agent.zig");
 const common = @import("common.zig");
 const lane_bridge = @import("lane_bridge.zig");
+
+const model_commands = [_][]const u8{ "list", "spawn", "read", "await", "steer", "cancel", "merge", "delete" };
+const internal_commands = [_][]const u8{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer", "delete" };
+
+comptime {
+    for (model_commands) |command| {
+        if (opFromString(command) == null) @compileError("model lane command is not a lane_bridge.Op");
+    }
+}
 
 pub const tool: common.Tool = .{
     .name = "lane",
@@ -30,14 +36,14 @@ pub const tool: common.Tool = .{
             .{
                 .name = "command",
                 .kind = .string,
-                .description = "The lane operation to perform. Always required — one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer, delete.",
+                .description = "The worker-lane operation to perform. Always required — one of: list, spawn, read, await, steer, cancel, merge, delete.",
                 .required = true,
-                .enum_values = &.{ "list", "create", "enter", "leave", "merge", "spawn", "read", "cancel", "await", "steer", "delete" },
+                .enum_values = &model_commands,
             },
             .{
                 .name = "purpose",
                 .kind = .string,
-                .description = "What the lane is for. Required for `create` (becomes the lane's visible title); naming context for `spawn`.",
+                .description = "Optional naming context for `spawn`.",
                 .required = false,
                 .nullable = true,
             },
@@ -51,7 +57,7 @@ pub const tool: common.Tool = .{
             .{
                 .name = "lane",
                 .kind = .string,
-                .description = "Lane id (the hex id shown by `lane list`). Required for `enter`, `leave`, `merge`, `read`, `cancel`, `await`, `steer`, `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`/`create`.",
+                .description = "Lane id (the hex id shown by `lane list`). Required for `merge`, `read`, `cancel`, `await`, `steer`, and `delete`; optional for `spawn` (targets an existing idle lane to reuse its worktree — omit to create a fresh one). Unused for `list`.",
                 .required = false,
                 .nullable = true,
             },
@@ -65,6 +71,24 @@ pub const tool: common.Tool = .{
         },
     },
     .run = runTool,
+    .display = display,
+};
+
+/// Internal lifecycle tool used by executor tests for workspace re-rooting.
+/// It is deliberately not included in the builtin registry or model schema.
+pub const internal_tool: common.Tool = .{
+    .name = "lane",
+    .description = "Internal lane lifecycle bridge.",
+    .schema = .{
+        .properties = &.{
+            .{ .name = "command", .kind = .string, .description = "Internal lane operation.", .required = true, .enum_values = &internal_commands },
+            .{ .name = "purpose", .kind = .string, .description = "Lane purpose.", .required = false, .nullable = true },
+            .{ .name = "task", .kind = .string, .description = "Worker task.", .required = false, .nullable = true },
+            .{ .name = "lane", .kind = .string, .description = "Lane id.", .required = false, .nullable = true },
+            .{ .name = "steer", .kind = .string, .description = "Steering message.", .required = false, .nullable = true },
+        },
+    },
+    .run = runInternalTool,
     .display = display,
 };
 
@@ -96,9 +120,17 @@ const JsonArgs = struct {
     id: ?[]const u8 = null,
 };
 
-const ParseError = error{ InvalidAction, WrongField, OutOfMemory };
+const ParseError = error{ InvalidAction, DriverOnlyAction, WrongField, OutOfMemory };
 
 fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
+    return parseArgsWithMode(gpa, arguments, false);
+}
+
+fn parseInternalArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
+    return parseArgsWithMode(gpa, arguments, true);
+}
+
+fn parseArgsWithMode(gpa: std.mem.Allocator, arguments: []const u8, allow_workspace_ops: bool) ParseError!Args {
     const parsed = std.json.parseFromSlice(JsonArgs, gpa, arguments, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidAction,
@@ -106,6 +138,7 @@ fn parseArgs(gpa: std.mem.Allocator, arguments: []const u8) ParseError!Args {
     defer parsed.deinit();
     const command_str = parsed.value.command orelse return error.InvalidAction;
     const command = opFromString(command_str) orelse return error.InvalidAction;
+    if (!allow_workspace_ops and !isModelCommand(command_str)) return error.DriverOnlyAction;
 
     // The canonical field is `lane`. `id` is a common model guess (the bare
     // value surfaces unlabelled in `lane list`), so reject it explicitly instead
@@ -131,18 +164,31 @@ fn opFromString(s: []const u8) ?lane_bridge.Op {
     return null;
 }
 
+fn isModelCommand(s: []const u8) bool {
+    for (model_commands) |command| {
+        if (std.mem.eql(u8, s, command)) return true;
+    }
+    return false;
+}
+
 fn parseError(gpa: std.mem.Allocator, err: ParseError) common.Error!common.Output {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.DriverOnlyAction => common.failFmt(
+            gpa,
+            1,
+            "lane: driver workspace commands (`create`, `enter`, `leave`) are unavailable to the model; use `spawn` for worker work\n",
+            .{},
+        ),
         error.InvalidAction => common.failFmt(
             gpa,
             1,
-            "lane: invalid arguments — `command` must be one of: list, create, enter, leave, merge, spawn, read, cancel, await, steer, delete\n",
+            "lane: invalid arguments — `command` must be one of: list, spawn, read, await, steer, cancel, merge, delete; driver workspace commands are unavailable to the model\n",
             .{},
         ),
         // Models learn the field name from output + schema; a misspelled `id`
         // must surface as a named-field hint, not a silent drop. Points at the
-        // canonical `lane` field for id-bearing ops and at `purpose` for create.
+        // canonical `lane` field for id-bearing worker operations.
         error.WrongField => common.failFmt(
             gpa,
             1,
@@ -159,6 +205,27 @@ pub fn runTool(
     arguments: []const u8,
     userdata: *anyopaque,
 ) common.Error!common.Output {
+    return runToolWithMode(gpa, io, cwd, arguments, userdata, false);
+}
+
+pub fn runInternalTool(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
+    userdata: *anyopaque,
+) common.Error!common.Output {
+    return runToolWithMode(gpa, io, cwd, arguments, userdata, true);
+}
+
+fn runToolWithMode(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    arguments: []const u8,
+    userdata: *anyopaque,
+    allow_workspace_ops: bool,
+) common.Error!common.Output {
     _ = cwd;
     _ = userdata;
     // Null slot is defined behavior: headless/tests have no bridge.
@@ -166,7 +233,7 @@ pub fn runTool(
     const bridge = slot.bridge orelse return common.failFmt(gpa, 1, "lane: lanes are unavailable in this context\n", .{});
     const requester = slot.requester orelse return common.failFmt(gpa, 1, "lane: no lane requester attached\n", .{});
 
-    var parsed = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
+    var parsed = parseArgsWithMode(gpa, arguments, allow_workspace_ops) catch |err| return parseError(gpa, err);
     defer parsed.deinit(gpa);
 
     var req = lane_bridge.Request{
@@ -250,6 +317,49 @@ test "lane rejects a missing or unknown command" {
     try std.testing.expectError(error.InvalidAction, parseArgs(gpa, "{\"action\":\"list\"}"));
 }
 
+test "lane accepts only model worker commands" {
+    const gpa = std.testing.allocator;
+    const property = tool.schema.properties[0];
+    const enum_values = property.enum_values.?;
+    try std.testing.expectEqual(model_commands.len, enum_values.len);
+    for (model_commands, enum_values) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+        const arguments = try std.fmt.allocPrint(gpa, "{{\"command\":\"{s}\"}}", .{expected});
+        defer gpa.free(arguments);
+        var args = try parseArgs(gpa, arguments);
+        defer args.deinit(gpa);
+        try std.testing.expectEqual(opFromString(expected).?, args.command);
+    }
+    try std.testing.expectError(error.DriverOnlyAction, parseArgs(gpa, "{\"command\":\"create\"}"));
+    try std.testing.expectError(error.DriverOnlyAction, parseArgs(gpa, "{\"command\":\"enter\"}"));
+    try std.testing.expectError(error.DriverOnlyAction, parseArgs(gpa, "{\"command\":\"leave\"}"));
+}
+
+test "lane reports driver-only commands without posting a bridge request" {
+    const gpa = std.testing.allocator;
+    var bridge: lane_bridge.LaneBridge = .{};
+    const AgentAligned = struct { _: u8 align(@alignOf(agent_mod.Agent)) };
+    var dummy: AgentAligned = .{ ._ = 0 };
+
+    const prev = lane_bridge.lane_bridge_slot;
+    defer lane_bridge.lane_bridge_slot = prev;
+    lane_bridge.lane_bridge_slot = .{ .bridge = &bridge, .requester = &dummy };
+
+    var output = try runTool(gpa, std.testing.io, ".", "{\"command\":\"enter\"}", undefined);
+    defer output.deinit(gpa);
+    try std.testing.expectEqual(@as(u8, 1), output.code);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "unavailable to the model") != null);
+    try std.testing.expect(bridge.pending == null);
+}
+
+test "lane invalid-action diagnostics advertise only worker commands" {
+    const gpa = std.testing.allocator;
+    var output = try parseError(gpa, error.InvalidAction);
+    defer output.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "list, spawn, read, await, steer, cancel, merge, delete") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.stderr, "list, create") == null);
+}
+
 test "lane rejects an `id` field and points at the canonical `lane` field" {
     // The canonical lane-id field is `lane`. A common model guess is `id`
     // (the bare value surfaces unlabelled in `lane list`, so models infer the
@@ -257,9 +367,6 @@ test "lane rejects an `id` field and points at the canonical `lane` field" {
     // otherwise the model loops on "needs a lane id" while believing it sent one.
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.WrongField, parseArgs(gpa, "{\"command\":\"read\",\"id\":\"e1e94861c257\"}"));
-    // Same on create: the model often tries `id` for a lane name, but create's
-    // title field is `purpose`.
-    try std.testing.expectError(error.WrongField, parseArgs(gpa, "{\"command\":\"create\",\"id\":\"dh01-defaults\"}"));
 }
 
 test "lane prefers the canonical `lane` field when both `lane` and `id` are present" {
@@ -270,11 +377,10 @@ test "lane prefers the canonical `lane` field when both `lane` and `id` are pres
     try std.testing.expectEqualStrings("abc", args.lane.?);
 }
 
-test "lane opFromString round-trips every op" {
-    const ops = std.meta.tags(lane_bridge.Op);
-    inline for (ops) |op| {
-        try std.testing.expectEqual(op, opFromString(@tagName(op)).?);
-    }
+test "lane opFromString still resolves internal operations" {
+    try std.testing.expectEqual(lane_bridge.Op.create, opFromString("create").?);
+    try std.testing.expectEqual(lane_bridge.Op.enter, opFromString("enter").?);
+    try std.testing.expectEqual(lane_bridge.Op.leave, opFromString("leave").?);
     try std.testing.expect(opFromString("bogus") == null);
 }
 
@@ -403,7 +509,7 @@ test "lane enter/leave write the agent workspace via the bridge" {
         fn run(b: *lane_bridge.LaneBridge, a: *agent_mod.Agent, action: []const u8) void {
             const args = std.fmt.allocPrint(std.testing.allocator, "{{\"command\":\"{s}\"}}", .{action}) catch unreachable;
             defer std.testing.allocator.free(args);
-            var output = runTool(std.testing.allocator, std.testing.io, ".", args, undefined) catch |err| {
+            var output = runInternalTool(std.testing.allocator, std.testing.io, ".", args, undefined) catch |err| {
                 std.debug.print("runTool failed: {s}\n", .{@errorName(err)});
                 return;
             };
