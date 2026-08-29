@@ -934,7 +934,10 @@ fn listLanes(app: *App) ?Resp {
         } else {
             const id = laneIdOf(lane) orelse "";
             const branch = if (lanes_util.workingLaneOf(lane)) |wl| wl.branch else "(primary)";
-            out.writer.print("  [{d}] {s} {s} ({s}) {s}{s}{s}\n", .{ i, id, title, branch, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
+            // Keep the model-facing identifier explicit. The old numeric
+            // position (`[1]`) looked like a usable lane id, but resolution
+            // accepts only the hex worktree id.
+            out.writer.print("  worker lane={s} title={s} branch={s} status={s}{s}{s}\n", .{ id, title, branch, status, active_marker, ws_marker }) catch return failResp(gpa, "lane: out of memory\n", .{});
         }
     }
     if (driver_ws) |ws| {
@@ -3578,7 +3581,8 @@ test "listLanes formats primary driver lane and worker lanes correctly" {
     const res2 = listLanes(&app).?;
     defer gpa.free(res2.text);
     try std.testing.expect(std.mem.indexOf(u8, res2.text, "[0] primary (driver / repo root)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, res2.text, "[1] c8882753bb24 feature-x (nova/c8882753bb24)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res2.text, "worker lane=c8882753bb24 title=feature-x branch=nova/c8882753bb24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res2.text, "[1] c8882753bb24") == null);
 }
 
 test "primary guard intercepts worker operations on primary IDs" {
