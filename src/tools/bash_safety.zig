@@ -115,8 +115,8 @@ fn isPrivilegedPackageManagement(command: []const u8) bool {
     // "apt", while "/usr/bin/apt", "./apt" and "apt;install" still split to the
     // bare "apt" token.
     const managers = [_][]const u8{
-        "apt", "apt-get", "dpkg", "dnf", "yum", "pacman", "apk", "brew",
-        "zypper", "emerge", "aptitude", "nix-env", "snap",
+        "apt",    "apt-get", "dpkg",     "dnf",     "yum",  "pacman", "apk", "brew",
+        "zypper", "emerge",  "aptitude", "nix-env", "snap",
     };
     for (managers) |mgr| {
         if (tokenContains(command, mgr)) return true;
@@ -127,11 +127,11 @@ fn isPrivilegedPackageManagement(command: []const u8) bool {
     // Install verbs that require an explicit subcommand; matched only at word
     // boundaries so "pip show" / "apt-cache show" stay safe reads.
     const phrases = [_][]const u8{
-        "pip install", "pip3 install", "npm install -g", "npm i -g",
-        "cargo install", "gem install", "go install", "conda install",
-        "snap install", "flatpak install", "apt install", "apt-get install",
-        "dnf install", "yum install", "pacman -S", "apk add", "brew install",
-        "zypper install", "emerge",
+        "pip install",   "pip3 install",    "npm install -g", "npm i -g",
+        "cargo install", "gem install",     "go install",     "conda install",
+        "snap install",  "flatpak install", "apt install",    "apt-get install",
+        "dnf install",   "yum install",     "pacman -S",      "apk add",
+        "brew install",  "zypper install",  "emerge",
     };
     for (phrases) |phrase| {
         if (phraseAtBoundary(command, phrase)) return true;
@@ -203,9 +203,7 @@ fn phraseAtBoundary(command: []const u8, phrase: []const u8) bool {
 
 /// True for whitespace or any shell metacharacter that separates tokens.
 fn isBoundary(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == ';' or c == '|'
-        or c == '&' or c == '(' or c == ')' or c == '<' or c == '>'
-        or c == '/' or c == '.' or c == '"' or c == '\'' or c == '`';
+    return c == ' ' or c == '\t' or c == '\n' or c == ';' or c == '|' or c == '&' or c == '(' or c == ')' or c == '<' or c == '>' or c == '/' or c == '.' or c == '"' or c == '\'' or c == '`';
 }
 
 /// PowerShell fork-bomb equivalents: recursive `while($true){Start-Job ...}`
@@ -646,16 +644,33 @@ test "local classifier still allows safe reads" {
     try std.testing.expectEqual(Verdict.safe, localClassify("cat adapter.log"));
 }
 
-test "RT semicolon" { try std.testing.expectEqual(Verdict.unsafe, localClassify("apt;install nginx")); }
-test "RT fullpath" { try std.testing.expectEqual(Verdict.unsafe, localClassify("/usr/bin/apt install nginx")); }
-test "RT doublespace" { try std.testing.expectEqual(Verdict.unsafe, localClassify("pip  install requests")); }
-test "RT newline" { try std.testing.expectEqual(Verdict.unsafe, localClassify("apt\ninstall nginx")); }
-test "RT relpath" { try std.testing.expectEqual(Verdict.unsafe, localClassify("./apt install nginx")); }
-test "RT sudo semicolon" { try std.testing.expectEqual(Verdict.unsafe, localClassify("sudo;apt install nginx")); }
-test "RT env prefix" { try std.testing.expectEqual(Verdict.unsafe, localClassify("env X=1 sudo apt install")); }
-test "RT exec prefix" { try std.testing.expectEqual(Verdict.unsafe, localClassify("exec sudo apt install")); }
-test "RT pip module" { try std.testing.expectEqual(Verdict.unsafe, localClassify("python -m pip install x")); }
-
+test "RT semicolon" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("apt;install nginx"));
+}
+test "RT fullpath" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("/usr/bin/apt install nginx"));
+}
+test "RT doublespace" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("pip  install requests"));
+}
+test "RT newline" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("apt\ninstall nginx"));
+}
+test "RT relpath" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("./apt install nginx"));
+}
+test "RT sudo semicolon" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("sudo;apt install nginx"));
+}
+test "RT env prefix" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("env X=1 sudo apt install"));
+}
+test "RT exec prefix" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("exec sudo apt install"));
+}
+test "RT pip module" {
+    try std.testing.expectEqual(Verdict.unsafe, localClassify("python -m pip install x"));
+}
 
 test "privileged pm: additional managers are unsafe" {
     try std.testing.expectEqual(Verdict.unsafe, localClassify("cargo install foo"));
