@@ -74,12 +74,19 @@ const always_ignored_dirs: []const []const u8 = &.{
     ".gitkeep",
 };
 
+fn makeIgnoredDirsMapKV(comptime dirs: []const []const u8) [dirs.len]struct { []const u8, void } {
+    var kvs: [dirs.len]struct { []const u8, void } = undefined;
+    for (dirs, 0..) |dir, i| {
+        kvs[i] = .{ dir, {} };
+    }
+    return kvs;
+}
+
+const always_ignored_dirs_map = std.StaticStringMap(void).initComptime(makeIgnoredDirsMapKV(always_ignored_dirs));
+
 /// True when `name` is one of the directory basenames we never recurse into.
 fn isIgnoredDir(name: []const u8) bool {
-    for (always_ignored_dirs) |ignored| {
-        if (std.mem.eql(u8, name, ignored)) return true;
-    }
-    return false;
+    return always_ignored_dirs_map.has(name);
 }
 
 pub const Op = enum {
@@ -984,5 +991,29 @@ test "initBackend returns failed outcome when walkSelectively allocation fails" 
     switch (outcome) {
         .failed => |msg| try std.testing.expectEqualStrings("", msg),
         else => return error.TestExpectedFailedOutcome,
+    }
+}
+
+test "isIgnoredDir_whenNameInIgnoredList_returnsTrueAndFalseOtherwise" {
+    // Arrange
+    const sample_non_ignored = [_][]const u8{
+        "src",
+        "lib",
+        "components",
+        "docs",
+        "assets",
+        "main.zig",
+        "git",
+        "",
+    };
+
+    // Act & Assert - All ignored directory basenames must return true
+    for (always_ignored_dirs) |ignored_dir| {
+        try std.testing.expect(isIgnoredDir(ignored_dir));
+    }
+
+    // Act & Assert - Normal directory basenames must return false
+    for (sample_non_ignored) |non_ignored_dir| {
+        try std.testing.expect(!isIgnoredDir(non_ignored_dir));
     }
 }
