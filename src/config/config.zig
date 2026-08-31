@@ -329,14 +329,14 @@ pub const Config = struct {
             const major = parse_mod.parseSemverMajor(v) orelse {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "version"),
-                    .reason = try std.fmt.allocPrint(gpa, "invalid semver '{s}'", .{v}),
+                    .reason = try formatReason(gpa, "invalid semver '{s}'", .{v}),
                 } });
                 return try list.toOwnedSlice(gpa);
             };
             if (major > 2) {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "version"),
-                    .reason = try std.fmt.allocPrint(gpa, "unsupported schema version {s}", .{v}),
+                    .reason = try formatReason(gpa, "unsupported schema version {s}", .{v}),
                 } });
             }
         }
@@ -344,11 +344,20 @@ pub const Config = struct {
             if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "base_url"),
-                    .reason = try std.fmt.allocPrint(gpa, "invalid URL scheme in '{s}'", .{url}),
+                    .reason = try formatReason(gpa, "invalid URL scheme in '{s}'", .{url}),
                 } });
             }
         }
         return try list.toOwnedSlice(gpa);
+    }
+
+    fn formatReason(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
+        var buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, fmt, args)) |formatted| {
+            return gpa.dupe(u8, formatted);
+        } else |_| {
+            return std.fmt.allocPrint(gpa, fmt, args);
+        }
     }
 
     /// Alias for `clone`, used by `nova.run` to hand the TUI an owned
