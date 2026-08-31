@@ -288,6 +288,7 @@ test {
     _ = @import("tui/widgets/status_bar.zig");
     _ = @import("tui/widgets/message.zig");
     _ = @import("tui/widgets/transcript.zig");
+    _ = @import("tui/widgets/plugins_status.zig");
     // The telemetry engine (token velocity EMA + context meter) is a new
     // module; reference it here so its inline tests compile into the run
     // (AGENTS.md test-runner quirk: a file only referenced lazily is never

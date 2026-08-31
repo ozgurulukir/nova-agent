@@ -60,10 +60,11 @@ pub const Content = struct {
         for (self.plugins, 0..) |plugin, i| {
             if (row >= height - 2) break;
             const is_selected = i == self.state.selection;
+            if (is_selected) panel.fillRow(&surface, row, p.selected);
             const style = if (is_selected) p.selected_item else p.thinking_body;
             const status_icon = if (plugin.active) "●" else "○";
-            const line = try std.fmt.allocPrint(ctx.arena, "  {s} {s}", .{ status_icon, plugin.name });
-            try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
+            try panel.lineStyledAt(&surface, row, status_icon, ctx, 4, style);
+            try panel.lineStyledAt(&surface, row, plugin.name, ctx, 6, style);
             row += 1;
         }
 
@@ -76,3 +77,59 @@ pub const PluginEntry = struct {
     name: []const u8,
     active: bool,
 };
+
+
+// ---------------------------------------------------------------------------
+// Tests
+
+fn readRowGraphemes(surface: *const vxfw.Surface, row: u16, out: []u8) []const u8 {
+    var len: usize = 0;
+    var col: u16 = 0;
+    while (col < surface.size.width) : (col += 1) {
+        const cell = surface.readCell(col, row);
+        if (cell.default) continue;
+        const grapheme = cell.char.grapheme;
+        if (len + grapheme.len > out.len) break;
+        @memcpy(out[len..][0..grapheme.len], grapheme);
+        len += grapheme.len;
+    }
+    return out[0..len];
+}
+
+test "plugins_status renders active and inactive plugins without loop allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var state: State = .{ .selection = 0 };
+    const plugins = [_]PluginEntry{
+        .{ .name = "git_helper", .active = true },
+        .{ .name = "linter", .active = false },
+    };
+    var content: Content = .{
+        .state = &state,
+        .plugins = &plugins,
+    };
+
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 10 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    var surface = try content.widget().draw(ctx);
+    try std.testing.expectEqual(@as(u16, 40), surface.size.width);
+    try std.testing.expectEqual(@as(u16, 10), surface.size.height);
+
+    var buf: [128]u8 = undefined;
+    // Header at row 0
+    try std.testing.expectEqualStrings("LUA PLUGINS", readRowGraphemes(&surface, 0, &buf));
+    // Summary at row 2
+    try std.testing.expectEqualStrings("Loaded: 2", readRowGraphemes(&surface, 2, &buf));
+    // First plugin entry at row 4: "●" at col 4, "git_helper" at col 6
+    try std.testing.expectEqualStrings("●", surface.readCell(4, 4).char.grapheme);
+    try std.testing.expectEqualStrings("g", surface.readCell(6, 4).char.grapheme);
+    // Second plugin entry at row 5: "○" at col 4, "linter" at col 6
+    try std.testing.expectEqualStrings("○", surface.readCell(4, 5).char.grapheme);
+    try std.testing.expectEqualStrings("l", surface.readCell(6, 5).char.grapheme);
+}
