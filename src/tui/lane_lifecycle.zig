@@ -1831,8 +1831,11 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         const title = lane.title orelse id;
         // Acknowledged (await/read/merge consumed the result): notice only.
         if (lane.acknowledged) {
-            const note = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id });
-            defer app.gpa.free(note);
+            var note_buf: [512]u8 = undefined;
+            const note = std.fmt.bufPrint(&note_buf, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id }) catch blk: {
+                break :blk try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id });
+            };
+            defer if (note.ptr != &note_buf) app.gpa.free(note);
             _ = spawner.transcript.append(app.gpa, .notice, "lane", note) catch {};
             if (spawner == active) changed = true;
             lane.completion_delivered = true;
@@ -1848,11 +1851,16 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         // then has no reason to read the lane or clean it up. The reason also
         // sits in the lane's transcript as a notice, so `lane read` shows the
         // full detail.
+        var msg_buf: [512]u8 = undefined;
         const message = if (lane.turn_failed) |reason|
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id })
+            std.fmt.bufPrint(&msg_buf, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id }) catch blk: {
+                break :blk try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id });
+            }
         else
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
-        defer app.gpa.free(message);
+            std.fmt.bufPrint(&msg_buf, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id }) catch blk: {
+                break :blk try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
+            };
+        defer if (message.ptr != &msg_buf) app.gpa.free(message);
         // Enqueue FIRST, then notice, then mark delivered: if the spawner's
         // queue is full, nothing has been written yet (agent queue and mirror
         // alike) and the next tick retries — the worker's result is never
