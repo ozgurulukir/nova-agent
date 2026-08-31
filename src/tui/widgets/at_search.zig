@@ -117,8 +117,8 @@ const Body = struct {
         if (content.results.len == 0) {
             try panel.lineAt(&surface, 0, content.emptyMessage(), ctx, false, 0);
             if (content.notice.len > 0 and surface.size.height > 1) {
-                const notice_text = try std.fmt.allocPrint(ctx.arena, "! {s}", .{content.notice});
-                try panel.lineAt(&surface, 1, notice_text, ctx, false, 0);
+                try panel.lineAt(&surface, 1, "! ", ctx, false, 0);
+                try panel.lineAt(&surface, 1, content.notice, ctx, false, 2);
             }
             return surface;
         }
@@ -142,8 +142,8 @@ const Body = struct {
             });
         }
         if (content.notice.len > 0 and row < surface.size.height) {
-            const notice_text = try std.fmt.allocPrint(ctx.arena, "! {s}", .{content.notice});
-            try panel.lineAt(&surface, row, notice_text, ctx, false, 0);
+            try panel.lineAt(&surface, row, "! ", ctx, false, 0);
+            try panel.lineAt(&surface, row, content.notice, ctx, false, 2);
         }
         return surface;
     }
@@ -178,4 +178,67 @@ test "firstVisible keeps the selection within the window" {
     // Selection near the end keeps it pinned to the bottom edge / last window.
     try std.testing.expectEqual(@as(u32, 38), firstVisible(45, 50, 8));
     try std.testing.expectEqual(@as(u32, 42), firstVisible(49, 50, 8));
+}
+
+test "rendersNotice_whenResultsEmptyAndNoticePresent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const results = [_][]const u8{};
+    var content: Content = .{ .results = &results, .selection = 0, .query = "foo", .notice = "Search index building" };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 4 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const outer_surface = try content.widget().draw(ctx);
+    try std.testing.expect(outer_surface.children.len > 0);
+    const inner_surface = outer_surface.children[0].surface;
+
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    var col: u16 = 0;
+    while (col < inner_surface.size.width) : (col += 1) {
+        const cell = inner_surface.readCell(col, 1);
+        if (cell.default) continue;
+        const grapheme = cell.char.grapheme;
+        if (len + grapheme.len > buf.len) break;
+        @memcpy(buf[len..][0..grapheme.len], grapheme);
+        len += grapheme.len;
+    }
+    try std.testing.expectEqualStrings("! Search index building", buf[0..len]);
+}
+
+test "rendersNotice_whenResultsPresentAndNoticePresent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const results = [_][]const u8{ "src/agent.zig", "src/ai.zig" };
+    var content: Content = .{ .results = &results, .selection = 0, .query = "src", .notice = "Search error: timeout" };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 40, .height = 6 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const outer_surface = try content.widget().draw(ctx);
+    try std.testing.expect(outer_surface.children.len > 0);
+    const inner_surface = outer_surface.children[0].surface;
+
+    // Row 0 and 1 have results, row 2 has the notice.
+    var buf: [64]u8 = undefined;
+    var len: usize = 0;
+    var col: u16 = 0;
+    while (col < inner_surface.size.width) : (col += 1) {
+        const cell = inner_surface.readCell(col, 2);
+        if (cell.default) continue;
+        const grapheme = cell.char.grapheme;
+        if (len + grapheme.len > buf.len) break;
+        @memcpy(buf[len..][0..grapheme.len], grapheme);
+        len += grapheme.len;
+    }
+    try std.testing.expectEqualStrings("! Search error: timeout", buf[0..len]);
 }
