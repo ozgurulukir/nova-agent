@@ -95,6 +95,16 @@ fn scopeLabel(scope: Scope) []const u8 {
     };
 }
 
+fn scopeTag(scope: Scope) []const u8 {
+    return switch (scope) {
+        .global => "[global] ",
+        .block_nav => "[blocks] ",
+        .diff_viewer => "[diff] ",
+        .jobs_modal => "[jobs] ",
+        .lanes => "[lanes] ",
+    };
+}
+
 /// Index of the first help line whose key contains `key` within `scope`, or
 /// null. Used by the guard test below.
 fn indexOfKey(key: []const u8, scope: Scope) ?usize {
@@ -125,6 +135,14 @@ test "help documents every diff-viewer, jobs-modal, and lane binding" {
 test "help documents /undo" {
     try std.testing.expect(indexOfKey("/undo", .global) != null);
 }
+test "scopeTag returns correct formatted bracketed tag for each scope" {
+    try std.testing.expectEqualStrings("[global] ", scopeTag(.global));
+    try std.testing.expectEqualStrings("[blocks] ", scopeTag(.block_nav));
+    try std.testing.expectEqualStrings("[diff] ", scopeTag(.diff_viewer));
+    try std.testing.expectEqualStrings("[jobs] ", scopeTag(.jobs_modal));
+    try std.testing.expectEqualStrings("[lanes] ", scopeTag(.lanes));
+}
+
 
 /// The help overlay's outer height in rows, as sized by `overlaySize` in
 /// `overlay.zig`. Lives here (not there) so the scroll clamp and the layout
@@ -221,7 +239,7 @@ pub const Content = struct {
             } else {
                 var key_col: u16 = 2;
                 if (item.scope != .global) {
-                    const tag = try std.fmt.allocPrint(ctx.arena, "[{s}] ", .{scopeLabel(item.scope)});
+                    const tag = scopeTag(item.scope);
                     panel.lineStyledAt(&surface, row, tag, ctx, key_col, p.thinking_body) catch {};
                     key_col += @intCast(ctx.stringWidth(tag));
                 }
