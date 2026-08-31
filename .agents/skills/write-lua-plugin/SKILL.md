@@ -29,7 +29,6 @@ return {
     network_access = false,
     require_others = true,
     allow_os_execute = false,
-    allow_os_exit = false,
     allow_os_remove = false,
     instruction_limit = 100000,
     memory_limit_mb = 16,

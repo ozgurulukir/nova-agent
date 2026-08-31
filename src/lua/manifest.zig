@@ -95,7 +95,6 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     if (bridge.getTableBoolean(L, -1, "network_access")) |v| perms.network_access = v;
     if (bridge.getTableBoolean(L, -1, "require_others")) |v| perms.require_others = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_execute")) |v| perms.allow_os_execute = v;
-    if (bridge.getTableBoolean(L, -1, "allow_os_exit")) |v| perms.allow_os_exit = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_remove")) |v| perms.allow_os_remove = v;
 
     // Clamp on the i64 before the u32 cast so a negative value (a manifest typo
@@ -116,7 +115,6 @@ fn isRecognizedPermissionKey(key: []const u8) bool {
         "network_access",
         "require_others",
         "allow_os_execute",
-        "allow_os_exit",
         "allow_os_remove",
         "instruction_limit",
         "memory_limit_mb",
@@ -234,7 +232,6 @@ test "manifest: isRecognizedPermissionKey accepts all valid keys (T3)" {
         "network_access",
         "require_others",
         "allow_os_execute",
-        "allow_os_exit",
         "allow_os_remove",
         "instruction_limit",
         "memory_limit_mb",
