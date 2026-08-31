@@ -71,8 +71,10 @@ fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
         .primary => return false,
     };
 
-    const branch = try std.fmt.allocPrint(app.gpa, "nova/{s}", .{slug});
+    const branch = try app.gpa.alloc(u8, "nova/".len + slug.len);
     errdefer app.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], slug);
     const title = try app.gpa.dupe(u8, branch);
     errdefer app.gpa.free(title);
 
@@ -1024,8 +1026,10 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
     app.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]});
+    const branch = try app.gpa.alloc(u8, "nova/".len + id.len);
     errdefer app.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], &id);
     const parent = try vcs.globalWorktreesDir(app.gpa, home);
     defer app.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
@@ -1328,11 +1332,13 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.io.random(&raw);
         const id = std.fmt.bytesToHex(raw, .lower);
 
-        const branch = std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]}) catch {
+        const branch = app.gpa.alloc(u8, "nova/".len + id.len) catch {
             freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         errdefer app.gpa.free(branch);
+        @memcpy(branch[0.."nova/".len], "nova/");
+        @memcpy(branch["nova/".len..], &id);
         const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
             app.gpa.free(branch);
             freeLaneContext(app.gpa, context);

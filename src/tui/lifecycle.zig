@@ -458,8 +458,10 @@ pub fn createParallelLane(self: *App) !void {
     self.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
+    const branch = try self.gpa.alloc(u8, "nova/".len + id.len);
     errdefer self.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], &id);
 
     // Worktrees live under the global `<home>/.config/nova/worktrees`, OUTSIDE the
     // repo, so `git add -A`/snapshots/`/save` never see them.
