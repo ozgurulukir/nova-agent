@@ -259,8 +259,10 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
             copyOsFunction(L, os_index, "execute");
         }
         if (permissions.allow_os_remove) {
-            copyOsFunction(L, os_index, "remove");
-            copyOsFunction(L, os_index, "rename");
+            c.lua_pushcfunction(L, plugin_api.deletePath);
+            c.lua_setfield(L, os_index, "remove");
+            c.lua_pushcfunction(L, plugin_api.movePath);
+            c.lua_setfield(L, os_index, "rename");
         }
     }
     c.lua_pop(L, 1); // pop real os
@@ -607,6 +609,82 @@ test "sandbox: plugin table visible in full-access states" {
     }
 
     try std.testing.expect(L.doString("return type(plugin.get_config) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: blocks os.remove and os.rename by default" {
+    var L = try createSandboxedState(.{});
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return os.remove == nil and os.rename == nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return type(os.remove) == 'function' and type(os.rename) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    const test_dir = ".zig-cache/test_sandbox_os_remove";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    const file_a = try std.fs.path.join(gpa, &.{ test_dir, "a.txt" });
+    defer gpa.free(file_a);
+    const file_b = try std.fs.path.join(gpa, &.{ test_dir, "b.txt" });
+    defer gpa.free(file_b);
+
+    var f = try std.Io.Dir.cwd().createFile(io, file_a, .{});
+    f.close(io);
+
+    const rename_script_raw = try std.fmt.allocPrint(gpa, "return os.rename(\"{s}\", \"{s}\")", .{ file_a, file_b });
+    defer gpa.free(rename_script_raw);
+    const rename_script = try gpa.dupeZ(u8, rename_script_raw);
+    defer gpa.free(rename_script);
+    try std.testing.expect(L.doString(rename_script));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    const remove_script_raw = try std.fmt.allocPrint(gpa, "return os.remove(\"{s}\")", .{file_b});
+    defer gpa.free(remove_script_raw);
+    const remove_script = try gpa.dupeZ(u8, remove_script_raw);
+    defer gpa.free(remove_script);
+    try std.testing.expect(L.doString(remove_script));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: os.remove and os.rename prevent path traversal outside workspace when permitted" {
+    const io = std.testing.io;
+    var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("local res, err = os.remove('/etc/passwd'); return res == nil and err ~= nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    try std.testing.expect(L.doString("local res, err = os.rename('/etc/passwd', '/tmp/passwd'); return res == nil and err ~= nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    try std.testing.expect(L.doString("local res, err = os.remove('../../../etc/passwd'); return res == nil and err ~= nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }
