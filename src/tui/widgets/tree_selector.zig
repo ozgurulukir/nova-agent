@@ -345,18 +345,37 @@ pub const TreeState = struct {
         return null;
     }
 
+    const NodeLayout = struct {
+        full_index: usize,
+        indent: u16,
+        foldable: bool,
+        is_folded: bool,
+        branch_point: bool,
+    };
+
     /// Rebuild `self.visible` for the current filter mode, fold set, and search.
     pub fn reflatten(self: *TreeState, search: []const u8) !void {
         _ = self.arena.reset(.retain_capacity);
-        const arena = self.arena.allocator();
         if (self.nodes.len == 0) {
             self.visible = &.{};
             return;
         }
+        const arena = self.arena.allocator();
 
-        // 1. Visibility mask: filter + search, minus fold-hidden subtrees.
-        // Legacy `checkpoint`-kind entries (from old jj-era sessions) never appear
-        // as their own rows.
+        const visible_mask = self.computeVisibilityMask(search);
+
+        var roots: std.ArrayListUnmanaged(usize) = .empty;
+        defer roots.deinit(self.gpa);
+        try self.buildVisibleTreeStructure(visible_mask, &roots);
+
+        const layout = try self.buildLayoutDFS(arena, roots.items);
+
+        self.visible = try self.buildVisibleNodes(arena, layout);
+    }
+
+    /// 1. Visibility mask: filter + search, minus fold-hidden subtrees.
+    /// Legacy `checkpoint`-kind entries never appear as their own rows.
+    fn computeVisibilityMask(self: *TreeState, search: []const u8) []bool {
         std.debug.assert(self.nodes.len <= self.visible_mask.items.len);
         const visible_mask = self.visible_mask.items[0..self.nodes.len];
         for (self.nodes, 0..) |node, i| {
@@ -364,13 +383,13 @@ pub const TreeState = struct {
             const search_ok = search.len == 0 or containsIgnoreCase(node.text, search);
             visible_mask[i] = kind_ok and search_ok and !self.foldHidden(i);
         }
+        return visible_mask;
+    }
 
-        // 2. Visible tree structure: nearest-visible parent + ordered children.
-        // A snapshot-bearing entry (often a hidden tool result) tags the nearest
-        // visible row at or above it with a ✦; pre-order means the deepest
-        // snapshot in a row's collapsed segment wins (last-write), so the row maps
-        // to the latest code state produced under it — which is what navigation
-        // restores.
+    /// 2. Visible tree structure: nearest-visible parent + ordered children.
+    /// A snapshot-bearing entry tags the nearest visible row at or above it with a ✦;
+    /// deepest snapshot in a row's collapsed segment wins (last-write).
+    fn buildVisibleTreeStructure(self: *TreeState, visible_mask: []const bool, roots: *std.ArrayListUnmanaged(usize)) !void {
         const visible_parent = self.visible_parent.items[0..self.nodes.len];
         const has_snap = self.has_snap.items[0..self.nodes.len];
         @memset(has_snap, false);
@@ -379,8 +398,6 @@ pub const TreeState = struct {
         const child_lists = self.child_lists.items[0..self.nodes.len];
         for (child_lists) |*list| list.clearRetainingCapacity();
 
-        var roots: std.ArrayListUnmanaged(usize) = .empty;
-        defer roots.deinit(self.gpa);
         for (self.nodes, 0..) |node, i| {
             if (visible_mask[i]) {
                 const ancestor = self.nearestVisibleAncestor(i, visible_mask);
@@ -399,32 +416,28 @@ pub const TreeState = struct {
                 if (node.has_snapshot) {
                     if (self.nearestVisibleAncestor(i, visible_mask)) |anc| {
                         has_snap[anc] = true;
-                        snap_id[anc] = node.id; // last-wins: deepest in the segment
+                        snap_id[anc] = node.id;
                     }
                 }
             }
         }
+    }
 
-        // 3a. DFS over the visible tree assigning each node a display indent.
-        // The root and any single-child (linear) chain stay flush at indent 0 —
-        // they read as one connected thread, not a staircase of siblings. The
-        // indent steps in by one only at a branch: each arm, and that arm's
-        // first continuation, moves one level deeper so sibling arms keep a free
-        // `│` gutter column.
-        const Layout = struct { full_index: usize, indent: u16, foldable: bool, is_folded: bool, branch_point: bool };
-        var layout: std.ArrayList(Layout) = .empty;
+    /// 3a. DFS over the visible tree assigning each node a display indent.
+    /// Linear chains stay flush at indent 0; indent steps in by one only at a branch.
+    fn buildLayoutDFS(self: *TreeState, arena: std.mem.Allocator, roots: []const usize) ![]const NodeLayout {
+        const child_lists = self.child_lists.items[0..self.nodes.len];
+        var layout: std.ArrayList(NodeLayout) = .empty;
         const Frame = struct { index: usize, indent: u16, just_branched: bool };
         var stack: std.ArrayList(Frame) = .empty;
-        var root_index = roots.items.len;
+        var root_index = roots.len;
         while (root_index > 0) {
             root_index -= 1;
-            try stack.append(arena, .{ .index = roots.items[root_index], .indent = 0, .just_branched = false });
+            try stack.append(arena, .{ .index = roots[root_index], .indent = 0, .just_branched = false });
         }
         while (stack.pop()) |frame| {
             const kids = child_lists[frame.index].items;
             const multiple = kids.len > 1;
-            // Fold controls appear on branch points and on the first node of
-            // each branch arm when that arm has descendants.
             const foldable = self.isFoldable(frame.index);
             try layout.append(arena, .{
                 .full_index = frame.index,
@@ -445,26 +458,24 @@ pub const TreeState = struct {
                 try stack.append(arena, .{ .index = kids[kid_index], .indent = child_indent, .just_branched = multiple });
             }
         }
+        return layout.toOwnedSlice(arena);
+    }
 
-        // 3b. Second pass: derive connectors from the *displayed* layout. Within
-        // a branch (indent ≥ 1) a run of nodes at the same indent connects as a
-        // thread (`├─`…`╰─`); only the genuine last node at a level gets the
-        // rounded corner. `last_at_indent[k]` tracks whether the current
-        // ancestor at indent k is the last at its level (drives the `│`
-        // gutters); pre-order + ≤+1 indent steps keep it pointing at ancestors.
-        var out: std.ArrayList(VisibleNode) = try .initCapacity(arena, layout.items.len);
+    /// 3b. Second pass: derive connectors from the displayed layout.
+    fn buildVisibleNodes(self: *TreeState, arena: std.mem.Allocator, layout: []const NodeLayout) ![]VisibleNode {
+        const has_snap = self.has_snap.items[0..self.nodes.len];
+        const snap_id = self.snap_id.items[0..self.nodes.len];
+        var out: std.ArrayList(VisibleNode) = try .initCapacity(arena, layout.len);
         var last_at_indent = [_]bool{false} ** (tree_art.max_levels + 2);
-        for (layout.items, 0..) |item, i| {
-            // Last at its level when the next node at indent <= this one steps
-            // back out (indent <), or there is none.
+        for (layout, 0..) |item, i| {
             var is_last = true;
             var j = i + 1;
-            while (j < layout.items.len) : (j += 1) {
-                if (layout.items[j].indent == item.indent) {
+            while (j < layout.len) : (j += 1) {
+                if (layout[j].indent == item.indent) {
                     is_last = false;
                     break;
                 }
-                if (layout.items[j].indent < item.indent) break;
+                if (layout[j].indent < item.indent) break;
             }
             const prefix = try tree_art.buildPrefix(arena, item.indent, is_last, last_at_indent[0..], item.is_folded, item.foldable, item.branch_point);
             if (item.indent <= tree_art.max_levels) last_at_indent[item.indent] = is_last;
@@ -482,8 +493,7 @@ pub const TreeState = struct {
                 .snapshot_entry = snap_id[item.full_index],
             });
         }
-
-        self.visible = try out.toOwnedSlice(arena);
+        return out.toOwnedSlice(arena);
     }
 
     fn isFoldable(self: *const TreeState, index: usize) bool {
