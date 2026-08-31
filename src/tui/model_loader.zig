@@ -306,7 +306,7 @@ fn loadConfiguredCtx(
         const id = try gpa.dupe(u8, entry.id);
         errdefer gpa.free(id);
         const prefix_name = if (configured.display_name) |d| d else providerModelLabel(configured.provider);
-        const label = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, entry.id });
+        const label = try std.mem.concat(gpa, u8, &.{ prefix_name, symbols.separator_dot_padded, entry.id });
         errdefer gpa.free(label);
         try result.models.append(gpa, .{ .id = id, .label = label });
         try result.sources.append(gpa, .{ .openai_compatible = try compatibleSource(
@@ -346,7 +346,7 @@ fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provide
         if (!includeLocalModel(provider, entry.id)) continue;
         const id = try gpa.dupe(u8, entry.id);
         errdefer gpa.free(id);
-        const label = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
+        const label = try std.mem.concat(gpa, u8, &.{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
         errdefer gpa.free(label);
         try result.models.append(gpa, .{ .id = id, .label = label });
         try result.sources.append(gpa, .{ .openai_compatible = try compatibleSource(
