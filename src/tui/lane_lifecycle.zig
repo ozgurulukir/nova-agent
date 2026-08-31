@@ -400,7 +400,10 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
     app.clearInput();
     clearLanesState(app);
     var buf: [256]u8 = undefined;
-    const message = try std.fmt.bufPrint(&buf, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
+    const message = std.fmt.bufPrint(&buf, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)}) catch blk: {
+        break :blk try std.fmt.allocPrint(app.gpa, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
+    };
+    defer if (message.ptr != &buf) app.gpa.free(message);
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
 }
 
