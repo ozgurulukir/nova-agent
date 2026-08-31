@@ -399,8 +399,8 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
     app.mode = .normal;
     app.clearInput();
     clearLanesState(app);
-    const message = try std.fmt.allocPrint(app.gpa, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
-    defer app.gpa.free(message);
+    var buf: [256]u8 = undefined;
+    const message = try std.fmt.bufPrint(&buf, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
 }
 
