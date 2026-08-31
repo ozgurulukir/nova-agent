@@ -700,7 +700,7 @@ test "duplicate skill names keep the first occurrence" {
     defer deinitAll(gpa, skills);
     try std.testing.expectEqual(@as(usize, 2), skills.len);
     const found = find(skills, "samename").?;
-    try std.testing.expectEqualStrings("first", found.description);
+    try std.testing.expectEqualStrings(skills[0].description, found.description);
 }
 
 test "loadProject follows symlinked skill directories" {

@@ -17,9 +17,9 @@ pub fn appendSkillInvocationsToTranscript(app: *App, prompt: []const u8) !void {
     const runtime = app.liveRuntime() orelse return;
     const names = try skill_mod.collectInvocations(app.gpa, runtime.skills, prompt);
     defer app.gpa.free(names);
+    var title_buf: [128]u8 = undefined;
     for (names) |name| {
-        const title = try std.fmt.allocPrint(app.gpa, "[SKILL] {s}", .{name});
-        defer app.gpa.free(title);
+        const title = try std.fmt.bufPrint(&title_buf, "[SKILL] {s}", .{name});
         _ = try app.thread.transcript.append(app.gpa, .skill, title, "");
     }
 }
@@ -216,4 +216,33 @@ fn transcriptHasUser(app: *App, needle: []const u8) bool {
         if (std.mem.indexOf(u8, body, needle) != null) return true;
     }
     return false;
+}
+
+
+const runtime_mod = @import("../runtime.zig");
+
+test "appendSkillInvocationsToTranscript appends formatted skill title to transcript" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var agent = agent_mod.Agent.init(gpa, io, ".", .none);
+    defer agent.deinit();
+    var app = try tui.App.init(io, gpa, &agent);
+    defer app.deinit();
+
+    var runtime: runtime_mod.AgentRuntime = undefined;
+    try runtime.initNew(gpa, io, ".", ".", ".", "test system prompt", .{}, &.{}, null);
+    defer runtime.deinit();
+    app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
+
+    const skills = try gpa.alloc(skill_mod.Skill, 2);
+    skills[0] = .{ .name = try gpa.dupe(u8, "skill1"), .description = try gpa.dupe(u8, "desc1"), .path = try gpa.dupe(u8, "path1"), .base_dir = try gpa.dupe(u8, "."), .body = try gpa.dupe(u8, "body1") };
+    skills[1] = .{ .name = try gpa.dupe(u8, "skill2"), .description = try gpa.dupe(u8, "desc2"), .path = try gpa.dupe(u8, "path2"), .base_dir = try gpa.dupe(u8, "."), .body = try gpa.dupe(u8, "body2") };
+    skill_mod.deinitAll(gpa, runtime.skills);
+    runtime.skills = skills;
+
+    try appendSkillInvocationsToTranscript(&app, "Run $skill1 and $skill2 now");
+
+    try std.testing.expectEqual(@as(usize, 2), app.thread.transcript.messages.items.len);
+    try std.testing.expectEqualStrings("[SKILL] skill1", app.thread.transcript.messages.items[0].skill.title);
+    try std.testing.expectEqualStrings("[SKILL] skill2", app.thread.transcript.messages.items[1].skill.title);
 }
