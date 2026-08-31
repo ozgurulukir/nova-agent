@@ -28,7 +28,6 @@ return {
     file_access = false,
     network_access = false,
     require_others = true,
-    allow_rawget_rawset = false,
     allow_os_execute = false,
     allow_os_exit = false,
     allow_os_remove = false,

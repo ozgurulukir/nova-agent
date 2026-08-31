@@ -23,8 +23,6 @@ pub const Permissions = struct {
     require_others: bool = true,
     /// Full access to all Lua standard libraries (embedded plugins only)
     full_access: bool = false,
-    /// Allow rawget/rawset (can be used for sandbox escape)
-    allow_rawget_rawset: bool = false,
     /// Allow os.execute
     allow_os_execute: bool = false,
     /// Allow os.exit
@@ -238,12 +236,6 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
     copyGlobal(L, env_index, "xpcall");
     copyGlobal(L, env_index, "_VERSION");
 
-    // rawget/rawset — dangerous for sandbox escape, controlled by permission
-    if (permissions.allow_rawget_rawset) {
-        copyGlobal(L, env_index, "rawget");
-        copyGlobal(L, env_index, "rawset");
-    }
-
     // Copy safe library tables
     copyGlobal(L, env_index, "string");
     copyGlobal(L, env_index, "table");
@@ -404,26 +396,14 @@ test "sandbox: full access exposes all libraries" {
     L.pop(1);
 }
 
-test "sandbox: blocks rawget by default" {
+test "sandbox: blocks rawget and rawset" {
     var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
     }
 
-    try std.testing.expect(L.doString("return rawget == nil"));
-    try std.testing.expect(L.toBoolean(-1));
-    L.pop(1);
-}
-
-test "sandbox: allows rawget when permitted" {
-    var L = try createSandboxedState(.{ .allow_rawget_rawset = true });
-    defer {
-        freeHookData(L.handle);
-        L.deinit();
-    }
-
-    try std.testing.expect(L.doString("return type(rawget) == 'function'"));
+    try std.testing.expect(L.doString("return rawget == nil and rawset == nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }

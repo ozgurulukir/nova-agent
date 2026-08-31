@@ -94,7 +94,6 @@ fn parsePermissions(L: *State) !sandbox.Permissions {
     if (bridge.getTableBoolean(L, -1, "file_access")) |v| perms.file_access = v;
     if (bridge.getTableBoolean(L, -1, "network_access")) |v| perms.network_access = v;
     if (bridge.getTableBoolean(L, -1, "require_others")) |v| perms.require_others = v;
-    if (bridge.getTableBoolean(L, -1, "allow_rawget_rawset")) |v| perms.allow_rawget_rawset = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_execute")) |v| perms.allow_os_execute = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_exit")) |v| perms.allow_os_exit = v;
     if (bridge.getTableBoolean(L, -1, "allow_os_remove")) |v| perms.allow_os_remove = v;
@@ -116,7 +115,6 @@ fn isRecognizedPermissionKey(key: []const u8) bool {
         "file_access",
         "network_access",
         "require_others",
-        "allow_rawget_rawset",
         "allow_os_execute",
         "allow_os_exit",
         "allow_os_remove",
@@ -210,7 +208,6 @@ test "manifest: parse permissions" {
     try testing.expect(manifest.permissions.allow_os_execute);
     try testing.expectEqual(@as(u32, 50000), manifest.permissions.instruction_limit);
     try testing.expectEqual(@as(u32, 32), manifest.permissions.memory_limit_mb);
-    try testing.expect(!manifest.permissions.allow_rawget_rawset);
 }
 
 test "manifest: default permissions when not specified" {
@@ -236,7 +233,6 @@ test "manifest: isRecognizedPermissionKey accepts all valid keys (T3)" {
         "file_access",
         "network_access",
         "require_others",
-        "allow_rawget_rawset",
         "allow_os_execute",
         "allow_os_exit",
         "allow_os_remove",
