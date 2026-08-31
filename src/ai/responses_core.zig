@@ -216,9 +216,15 @@ pub const Client = struct {
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = req.receiveHead(&redirect_buffer) catch |err| {
-            if (err == error.ReadFailed) {
+            // Capture the underlying socket error so the UI shows what
+            // actually went wrong instead of the opaque error name. Read the
+            // stream error fields directly — `Connection.getReadError`
+            // unwraps `.?` internally and panics when std synthesized the
+            // ReadFailed without a socket error.
+            if (err == error.ReadFailed or err == error.WriteFailed) {
                 if (req.connection) |conn| {
-                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
+                    self.recordReadFailure(reason);
                 }
             }
             return self.headPhaseFailure(err);
@@ -242,7 +248,13 @@ pub const Client = struct {
         return readStream(self.gpa, reader, observer, &self.call_seq) catch |err| {
             if (err == error.ReadFailed) {
                 if (req.connection) |conn| {
-                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                    // Prefer the socket error; std also synthesizes
+                    // `error.ReadFailed` for a truncated or invalid chunked
+                    // body (recorded as `body_err`), and
+                    // `Connection.getReadError` would panic on `.?` there —
+                    // see the head-phase note above.
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
+                    self.recordReadFailure(reason);
                 }
             }
             return err;
@@ -315,6 +327,30 @@ test "headPhaseFailure maps transient connection drops to a retryable error" {
     try std.testing.expectEqual(error.HttpHeadersInvalid, client.headPhaseFailure(error.HttpHeadersInvalid));
 }
 
+/// Drain a full chunked HTTP request (headers + body through the terminal
+/// `0\r\n\r\n`) from a mock connection without ever blocking past it: the
+/// client sends nothing after the terminator — it blocks reading the
+/// response — so a blind extra read would hang the server thread and, with
+/// it, the whole test. A complete drain also proves the client finished
+/// sending before the mock aborts the connection.
+fn drainChunkedRequest(reader: *std.Io.Reader) void {
+    var req_buf: [4096]u8 = undefined;
+    var req_len: usize = 0;
+    while (req_len < req_buf.len) {
+        // `readSliceShort` blocks until its destination is FULL — and this
+        // request is smaller than any fixed buffer we could pick — so it
+        // must never be handed a larger destination here. `fillMore`
+        // performs exactly one blocking read, then an exactly-sized
+        // `readSliceShort` copies the buffered bytes out without waiting
+        // for more.
+        reader.fillMore() catch break;
+        const take = @min(reader.bufferedLen(), req_buf.len - req_len);
+        req_len += reader.readSliceShort(req_buf[req_len..][0..take]) catch break;
+        if (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") != null and
+            std.mem.endsWith(u8, req_buf[0..req_len], "0\r\n\r\n")) break;
+    }
+}
+
 test "prompt records last_error_detail on head-phase ReadFailed" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -341,7 +377,10 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
 
         fn serve(self: *@This()) void {
             var stream = self.server.accept(self.srv_io) catch return;
-            // Close immediately without sending any HTTP response.
+            // Close immediately without reading the request: the kernel then
+            // sees unread inbound data and answers with an RST, so the
+            // client's next operation (its remaining writes or the head
+            // read) fails with a connection-level error.
             stream.close(self.srv_io);
         }
     };
@@ -351,9 +390,13 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
     const thread = try std.Thread.spawn(.{}, MockCloseServer.serve, .{&server});
     defer thread.join();
 
+    // `Client.init` copies what it keeps and clears `base_url` in its owned
+    // config — the temporary string stays ours to free.
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
     var client: Client = undefined;
     try Client.init(&client, gpa, io, .{
-        .base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()}),
+        .base_url = base_url,
         .api_key = "test-key",
         .model = "test-model",
         .tools = &.{},
@@ -361,10 +404,7 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
         .session_id = "test",
         .system_prompt = "",
     }, .{});
-    defer {
-        gpa.free(client.config.base_url);
-        client.deinit();
-    }
+    defer client.deinit();
 
     try std.testing.expectError(error.ConnectionFailed, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail on head-phase ReadFailed");
@@ -396,21 +436,16 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
         }
 
         fn serve(self: *@This()) void {
-            var read_buf: [8192]u8 = undefined;
+            var read_buf: [4096]u8 = undefined;
             var write_buf: [8192]u8 = undefined;
             var stream = self.server.accept(self.srv_io) catch return;
             defer stream.close(self.srv_io);
             var reader = stream.reader(self.srv_io, &read_buf);
             var writer = stream.writer(self.srv_io, &write_buf);
-            // Drain the HTTP request.
-            while (true) {
-                const n = reader.interface.readSliceShort(read_buf[0..]) catch break;
-                if (n == 0) break;
-                if (std.mem.indexOf(u8, read_buf[0..n], "\r\n\r\n")) |_| {
-                    _ = reader.interface.readSliceShort(read_buf[0..]) catch break;
-                    break;
-                }
-            }
+            // Drain the FULL request (headers + chunked body through the
+            // terminal `0\r\n\r\n`); see drainChunkedRequest for why a blind
+            // extra read past it would hang the test.
+            drainChunkedRequest(&reader.interface);
             // Send a 200 OK response with SSE content-type.
             writer.interface.writeAll("HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: text/event-stream\r\n" ++
@@ -423,8 +458,15 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
             writer.interface.writeAll(hex) catch return;
             writer.interface.writeAll(chunk) catch return;
             writer.interface.writeAll("\r\n") catch return;
+            // A malformed chunk header breaks the client's chunked decoder
+            // mid-body — std maps that to a stream-phase `error.ReadFailed`
+            // with `body_err` set. An abortive RST would mimic a real-world
+            // drop more closely, but `Io.Threaded` hands out AFD handles on
+            // Windows, which `setsockopt`(SO_LINGER) rejects — a
+            // protocol-level abort is the portable way to exercise the same
+            // client capture path.
+            writer.interface.writeAll("ZZ\r\n") catch return;
             writer.interface.flush() catch return;
-            // Close abruptly without sending the final chunk or done event.
         }
     };
 
@@ -433,9 +475,13 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     const thread = try std.Thread.spawn(.{}, MockAbortServer.serve, .{&server});
     defer thread.join();
 
+    // `Client.init` copies what it keeps and clears `base_url` in its owned
+    // config — the temporary string stays ours to free.
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
     var client: Client = undefined;
     try Client.init(&client, gpa, io, .{
-        .base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()}),
+        .base_url = base_url,
         .api_key = "test-key",
         .model = "test-model",
         .tools = &.{},
@@ -443,10 +489,7 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
         .session_id = "test",
         .system_prompt = "",
     }, .{});
-    defer {
-        gpa.free(client.config.base_url);
-        client.deinit();
-    }
+    defer client.deinit();
 
     try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream-phase ReadFailed");

@@ -337,12 +337,16 @@ pub const Client = struct {
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = req.receiveHead(&redirect_buffer) catch |err| {
-            // `receiveHead` fails with `error.ReadFailed` when the connection
-            // drops; capture the underlying socket error so the UI shows what
-            // actually went wrong instead of the opaque `ReadFailed`.
-            if (err == error.ReadFailed) {
+            // `receiveHead` fails with `error.ReadFailed`/`error.WriteFailed`
+            // when the connection drops; capture the underlying socket error
+            // so the UI shows what actually went wrong instead of the opaque
+            // error name. Read the stream error fields directly —
+            // `Connection.getReadError` unwraps `.?` internally and panics
+            // when std synthesized the ReadFailed without a socket error.
+            if (err == error.ReadFailed or err == error.WriteFailed) {
                 if (req.connection) |conn| {
-                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
+                    self.recordReadFailure(reason);
                 }
             }
             return self.headPhaseFailure(err);
@@ -381,19 +385,24 @@ pub const Client = struct {
         // Socket-level read timeout: prevents indefinite hangs when the
         // server stops mid-stream. Applied after the head is received so
         // the (fast) head exchange is not affected.
-        if (req.connection) |conn| {
-            const tv: std.posix.timeval = .{
-                .sec = @intCast(self.config.request_timeout_seconds),
-                .usec = 0,
-            };
-            if (std.c.setsockopt(
-                conn.stream_reader.stream.socket.handle,
-                std.posix.SOL.SOCKET,
-                std.posix.SO.RCVTIMEO,
-                @ptrCast(std.mem.asBytes(&tv)),
-                @intCast(@sizeOf(std.posix.timeval)),
-            ) != 0) {
-                log.warn("openai_compatible.setsockopt.RCVTIMEO failed", .{});
+        // Windows: `Io.Threaded` opens sockets through the AFD driver, so
+        // socket handles are not ws2_32 SOCKETs and setsockopt always fails
+        // (WSAENOTSOCK) — skip it rather than warn on every request.
+        if (!os.is_windows) {
+            if (req.connection) |conn| {
+                const tv: std.posix.timeval = .{
+                    .sec = @intCast(self.config.request_timeout_seconds),
+                    .usec = 0,
+                };
+                if (std.c.setsockopt(
+                    conn.stream_reader.stream.socket.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.RCVTIMEO,
+                    @ptrCast(std.mem.asBytes(&tv)),
+                    @intCast(@sizeOf(std.posix.timeval)),
+                ) != 0) {
+                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed", .{});
+                }
             }
         }
 
@@ -404,7 +413,13 @@ pub const Client = struct {
         return stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model) catch |err| {
             if (err == error.ReadFailed) {
                 if (req.connection) |conn| {
-                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                    // Prefer the socket error; std also synthesizes
+                    // `error.ReadFailed` for a truncated or invalid chunked
+                    // body (recorded as `body_err`), and
+                    // `Connection.getReadError` would panic on `.?` there —
+                    // see the head-phase note above.
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
+                    self.recordReadFailure(reason);
                 }
             }
             return err;
@@ -2013,14 +2028,23 @@ const MockAbortServer = struct {
         defer stream.close(self.srv_io);
         var reader = stream.reader(self.srv_io, &read_buf);
         var writer = stream.writer(self.srv_io, &write_buf);
-        // Drain the HTTP request (headers + body).
-        while (true) {
-            const n = reader.interface.readSliceShort(read_buf[0..]) catch break;
-            if (n == 0) break;
-            if (std.mem.indexOf(u8, read_buf[0..n], "\r\n\r\n")) |_| {
-                _ = reader.interface.readSliceShort(read_buf[0..]) catch break;
-                break;
-            }
+        // Drain the FULL request (headers + chunked body through the terminal
+        // `0\r\n\r\n`). `readSliceShort` blocks until its destination is
+        // FULL — and this request is smaller than any fixed buffer we could
+        // pick — so it must never be handed a larger destination here.
+        // `fillMore` performs exactly one blocking read, then an
+        // exactly-sized `readSliceShort` copies the buffered bytes out
+        // without waiting for more. The client sends nothing after the
+        // terminator (it blocks reading the response), so the loop ends
+        // there and never hangs.
+        var req_buf: [4096]u8 = undefined;
+        var req_len: usize = 0;
+        while (req_len < req_buf.len) {
+            reader.interface.fillMore() catch break;
+            const take = @min(reader.interface.bufferedLen(), req_buf.len - req_len);
+            req_len += reader.interface.readSliceShort(req_buf[req_len..][0..take]) catch break;
+            if (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") != null and
+                std.mem.endsWith(u8, req_buf[0..req_len], "0\r\n\r\n")) break;
         }
         // Send a 200 OK response with chunked transfer-encoding.
         writer.interface.writeAll("HTTP/1.1 200 OK\r\n" ++
@@ -2034,8 +2058,14 @@ const MockAbortServer = struct {
         writer.interface.writeAll(hex) catch return;
         writer.interface.writeAll(chunk) catch return;
         writer.interface.writeAll("\r\n") catch return;
+        // A malformed chunk header breaks the client's chunked decoder
+        // mid-body — std maps that to a stream-phase `error.ReadFailed` with
+        // `body_err` set. An abortive RST would mimic a real-world drop more
+        // closely, but `Io.Threaded` hands out AFD handles on Windows, which
+        // `setsockopt`(SO_LINGER) rejects — a protocol-level abort is the
+        // portable way to exercise the same client capture path.
+        writer.interface.writeAll("ZZ\r\n") catch return;
         writer.interface.flush() catch return;
-        // Close abruptly without sending the final chunk or [DONE].
     }
 };
 
