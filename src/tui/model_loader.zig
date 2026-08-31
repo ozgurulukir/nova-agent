@@ -306,7 +306,7 @@ fn loadConfiguredCtx(
         const id = try gpa.dupe(u8, entry.id);
         errdefer gpa.free(id);
         const prefix_name = if (configured.display_name) |d| d else providerModelLabel(configured.provider);
-        const label = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, entry.id });
+        const label = try formatModelLabel(gpa, prefix_name, entry.id);
         errdefer gpa.free(label);
         try result.models.append(gpa, .{ .id = id, .label = label });
         try result.sources.append(gpa, .{ .openai_compatible = try compatibleSource(
@@ -346,7 +346,7 @@ fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provide
         if (!includeLocalModel(provider, entry.id)) continue;
         const id = try gpa.dupe(u8, entry.id);
         errdefer gpa.free(id);
-        const label = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ providerModelLabel(provider), symbols.separator_dot_padded, entry.id });
+        const label = try formatModelLabel(gpa, providerModelLabel(provider), entry.id);
         errdefer gpa.free(label);
         try result.models.append(gpa, .{ .id = id, .label = label });
         try result.sources.append(gpa, .{ .openai_compatible = try compatibleSource(
@@ -494,4 +494,28 @@ test "mergeResult rolls back atomically on failure" {
     try std.testing.expectEqual(@as(usize, 2), agg.models.items.len);
     try std.testing.expectEqual(@as(usize, 2), agg.sources.items.len);
     try std.testing.expectEqual(agg.models.items.len, agg.sources.items.len);
+}
+
+pub fn formatModelLabel(gpa: std.mem.Allocator, prefix_name: []const u8, model_id: []const u8) ![]u8 {
+    var buf: [256]u8 = undefined;
+    const formatted = std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, model_id }) catch |err| switch (err) {
+        error.NoSpaceLeft => return try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ prefix_name, symbols.separator_dot_padded, model_id }),
+    };
+    return try gpa.dupe(u8, formatted);
+}
+
+test "formatModelLabel formats correctly and handles fallback" {
+    const gpa = std.testing.allocator;
+
+    // Normal label fit in buffer
+    const label1 = try formatModelLabel(gpa, "Ollama", "llama3.1:8b");
+    defer gpa.free(label1);
+    try std.testing.expectEqualStrings("Ollama" ++ symbols.separator_dot_padded ++ "llama3.1:8b", label1);
+
+    // Long label fallback to allocPrint
+    var long_id_buf: [300]u8 = undefined;
+    @memset(&long_id_buf, 'a');
+    const label2 = try formatModelLabel(gpa, "Provider", &long_id_buf);
+    defer gpa.free(label2);
+    try std.testing.expect(label2.len > 300);
 }
