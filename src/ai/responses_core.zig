@@ -82,6 +82,7 @@ pub const Client = struct {
     responses_config: ResponsesConfig,
     http_client: std.http.Client,
     call_seq: u64 = 0,
+    last_error_detail: ?[]u8 = null,
 
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config, responses_config: ResponsesConfig) !void {
         std.debug.assert(config.base_url.len > 0);
@@ -125,6 +126,7 @@ pub const Client = struct {
         self.gpa.free(self.tools_json);
         self.gpa.free(self.authorization);
         self.gpa.free(self.url);
+        if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
 
@@ -155,7 +157,40 @@ pub const Client = struct {
         self.tools_json = new_json;
     }
 
+    fn clearErrorDetail(self: *Client) void {
+        if (self.last_error_detail) |d| self.gpa.free(d);
+        self.last_error_detail = null;
+    }
+
+    fn recordReadFailure(self: *Client, read_err: anyerror) void {
+        const detail = std.fmt.allocPrint(
+            self.gpa,
+            "Connection to the model provider was lost: {s}",
+            .{@errorName(read_err)},
+        ) catch return;
+        self.clearErrorDetail();
+        self.last_error_detail = detail;
+    }
+
+    fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
+        _ = self;
+        return switch (err) {
+            error.ReadFailed,
+            error.WriteFailed,
+            error.EndOfStream,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.BrokenPipe,
+            error.HttpConnectionClosing,
+            error.Unexpected,
+            => error.ConnectionFailed,
+            else => err,
+        };
+    }
+
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
+        self.clearErrorDetail();
         var extra_headers_buffer: [8]std.http.Header = undefined;
         const extra_headers = self.extraHeaders(&extra_headers_buffer);
         var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
@@ -180,7 +215,14 @@ pub const Client = struct {
         try req.connection.?.flush();
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
-        var http_response = try req.receiveHead(&redirect_buffer);
+        var http_response = req.receiveHead(&redirect_buffer) catch |err| {
+            if (err == error.ReadFailed) {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                }
+            }
+            return self.headPhaseFailure(err);
+        };
         const status_code: u16 = @intFromEnum(http_response.head.status);
         log.info("responses.response.head status={d} profile={s}", .{ status_code, self.responses_config.log_name });
         if (status_code >= 400) {
@@ -197,7 +239,14 @@ pub const Client = struct {
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
-        return try readStream(self.gpa, reader, observer, &self.call_seq);
+        return readStream(self.gpa, reader, observer, &self.call_seq) catch |err| {
+            if (err == error.ReadFailed) {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                }
+            }
+            return err;
+        };
     }
 
     fn extraHeaders(self: *const Client, buffer: *[8]std.http.Header) []const std.http.Header {
@@ -237,4 +286,169 @@ fn readStream(gpa: std.mem.Allocator, reader: *std.Io.Reader, observer: anytype,
         try state.processJson(gpa, data, observer, call_seq);
     }
     return try state.finish(gpa, call_seq);
+}
+
+test "headPhaseFailure maps transient connection drops to a retryable error" {
+    var client: Client = undefined;
+    try Client.init(&client, std.testing.allocator, std.testing.io, .{
+        .base_url = "http://127.0.0.1:1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    }, .{});
+    defer client.deinit();
+
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ReadFailed));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.WriteFailed));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.EndOfStream));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionRefused));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.BrokenPipe));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.HttpConnectionClosing));
+    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.Unexpected));
+    // Permanent failures are returned unchanged.
+    try std.testing.expectEqual(error.HttpClientError, client.headPhaseFailure(error.HttpClientError));
+    try std.testing.expectEqual(error.HttpHeadersInvalid, client.headPhaseFailure(error.HttpHeadersInvalid));
+}
+
+test "prompt records last_error_detail on head-phase ReadFailed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A mock server that accepts a connection but closes immediately
+    // without sending any HTTP response. receiveHead will see ReadFailed.
+    const MockCloseServer = struct {
+        srv_io: std.Io,
+        server: std.Io.net.Server,
+
+        fn init(srv_io: std.Io) !@This() {
+            const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+            const srv = try addr.listen(srv_io, .{ .reuse_address = true });
+            return .{ .srv_io = srv_io, .server = srv };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.server.deinit(self.srv_io);
+        }
+
+        fn port(self: *const @This()) u16 {
+            return self.server.socket.address.ip4.port;
+        }
+
+        fn serve(self: *@This()) void {
+            var stream = self.server.accept(self.srv_io) catch return;
+            // Close immediately without sending any HTTP response.
+            stream.close(self.srv_io);
+        }
+    };
+
+    var server = try MockCloseServer.init(io);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockCloseServer.serve, .{&server});
+    defer thread.join();
+
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()}),
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    }, .{});
+    defer {
+        gpa.free(client.config.base_url);
+        client.deinit();
+    }
+
+    try std.testing.expectError(error.ConnectionFailed, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail on head-phase ReadFailed");
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
+}
+
+test "prompt records last_error_detail on stream-phase ReadFailed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A mock server that sends a valid HTTP 200 head with SSE content-type,
+    // sends partial SSE data, then closes abruptly.
+    const MockAbortServer = struct {
+        srv_io: std.Io,
+        server: std.Io.net.Server,
+
+        fn init(srv_io: std.Io) !@This() {
+            const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+            const srv = try addr.listen(srv_io, .{ .reuse_address = true });
+            return .{ .srv_io = srv_io, .server = srv };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.server.deinit(self.srv_io);
+        }
+
+        fn port(self: *const @This()) u16 {
+            return self.server.socket.address.ip4.port;
+        }
+
+        fn serve(self: *@This()) void {
+            var read_buf: [8192]u8 = undefined;
+            var write_buf: [8192]u8 = undefined;
+            var stream = self.server.accept(self.srv_io) catch return;
+            defer stream.close(self.srv_io);
+            var reader = stream.reader(self.srv_io, &read_buf);
+            var writer = stream.writer(self.srv_io, &write_buf);
+            // Drain the HTTP request.
+            while (true) {
+                const n = reader.interface.readSliceShort(read_buf[0..]) catch break;
+                if (n == 0) break;
+                if (std.mem.indexOf(u8, read_buf[0..n], "\r\n\r\n")) |_| {
+                    _ = reader.interface.readSliceShort(read_buf[0..]) catch break;
+                    break;
+                }
+            }
+            // Send a 200 OK response with SSE content-type.
+            writer.interface.writeAll("HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: text/event-stream\r\n" ++
+                "Transfer-Encoding: chunked\r\n" ++
+                "\r\n") catch return;
+            // Send one chunk of SSE data (Responses API format).
+            const chunk = "event: response.output_text.delta\ndata: {\"delta\":\"hi\"}\n\n";
+            var hex_buf: [16]u8 = undefined;
+            const hex = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{chunk.len}) catch return;
+            writer.interface.writeAll(hex) catch return;
+            writer.interface.writeAll(chunk) catch return;
+            writer.interface.writeAll("\r\n") catch return;
+            writer.interface.flush() catch return;
+            // Close abruptly without sending the final chunk or done event.
+        }
+    };
+
+    var server = try MockAbortServer.init(io);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockAbortServer.serve, .{&server});
+    defer thread.join();
+
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()}),
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+    }, .{});
+    defer {
+        gpa.free(client.config.base_url);
+        client.deinit();
+    }
+
+    try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream-phase ReadFailed");
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
 }

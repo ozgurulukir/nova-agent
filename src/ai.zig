@@ -683,8 +683,10 @@ pub const LanguageModel = union(enum) {
 
     pub fn lastErrorDetail(self: LanguageModel) ?[]const u8 {
         return switch (self) {
+            .none => null,
             .openai_compatible => |c| c.last_error_detail,
-            else => null,
+            .codex_responses => |c| c.core_client.last_error_detail,
+            .openai_responses => |c| c.core_client.last_error_detail,
         };
     }
 

@@ -382,19 +382,18 @@ pub const Client = struct {
         // server stops mid-stream. Applied after the head is received so
         // the (fast) head exchange is not affected.
         if (req.connection) |conn| {
-            if (!os.is_windows) {
-                const tv: std.posix.timeval = .{
-                    .sec = @intCast(self.config.request_timeout_seconds),
-                    .usec = 0,
-                };
-                std.posix.setsockopt(
-                    conn.stream_reader.stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.RCVTIMEO,
-                    std.mem.asBytes(&tv),
-                ) catch |err| {
-                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
-                };
+            const tv: std.posix.timeval = .{
+                .sec = @intCast(self.config.request_timeout_seconds),
+                .usec = 0,
+            };
+            if (std.c.setsockopt(
+                conn.stream_reader.stream.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVTIMEO,
+                @ptrCast(std.mem.asBytes(&tv)),
+                @intCast(@sizeOf(std.posix.timeval)),
+            ) != 0) {
+                log.warn("openai_compatible.setsockopt.RCVTIMEO failed", .{});
             }
         }
 
@@ -402,7 +401,14 @@ pub const Client = struct {
         var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-        return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model);
+        return stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model) catch |err| {
+            if (err == error.ReadFailed) {
+                if (req.connection) |conn| {
+                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                }
+            }
+            return err;
+        };
     }
 
     /// Map a failure that occurred before any response bytes (connect, body
@@ -1977,4 +1983,75 @@ test "prompt decompresses a Content-Encoding: gzip error body into the UI detail
     try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail");
     try std.testing.expectEqualStrings("HTTP 403: invalid api key", detail);
+}
+
+/// Mock server that sends a valid HTTP 200 head with chunked transfer-encoding,
+/// sends partial SSE data, then closes abruptly without [DONE]. Used to test
+/// stream-phase ReadFailed capture.
+const MockAbortServer = struct {
+    srv_io: std.Io,
+    server: std.Io.net.Server,
+
+    fn init(srv_io: std.Io) !MockAbortServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const srv = try addr.listen(srv_io, .{ .reuse_address = true });
+        return .{ .srv_io = srv_io, .server = srv };
+    }
+
+    fn deinit(self: *MockAbortServer) void {
+        self.server.deinit(self.srv_io);
+    }
+
+    fn port(self: *const MockAbortServer) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn serve(self: *MockAbortServer) void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        var stream = self.server.accept(self.srv_io) catch return;
+        defer stream.close(self.srv_io);
+        var reader = stream.reader(self.srv_io, &read_buf);
+        var writer = stream.writer(self.srv_io, &write_buf);
+        // Drain the HTTP request (headers + body).
+        while (true) {
+            const n = reader.interface.readSliceShort(read_buf[0..]) catch break;
+            if (n == 0) break;
+            if (std.mem.indexOf(u8, read_buf[0..n], "\r\n\r\n")) |_| {
+                _ = reader.interface.readSliceShort(read_buf[0..]) catch break;
+                break;
+            }
+        }
+        // Send a 200 OK response with chunked transfer-encoding.
+        writer.interface.writeAll("HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n") catch return;
+        // Send one chunk of SSE data.
+        const chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
+        var hex_buf: [16]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{chunk.len}) catch return;
+        writer.interface.writeAll(hex) catch return;
+        writer.interface.writeAll(chunk) catch return;
+        writer.interface.writeAll("\r\n") catch return;
+        writer.interface.flush() catch return;
+        // Close abruptly without sending the final chunk or [DONE].
+    }
+};
+
+test "prompt records last_error_detail on stream-phase ReadFailed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockAbortServer.init(io);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockAbortServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream ReadFailed");
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
 }
