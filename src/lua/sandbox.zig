@@ -25,8 +25,6 @@ pub const Permissions = struct {
     full_access: bool = false,
     /// Allow os.execute
     allow_os_execute: bool = false,
-    /// Allow os.exit
-    allow_os_exit: bool = false,
     /// Allow os.remove/os.rename
     allow_os_remove: bool = false,
     /// Maximum Lua instructions before abort (0 = unlimited). This is a
@@ -260,9 +258,6 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
         if (permissions.allow_os_execute) {
             copyOsFunction(L, os_index, "execute");
         }
-        if (permissions.allow_os_exit) {
-            copyOsFunction(L, os_index, "exit");
-        }
         if (permissions.allow_os_remove) {
             copyOsFunction(L, os_index, "remove");
             copyOsFunction(L, os_index, "rename");
@@ -404,6 +399,19 @@ test "sandbox: blocks rawget and rawset" {
     }
 
     try std.testing.expect(L.doString("return rawget == nil and rawset == nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+
+test "sandbox: blocks os.exit" {
+    var L = try createSandboxedState(.{});
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return os.exit == nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }
