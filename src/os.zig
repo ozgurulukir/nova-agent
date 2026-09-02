@@ -33,11 +33,18 @@ pub fn termCode(term: std.process.Child.Term) u8 {
     };
 }
 
+const windows = if (is_windows) struct {
+    const BOOL = i32;
+    const UINT = u32;
+    extern "kernel32" fn SetConsoleOutputCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+    extern "kernel32" fn SetConsoleCP(wCodePageID: UINT) callconv(.winapi) BOOL;
+} else struct {};
+
 /// Ensure Windows console input/output codepage is set to UTF-8 (65001)
 /// so Unicode characters render cleanly instead of falling back to legacy OEM codepages.
 pub fn initConsoleUtf8() void {
     if (comptime is_windows) {
-        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
-        _ = std.os.windows.kernel32.SetConsoleCP(65001);
+        _ = windows.SetConsoleOutputCP(65001);
+        _ = windows.SetConsoleCP(65001);
     }
 }
