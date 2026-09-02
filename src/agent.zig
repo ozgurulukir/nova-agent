@@ -78,6 +78,9 @@ pub const Agent = struct {
     /// The driver/primary agents keep this false — they legitimately `cd` to
     /// lane worktrees to inspect them.
     contained: bool = false,
+    /// Monotonic lane generation identity for routing background job completions
+    /// safely without holding raw agent pointers.
+    lane_generation: u64 = 1,
     /// The App-owned `LaneBridge` the `lane` tool posts across. Borrowed
     /// (owned by the App); null disables the lane tool (headless/tests).
     lane_bridge: ?*lane_bridge.LaneBridge = null,
@@ -652,7 +655,7 @@ pub const Agent = struct {
             .contained = self.contained,
             .bash_classifier_url = self.bash_classifier_url,
             .background = if (self.background_manager) |manager|
-                .{ .manager = manager, .owner = self }
+                .{ .manager = manager, .owner_generation = self.lane_generation }
             else
                 null,
             .mcp_manager = self.mcp_manager,

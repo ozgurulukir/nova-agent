@@ -1085,7 +1085,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     // An idle lane has no runtime to name itself — `purpose` becomes its
     // visible title instead, so the split grid reads as the task, not
     // "untitled".
@@ -1410,7 +1410,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         wt_dest, // adopted by the lane
         runtime,
     );
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     lane.spawned_by_generation = spawner.generation;
     app.threads.append(lane) catch {
         // The lane adopted wt_branch/wt_dest via initLive. Remove the worktree
@@ -1511,6 +1511,7 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
     lane.parent_context = context;
 
     lane.agent = &runtime.agent;
+    runtime.agent.lane_generation = lane.generation;
     lane.worker_context = .{ .io = app.io, .gpa = runtime.gpa };
     lane.engine = .{ .live = .{
         .lane = .{ .working = working },
@@ -3165,7 +3166,7 @@ test "B1: wakeIdleLane frees the prior parent_context before overwriting it" {
     const wt = try createLaneWorktree(app, repo, fx.home_dir);
     const lane = try gpa.create(Thread);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     try app.threads.append(lane);
 
     // First re-task: adopt a non-empty parent_context, then park back to idle

@@ -37,13 +37,13 @@ const assert = std.debug.assert;
 /// shell-selection points, and they mirror each other by construction.
 const shell_tool = if (os.is_windows) pwsh_tool else bash_tool;
 
-/// Wiring for the background-bash path: the shared manager plus an opaque token
-/// identifying the agent the job belongs to (the manager hands it back at
-/// completion so the UI can route the delivery to the right lane). Threaded in
+/// Wiring for the background-bash path: the shared manager plus a lane generation
+/// identifying the lane the job belongs to (the manager hands it back at
+/// completion so the UI can route the delivery to the right lane safely). Threaded in
 /// by the agent only when a `BackgroundManager` is attached.
 pub const BackgroundStart = struct {
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64 = 1,
 };
 
 /// The output of one ToolCall, carrying both the LLM channel (the terse
@@ -447,7 +447,7 @@ pub const ExecutorService = struct {
 
         const prev_bg = background_tool.background_slot;
         background_tool.background_slot = if (self.background) |bg|
-            .{ .manager = bg.manager, .owner = bg.owner }
+            .{ .manager = bg.manager, .owner_generation = bg.owner_generation }
         else
             .{};
         defer background_tool.background_slot = prev_bg;
@@ -462,7 +462,7 @@ pub const ExecutorService = struct {
             // shared with plugins — stays untouched.
             if (std.mem.eql(u8, call.name, tools.shell_tool.name)) {
                 const background_ctx: ?shell_tool.BackgroundCtx = if (self.background) |bg|
-                    .{ .manager = bg.manager, .owner = bg.owner }
+                    .{ .manager = bg.manager, .owner_generation = bg.owner_generation }
                 else
                     null;
                 return shell_tool.runContained(self.gpa, self.io, self.cwd, call.arguments, background_ctx);
@@ -470,7 +470,7 @@ pub const ExecutorService = struct {
         }
         if (self.background) |bg| {
             if (std.mem.eql(u8, call.name, tools.shell_tool.name) and shell_tool.wantsBackground(self.gpa, call.arguments)) {
-                return shell_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner);
+                return shell_tool.runBackground(self.gpa, self.io, self.cwd, call.arguments, bg.manager, bg.owner_generation);
             }
         }
         if (self.tool_registry) |r| {

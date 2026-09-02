@@ -51,15 +51,15 @@ pub const tool: common.Tool = .{
 /// `BackgroundStart`; null means background is unavailable for this call.
 pub const BackgroundCtx = struct {
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64 = 1,
 };
 
 /// Per-call execution options for the internal run path.
 const RunOpts = struct {
-    /// When set, prepend the `cd` containment guard so the shell cannot leave
-    /// `cwd` (the lane worktree). The guard anchors on the PROJECT root (the
-    /// `cwd` param), not the resolved cwd, so a `cwd` subdir argument doesn't
-    /// tighten containment to that subdir.
+    /// When set, prepend the `Set-Location` containment guard so the shell
+    /// cannot leave `cwd` (the lane worktree). The guard anchors on the PROJECT
+    /// root (the `cwd` param), not the resolved cwd, so a `cwd` subdir argument
+    /// doesn't tighten containment to that subdir.
     contained: bool = false,
     /// When set and the call requests `run_in_background`, launch the guarded
     /// command through the manager instead of capturing it synchronously.
@@ -90,9 +90,9 @@ pub fn runToolForTest(
 }
 
 /// Root-contained pwsh run for lane workers (see `Agent.contained`). Parses
-/// the call like `runTool`, then prepends the cd guard so the command cannot
-/// leave `cwd` into the main tree. Background launches (when `background`
-/// is non-null and the call asks for one) are guarded too.
+/// the call like `runTool`, then prepends the `Set-Location` guard so the
+/// command cannot leave `cwd` into the main tree. Background launches (when
+/// `background` is non-null and the call asks for one) are guarded too.
 pub fn runContained(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -140,7 +140,7 @@ fn runToolImpl(
 
     if (opts.background) |bg| {
         if (wantsBackground(gpa, arguments)) {
-            return runBackgroundImpl(gpa, io, resolved_cwd, command, bg.manager, bg.owner, &env_map);
+            return runBackgroundImpl(gpa, io, resolved_cwd, command, bg.manager, bg.owner_generation, &env_map);
         }
     }
 
@@ -195,7 +195,7 @@ pub fn runBackground(
     cwd: []const u8,
     arguments: []const u8,
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64,
 ) common.Error!common.Output {
     var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
     defer args.deinit();
@@ -215,7 +215,7 @@ pub fn runBackground(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
-    return runBackgroundImpl(gpa, io, resolved_cwd, args.command, manager, owner, &env_map);
+    return runBackgroundImpl(gpa, io, resolved_cwd, args.command, manager, owner_generation, &env_map);
 }
 
 /// The shared background launch tail: start `command` (already cwd-resolved,
@@ -227,14 +227,14 @@ fn runBackgroundImpl(
     cwd: []const u8,
     command: []const u8,
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64,
     env_map: *const std.process.Environ.Map,
 ) common.Error!common.Output {
     var started = manager.start(.{
         .command = command,
         .cwd = cwd,
         .env_map = env_map,
-        .owner = owner,
+        .owner_generation = owner_generation,
         .shell_path = pws.shellPath(io),
         .command_mode = .stdin_dash_command,
         .stderr_merge_prefix = "",

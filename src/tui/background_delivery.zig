@@ -46,13 +46,8 @@ pub fn pollBackgroundJobs(app: *App) !bool {
         // frees the metadata.
         const message = job.completion_message;
         job.completion_message = null;
-        // Layer crossing: `background.BackgroundManager.Finished.owner` is
-        // `*anyopaque` (the manager is layer-agnostic about which agent
-        // owns a job). The TUI, which knows the agent, types the owner
-        // here — one explicit cast at the boundary, none at the use site.
-        const owner: *tui.Agent = @ptrCast(@alignCast(job.owner));
         app.background_modal_state.pending.append(app.gpa, .{
-            .owner = owner,
+            .owner_generation = job.owner_generation,
             .notice = notice,
             .message = message,
         }) catch {
@@ -90,7 +85,7 @@ pub fn deliverPendingBackground(app: *App) !bool {
     var i: usize = 0;
     while (i < app.background_modal_state.pending.items.len) {
         const delivery = &app.background_modal_state.pending.items[i];
-        const lane = app.laneForAgent(delivery.owner) orelse {
+        const lane = app.laneByGeneration(delivery.owner_generation) orelse {
             freeDelivery(app, delivery);
             _ = app.background_modal_state.pending.orderedRemove(i);
             continue;
@@ -218,7 +213,7 @@ test "M2: a QueueFull background drop gains no mirror entry" {
     for (0..runtime.agent.message_queue_storage.len) |_| try runtime.agent.enqueueRaw("filler");
 
     try app.background_modal_state.pending.append(app.gpa, .{
-        .owner = &runtime.agent,
+        .owner_generation = 1,
         .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
         .message = try gpa.dupe(u8, "job result"),
     });
@@ -246,7 +241,7 @@ test "M2: a no-provider delivery clears the mirror in lockstep with the agent qu
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = runtime, .owns = false } };
 
     try app.background_modal_state.pending.append(app.gpa, .{
-        .owner = &runtime.agent,
+        .owner_generation = 1,
         .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
         .message = try gpa.dupe(u8, "job result"),
     });
@@ -262,6 +257,28 @@ test "M2: a no-provider delivery clears the mirror in lockstep with the agent qu
     try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
     try std.testing.expect(transcriptContains(app.thread, "finished — exit 0"));
     try std.testing.expect(!transcriptContains(app.thread, "job result"));
+}
+
+test "INV-BG-OWNER-1: late background completion drops cleanly when owning lane is deleted" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const runtime = try createNoProviderRuntime(gpa, io);
+    defer gpa.destroy(runtime);
+    defer runtime.agent.deinit();
+    var app = try tui.App.init(io, gpa, &runtime.agent);
+    defer app.deinit();
+
+    // Enqueue delivery for a non-existent lane generation (e.g. 999).
+    try app.background_modal_state.pending.append(app.gpa, .{
+        .owner_generation = 999,
+        .notice = try gpa.dupe(u8, "job (cmd) finished — exit 0"),
+        .message = try gpa.dupe(u8, "job result"),
+    });
+
+    _ = try deliverPendingBackground(&app);
+
+    // Must drop the delivery without crashing or dereferencing stale memory.
+    try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
 }
 
 fn transcriptContains(lane: *tui.Thread, needle: []const u8) bool {

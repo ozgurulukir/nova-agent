@@ -50,7 +50,7 @@ pub const tool: common.Tool = .{
 /// `BackgroundStart`; null means background is unavailable for this call.
 pub const BackgroundCtx = struct {
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64 = 1,
 };
 
 /// Per-call execution options for the internal run path.
@@ -111,6 +111,7 @@ fn runToolImpl(
 ) common.Error!common.Output {
     var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
     defer args.deinit();
+
     var command_cwd: ?[]u8 = null;
     defer if (command_cwd) |path| gpa.free(path);
     const resolved_cwd = if (args.cwd) |path| value: {
@@ -127,11 +128,8 @@ fn runToolImpl(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
-    // A contained run replaces the model's command with the guard-prefixed
-    // form; the guard definition is silent, so the observation still reads as
-    // the original command (`finishBashOutput` echoes `command`, not the guard).
     var owned_command: ?[]u8 = null;
-    defer if (owned_command) |command| gpa.free(command);
+    defer if (owned_command) |p| gpa.free(p);
     const command = if (opts.contained) blk: {
         owned_command = prependCdGuard(gpa, cwd, args.command) catch return error.OutOfMemory;
         break :blk owned_command.?;
@@ -139,7 +137,7 @@ fn runToolImpl(
 
     if (opts.background) |bg| {
         if (wantsBackground(gpa, arguments)) {
-            return runBackgroundImpl(gpa, io, resolved_cwd, command, bg.manager, bg.owner, &env_map);
+            return runBackgroundImpl(gpa, io, resolved_cwd, command, bg.manager, bg.owner_generation, &env_map);
         }
     }
 
@@ -167,8 +165,6 @@ pub fn runCaptured(
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Canceled) return error.Canceled;
-        // Surface the real spawn/capture failure to the model instead of the
-        // opaque "Unexpected" (M4).
         return common.failFmt(gpa, 1, "bash: command failed to run: {s}\n", .{describeBashError(err)});
     };
     defer captured.deinit(gpa);
@@ -196,7 +192,7 @@ pub fn runBackground(
     cwd: []const u8,
     arguments: []const u8,
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64,
 ) common.Error!common.Output {
     var args = parseArgs(gpa, arguments) catch |err| return parseError(gpa, err);
     defer args.deinit();
@@ -216,7 +212,7 @@ pub fn runBackground(
     defer env_map.deinit();
     if (args.env) |env| try applyEnv(&env_map, env);
 
-    return runBackgroundImpl(gpa, io, resolved_cwd, args.command, manager, owner, &env_map);
+    return runBackgroundImpl(gpa, io, resolved_cwd, args.command, manager, owner_generation, &env_map);
 }
 
 /// The shared background launch tail: start `command` (already cwd-resolved,
@@ -228,14 +224,14 @@ fn runBackgroundImpl(
     cwd: []const u8,
     command: []const u8,
     manager: *background.BackgroundManager,
-    owner: *anyopaque,
+    owner_generation: u64,
     env_map: *const std.process.Environ.Map,
 ) common.Error!common.Output {
     var started = manager.start(.{
         .command = command,
         .cwd = cwd,
         .env_map = env_map,
-        .owner = owner,
+        .owner_generation = owner_generation,
         .shell_path = bash.shellPath(io),
         .command_mode = .argv_dash_c,
         .stderr_merge_prefix = "exec 2>&1\n",

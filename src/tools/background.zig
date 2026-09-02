@@ -10,7 +10,7 @@ const common = @import("common.zig");
 
 pub const BackgroundSlot = struct {
     manager: ?*background.BackgroundManager = null,
-    owner: ?*anyopaque = null,
+    owner_generation: u64 = 1,
 };
 
 pub threadlocal var background_slot: BackgroundSlot = .{};
@@ -236,8 +236,8 @@ pub fn handleStatus(
 
             const text = try std.fmt.allocPrint(
                 gpa,
-                "Job {d} ({s}): RUNNING\nCommand: `{s}`\nElapsed: {d} seconds\nLog file: {s}\n\nRecent output:\n{s}",
-                .{ v.id, v.label, v.command, v.elapsed_seconds, v.log_path, tail_content },
+                "Job {d} ({s}): {s}\nCommand: `{s}`\nElapsed: {d} seconds\nLog file: {s}\n\nRecent output:\n{s}",
+                .{ v.id, v.label, if (v.terminating) "TERMINATING" else "RUNNING", v.command, v.elapsed_seconds, v.log_path, tail_content },
             );
             return common.ok(gpa, text);
         }
@@ -253,7 +253,7 @@ pub fn handleCancel(
 ) common.Error!common.Output {
     const cancelled = manager.cancel(id);
     if (cancelled) {
-        return common.ok(gpa, try std.fmt.allocPrint(gpa, "Background job {d} cancelled successfully.\n", .{id}));
+        return common.ok(gpa, try std.fmt.allocPrint(gpa, "Termination requested for background job {d}.\n", .{id}));
     }
     return common.failFmt(gpa, 1, "background: no running job found with id {d} to cancel\n", .{id});
 }
@@ -461,7 +461,7 @@ test "background tool executes list, status, cancel, and tail with active manage
 
     const prev = background_slot;
     defer background_slot = prev;
-    background_slot = .{ .manager = &manager, .owner = undefined };
+    background_slot = .{ .manager = &manager, .owner_generation = 1 };
 
     // 1. List with no jobs
     {

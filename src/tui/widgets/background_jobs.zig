@@ -78,9 +78,11 @@ const BackgroundJobsInner = struct {
             const view = self.views[row];
             const selected = row == self.selection;
             var elapsed_buf: [32]u8 = undefined;
-            const line = std.fmt.allocPrint(ctx.arena, "  {s}  [{s}]  {s}", .{
+            const state = if (view.terminating) "TERMINATING" else "RUNNING";
+            const line = std.fmt.allocPrint(ctx.arena, "  {s}  [{s}]  [{s}]  {s}", .{
                 view.label,
                 formatJobElapsed(&elapsed_buf, view.elapsed_seconds),
+                state,
                 view.command,
             }) catch view.command;
             panel.lineAt(&surface, 1 + row, line, ctx, selected, 1) catch {};

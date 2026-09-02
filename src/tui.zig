@@ -269,6 +269,7 @@ pub const App = struct {
         // The primary lane is generation 1; every later lane gets the next
         // counter value at its creation site.
         primary.generation = 1;
+        agent.lane_generation = primary.generation;
         // Seed the theme registry's builtins (gpa only, no io/paths) so
         // `app.theme_registry.slice()` is non-empty for every App — including
         // the headless/test path. Custom themes load later in `initRuntime`.
@@ -673,6 +674,15 @@ pub const App = struct {
     pub fn nextLaneGeneration(self: *App) u64 {
         self.lane_generation_counter += 1;
         return self.lane_generation_counter;
+    }
+
+    /// Assign one stable identity to both the lane and its live agent.
+    /// Background completions use the agent copy, while UI routing uses the lane.
+    pub fn assignLaneGeneration(self: *App, lane: *Thread) u64 {
+        const generation = self.nextLaneGeneration();
+        lane.generation = generation;
+        if (lane.agent) |agent| agent.lane_generation = generation;
+        return generation;
     }
 
     /// The open lane whose `generation` matches `g`, or null. Used to route a
