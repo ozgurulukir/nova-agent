@@ -786,12 +786,15 @@ fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: ?*Backgr
 }
 
 fn processId(child: std.process.Child) i64 {
-    if (os.is_windows) return @intCast(windows.GetProcessId(child.id.?));
-    return @intCast(child.id.?);
+    if (comptime os.is_windows) {
+        return @intCast(windows.GetProcessId(child.id.?));
+    } else {
+        return @intCast(child.id.?);
+    }
 }
 
 /// Win32 surface for process ID and Job Object management (kill-on-close limits).
-const windows = struct {
+const windows = if (os.is_windows) struct {
     const HANDLE = std.os.windows.HANDLE;
     const DWORD = std.os.windows.DWORD;
     const BOOL = i32;
@@ -844,6 +847,56 @@ const windows = struct {
     extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+} else struct {
+    // Stub types for non-Windows (same type aliases, available on all platforms)
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const DWORD = std.os.windows.DWORD;
+    pub const BOOL = i32;
+    pub const LPVOID = ?*anyopaque;
+    pub const LPCWSTR = [*:0]const u16;
+    pub const SIZE_T = usize;
+    pub const ULONG_PTR = usize;
+
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    pub const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    pub const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+
+    pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: SIZE_T,
+        MaximumWorkingSetSize: SIZE_T,
+        ActiveProcessLimit: DWORD,
+        Affinity: ULONG_PTR,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+
+    pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: SIZE_T,
+        JobMemoryLimit: SIZE_T,
+        PeakProcessMemoryLimit: SIZE_T,
+        PeakJobMemoryLimit: SIZE_T,
+    };
+
+    // Stub functions - never called on non-Windows (call sites guarded by comptime)
+    pub fn GetProcessId(_: HANDLE) DWORD { unreachable; }
+    pub fn CreateJobObjectW(_: ?*anyopaque, _: ?LPCWSTR) ?HANDLE { unreachable; }
+    pub fn SetInformationJobObject(_: HANDLE, _: DWORD, _: LPVOID, _: DWORD) BOOL { unreachable; }
+    pub fn AssignProcessToJobObject(_: HANDLE, _: HANDLE) BOOL { unreachable; }
+    pub fn TerminateJobObject(_: HANDLE, _: DWORD) BOOL { unreachable; }
+    pub fn CloseHandle(_: HANDLE) void { unreachable; }
 };
 
 pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
