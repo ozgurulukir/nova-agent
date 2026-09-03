@@ -39,3 +39,11 @@ pr-68-review.md
 proposal-lua-plugin-sdk-bridge-2026-08-20.md
 redteam_test
 resolve_test
+
+## Stray global-state planted by a run with a bogus HOME/USERPROFILE
+## (issue #26: Windows config paths). Nova's global tree belongs under
+## %APPDATA%\nova — never under the repo. If this reappears, the home
+## resolution regressed.
+AppData/
+## Stray POSIX-layout global config planted by a pre-#26 Windows run
+.config/
