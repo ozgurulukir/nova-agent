@@ -20,6 +20,7 @@ const vxfw = vaxis.vxfw;
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
 const config_mod = @import("../../config/config.zig");
+const input = @import("input.zig");
 
 const assert = std.debug.assert;
 
@@ -287,6 +288,14 @@ pub const Content = struct {
 
         try drawWrappedText(surface, ctx, 6, left_col + 1, surface.size.width -| left_col -| 4, text, 5, p.info);
 
+        if (is_editing) {
+            const cursor_pos = input.wrappedPosition(text, text.len, surface.size.width -| left_col -| 4);
+            surface.cursor = .{
+                .row = @min(6 + cursor_pos.row, 10), // start_row + max_rows - 1
+                .col = left_col + 1 + cursor_pos.col,
+            };
+        }
+
         // Edit hint row below the box.
         const hint_row: u16 = 13;
         if (is_editing) {
@@ -327,6 +336,10 @@ pub const Content = struct {
             const display_url = if (url_text.len > 0) url_text else "(not set)";
             const url_style: vaxis.Style = if (selected) p.selected_item else p.model_status;
             try panel.lineStyledAt(surface, 4, display_url, ctx, url_col, url_style);
+            if (is_editing) {
+                const w = @as(u16, @intCast(ctx.stringWidth(url_text)));
+                surface.cursor = .{ .row = 4, .col = url_col + w };
+            }
             const desc = "Override the remote bash-safety classifier endpoint (leave empty to use built-in).";
             try self.drawDescription(surface, ctx, 5, desc, selected);
         }

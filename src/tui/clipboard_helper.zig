@@ -11,7 +11,24 @@ const App = tui.App;
 /// Paste `text` into whichever text input currently has focus for `app.mode`.
 pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     if (text.len == 0) return;
-    const clean_text = std.mem.trim(u8, text, "\r\n");
+    // The prompt is a multiline field: keep embedded newlines (that is the
+    // whole point of multiline paste), folding CR to LF so Windows CRLF
+    // clipboards don't inject raw carriage returns into the buffer. Every
+    // other target is single-line — trim line endings so a multiline
+    // clipboard can't leak newlines into a filter field.
+    var normalized: ?[]u8 = null;
+    const clean_text: []const u8 = if (app.getMode() == .normal) blk: {
+        const buf = try app.gpa.alloc(u8, text.len);
+        var out_len: usize = 0;
+        for (text, 0..) |byte, index| {
+            if (byte == '\r' and index + 1 < text.len and text[index + 1] == '\n') continue;
+            buf[out_len] = if (byte == '\r') '\n' else byte;
+            out_len += 1;
+        }
+        normalized = buf;
+        break :blk buf[0..out_len];
+    } else std.mem.trim(u8, text, "\r\n");
+    defer if (normalized) |buf| app.gpa.free(buf);
     if (clean_text.len == 0) return;
 
     switch (app.getMode()) {
@@ -123,11 +140,56 @@ test "pasteToFocusedInput inserts text into main prompt in normal mode" {
     defer app.deinit();
 
     app.mode = .normal;
-    try pasteToFocusedInput(&app, "pasted prompt text\n");
+    try pasteToFocusedInput(&app, "pasted prompt text");
 
     const val = try app.peekInput();
     defer gpa.free(val);
     try std.testing.expectEqualStrings("pasted prompt text", val);
+}
+
+test "pasteToFocusedInput keeps newlines in the multiline prompt" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .normal;
+    try pasteToFocusedInput(&app, "line1\nline2\nline3");
+
+    const val = try app.peekInput();
+    defer gpa.free(val);
+    try std.testing.expectEqualStrings("line1\nline2\nline3", val);
+}
+
+test "pasteToFocusedInput folds CRLF to LF in the prompt" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .normal;
+    try pasteToFocusedInput(&app, "line1\r\nline2");
+
+    const val = try app.peekInput();
+    defer gpa.free(val);
+    try std.testing.expectEqualStrings("line1\nline2", val);
+}
+
+test "pasteToFocusedInput trims newlines for single-line palette targets" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    app.mode = .model_picker;
+    try pasteToFocusedInput(&app, "filter\r\n");
+
+    const val = try app.peekPaletteInput();
+    defer gpa.free(val);
+    try std.testing.expectEqualStrings("filter", val);
 }
 
 test "pasteToFocusedInput inserts text into provider key input in provider form" {

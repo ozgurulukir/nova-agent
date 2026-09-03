@@ -112,11 +112,12 @@ test "pathsEqualInternal: Windows case-insensitivity control" {
 ///   - Windows: <USERPROFILE>/AppData/Roaming/nova   (== %APPDATA%\nova)
 ///   - POSIX:   <home>/.config/nova                  (XDG base directory)
 ///
-/// Callers must pass a non-empty `home_dir`: every caller validates this
-/// upstream (`globalConfigPath` early-returns, `resolveLogPath` requires
-/// HOME/USERPROFILE, `defaultPath` asserts) so an empty home never reaches
-/// here. The returned path is therefore always rooted under a real home.
-/// Caller owns the returned slice.
+/// Callers must pass a non-empty `home_dir`: the production caller
+/// (`root.zig`'s `resolveHome`) validates the env-derived value before it
+/// reaches here; tests pass controlled relative homes to pin global state
+/// under a scratch directory. `defaultPath` asserts the resulting layout so
+/// a layout regression fails the suite immediately. Caller owns the returned
+/// slice.
 pub fn platformConfigDir(gpa: std.mem.Allocator, home_dir: []const u8) ![]u8 {
     if (os.is_windows) {
         return std.fs.path.join(gpa, &.{ home_dir, "AppData", "Roaming", "nova" });

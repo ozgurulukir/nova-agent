@@ -410,6 +410,10 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
+        if (state.edit_target == .system_prompt) {
+            try app.input_buffers.settings_text.append(app.gpa, '\n');
+            return true;
+        }
         // Enter commits the text edit without saving to disk (user must
         // press Ctrl+S to persist). This gives a chance to edit multiple
         // fields before saving.

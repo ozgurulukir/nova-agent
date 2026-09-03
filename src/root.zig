@@ -82,7 +82,13 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
     const cwd = try std.process.currentPathAlloc(init.io, gpa);
     defer gpa.free(cwd);
 
-    const home_dir = try resolveHomeDir(gpa, init.environ_map);
+    const home_dir = try resolveHome(gpa, init.environ_map) orelse {
+        // No usable home (none set, or set to a relative path): the global
+        // tree (config, sessions DB, worktrees, logs) has nowhere safe to go.
+        // Fail with an actionable message instead of letting a stray
+        // `AppData/` (or `.config/`) sprout in the launch directory.
+        return error.HomeNotSet;
+    };
     defer gpa.free(home_dir);
 
     var load_result = try config.load(gpa, init.io, cwd, home_dir, init.environ_map);
@@ -192,7 +198,7 @@ pub fn run(init: std.process.Init, gpa: std.mem.Allocator) !void {
 
 fn resolveLogPath(gpa: std.mem.Allocator, env: anytype) ![]u8 {
     if (env.get("NOVA_LOG_FILE")) |path| return gpa.dupe(u8, path);
-    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return error.HomeNotSet;
+    const home = try resolveHome(gpa, env) orelse return error.HomeNotSet;
     // Platform-correct base: Windows -> %APPDATA%\nova, POSIX -> ~/.config/nova.
     const base = try paths.platformConfigDir(gpa, home);
     errdefer gpa.free(base);
@@ -238,10 +244,86 @@ fn resolveMaxBytes(env: anytype) u64 {
     return logger.default_max_bytes;
 }
 
-fn resolveHomeDir(gpa: std.mem.Allocator, env: anytype) std.mem.Allocator.Error![]u8 {
-    if (env.get("HOME")) |home| return gpa.dupe(u8, home);
-    if (env.get("USERPROFILE")) |home| return gpa.dupe(u8, home);
-    return gpa.dupe(u8, "");
+/// Resolve the home directory that anchors Nova's global tree (config,
+/// sessions DB, worktrees, logs). Returns null when no usable home exists —
+/// `run` then fails fast with `error.HomeNotSet` instead of letting a bogus
+/// home plant the global tree inside the user's project.
+///
+/// Env precedence is platform-correct:
+///   - Windows: USERPROFILE first (the canonical home; %APPDATA% is derived
+///     from it). HOME is a foreign variable — it only appears in git-bash /
+///     MSYS2 / CI-style environments, and an override pointing at the project
+///     root used to plant `AppData/Roaming/nova/` inside the user's repo.
+///   - POSIX: HOME first, as is conventional.
+/// A set-but-relative value is rejected: it would resolve against the launch
+/// directory and anchor the global tree inside the user's project.
+fn resolveHome(
+    gpa: std.mem.Allocator,
+    env: anytype,
+) std.mem.Allocator.Error!?[]u8 {
+    const primary: ?[]const u8 = if (os.is_windows)
+        env.get("USERPROFILE")
+    else
+        env.get("HOME");
+    const candidate: ?[]const u8 = if (primary != null)
+        primary
+    else
+        (if (os.is_windows) env.get("HOME") else env.get("USERPROFILE"));
+    if (candidate) |home| {
+        if (std.fs.path.isAbsolute(home)) {
+            const dup = try gpa.dupe(u8, home);
+            return dup;
+        }
+    }
+    return null;
+}
+
+test "resolveHome: platform-canonical var wins, relative rejected" {
+    const gpa = std.testing.allocator;
+    // resolveHome is platform-branched at compile time (os.is_windows), so
+    // only the active host's branch runs; both are still type-checked.
+    if (os.is_windows) {
+        // USERPROFILE (canonical) beats a foreign, project-root HOME override —
+        // the exact scenario that planted AppData/Roaming/nova in a repo.
+        var map = std.process.Environ.Map.init(gpa);
+        defer map.deinit();
+        try map.put("USERPROFILE", "C:/Users/tester");
+        try map.put("HOME", "C:/Github/nova-agent");
+        const home = try resolveHome(gpa, map);
+        defer if (home) |h| gpa.free(h);
+        try std.testing.expect(home != null);
+        try std.testing.expect(paths.pathsEqual(home.?, "C:/Users/tester"));
+
+        // A set-but-relative USERPROFILE is rejected fail-closed, even when
+        // HOME looks valid: a broken canonical var must not be silently
+        // second-guessed.
+        var map2 = std.process.Environ.Map.init(gpa);
+        defer map2.deinit();
+        try map2.put("USERPROFILE", "relative/path");
+        try map2.put("HOME", "C:/Users/tester");
+        try std.testing.expect(try resolveHome(gpa, map2) == null);
+    } else {
+        // HOME is canonical on POSIX.
+        var map = std.process.Environ.Map.init(gpa);
+        defer map.deinit();
+        try map.put("HOME", "/home/tester");
+        const home = try resolveHome(gpa, map);
+        defer if (home) |h| gpa.free(h);
+        try std.testing.expect(home != null);
+        try std.testing.expect(paths.pathsEqual(home.?, "/home/tester"));
+
+        // A set-but-relative HOME is rejected fail-closed.
+        var map2 = std.process.Environ.Map.init(gpa);
+        defer map2.deinit();
+        try map2.put("HOME", "relative/path");
+        try map2.put("USERPROFILE", "/home/tester");
+        try std.testing.expect(try resolveHome(gpa, map2) == null);
+    }
+
+    // Neither variable set: no home at all.
+    var empty = std.process.Environ.Map.init(gpa);
+    defer empty.deinit();
+    try std.testing.expect(try resolveHome(gpa, empty) == null);
 }
 
 /// The default system prompt, composed at comptime from the shared
@@ -326,4 +408,5 @@ test {
     _ = @import("paths.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("auth/keyring.zig");
+    _ = @import("config/provider.zig");
 }

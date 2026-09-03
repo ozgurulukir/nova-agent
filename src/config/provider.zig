@@ -453,3 +453,154 @@ const CustomSelection = struct {
         };
     }
 };
+
+test "returnsCatalogueProvidersList_whenCatalogueProvidersCalled" {
+    const list = catalogueProviders();
+    try std.testing.expect(list.len > 0);
+
+    for (list) |p| {
+        try std.testing.expect(p.isCatalogue());
+    }
+
+    // Known catalogue providers check
+    var found_openrouter = false;
+    for (list) |p| {
+        if (p == .openrouter) found_openrouter = true;
+    }
+    try std.testing.expect(found_openrouter);
+}
+
+test "returnsAllBuiltinLabels_whenAllBuiltinLabelsCalled" {
+    const labels = allBuiltinLabels();
+    try std.testing.expectEqual(@typeInfo(Provider).@"enum".fields.len, labels.len);
+
+    for (labels) |lbl| {
+        try std.testing.expect(providers_by_name.get(lbl) != null);
+    }
+}
+
+test "lookupProvider_whenProvidersByNameQueried" {
+    try std.testing.expectEqual(Provider.openai, providers_by_name.get("openai").?);
+    try std.testing.expectEqual(Provider.anthropic, providers_by_name.get("anthropic").?);
+    try std.testing.expectEqual(Provider.nvidia_nim, providers_by_name.get("nvidia_nim").?);
+    try std.testing.expectEqual(@as(?Provider, null), providers_by_name.get("unknown_provider"));
+}
+
+test "resolvesEffort_whenReasoningSettingResolved" {
+    const unset_setting: ReasoningSetting = .unset;
+    try std.testing.expectEqual(ai.ReasoningEffort.medium, unset_setting.resolve());
+
+    const explicit_setting: ReasoningSetting = .{ .effort = .high };
+    try std.testing.expectEqual(ai.ReasoningEffort.high, explicit_setting.resolve());
+}
+
+test "clonesAndDeinitsModel_whenModelLifecycleExecuted" {
+    const gpa = std.testing.allocator;
+
+    const reasoning_opts = try gpa.alloc(ai.ReasoningEffort, 2);
+    reasoning_opts[0] = .low;
+    reasoning_opts[1] = .high;
+
+    var original: Model = .{
+        .id = try gpa.dupe(u8, "gpt-4o"),
+        .reasoning = .{ .effort = .high },
+        .context_window = 128000,
+        .max_output_tokens = 4096,
+        .reasoning_options = reasoning_opts,
+    };
+
+    var cloned = try original.clone(gpa);
+    defer cloned.deinit(gpa);
+    original.deinit(gpa);
+
+    try std.testing.expectEqualStrings("gpt-4o", cloned.id);
+    try std.testing.expectEqual(ai.ReasoningEffort.high, cloned.reasoning.resolve());
+    try std.testing.expectEqual(@as(?u32, 128000), cloned.context_window);
+    try std.testing.expectEqual(@as(?u32, 4096), cloned.max_output_tokens);
+    try std.testing.expectEqual(@as(usize, 2), cloned.reasoning_options.len);
+    try std.testing.expectEqual(ai.ReasoningEffort.low, cloned.reasoning_options[0]);
+    try std.testing.expectEqual(ai.ReasoningEffort.high, cloned.reasoning_options[1]);
+}
+
+test "clonesAndDeinitsProviderConfig_whenProviderConfigLifecycleExecuted" {
+    const gpa = std.testing.allocator;
+
+    var models = try gpa.alloc(ProviderModel, 1);
+    models[0] = .{
+        .id = try gpa.dupe(u8, "claude-3-5-sonnet"),
+    };
+
+    var original: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "custom-anthropic"),
+        .provider = .anthropic,
+        .base_url = .{ .custom = try gpa.dupe(u8, "https://api.anthropic.com") },
+        .models = models,
+    };
+
+    var cloned = try original.clone(gpa);
+    defer cloned.deinit(gpa);
+    original.deinit(gpa);
+
+    try std.testing.expectEqualStrings("custom-anthropic", cloned.name);
+    try std.testing.expectEqual(Provider.anthropic, cloned.provider);
+    switch (cloned.base_url) {
+        .custom => |url| try std.testing.expectEqualStrings("https://api.anthropic.com", url),
+        .default => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(@as(usize, 1), cloned.models.len);
+    try std.testing.expectEqualStrings("claude-3-5-sonnet", cloned.models[0].id);
+}
+
+test "clonesAndAccessesModelSelection_whenBuiltinAndCustomVariantsUsed" {
+    const gpa = std.testing.allocator;
+
+    var original_builtin: ModelSelection = .{
+        .builtin = .{
+            .provider = .openrouter,
+            .provider_name = try gpa.dupe(u8, "openrouter"),
+            .model = .{
+                .id = try gpa.dupe(u8, "anthropic/claude-3.5-sonnet"),
+            },
+            .use_responses_endpoint = true,
+            .system_prompt = try gpa.dupe(u8, "system prompt"),
+            .bash_classifier_url = try gpa.dupe(u8, "http://classifier"),
+        },
+    };
+
+    var cloned_builtin = try original_builtin.clone(gpa);
+    defer cloned_builtin.deinit(gpa);
+    original_builtin.deinit(gpa);
+
+    try std.testing.expectEqual(Provider.openrouter, cloned_builtin.provider());
+    try std.testing.expectEqualStrings("openrouter", cloned_builtin.providerName());
+    try std.testing.expectEqualStrings("anthropic/claude-3.5-sonnet", cloned_builtin.model().id);
+    try std.testing.expectEqual(@as(?[]const u8, null), cloned_builtin.baseUrl());
+    try std.testing.expectEqual(@as(?[]const u8, null), cloned_builtin.apiKey());
+    try std.testing.expect(cloned_builtin.useResponsesEndpoint());
+    try std.testing.expectEqualStrings("system prompt", cloned_builtin.systemPrompt().?);
+    try std.testing.expectEqualStrings("http://classifier", cloned_builtin.bashClassifierUrl().?);
+
+    var original_custom: ModelSelection = .{
+        .custom = .{
+            .provider_name = try gpa.dupe(u8, "my-llm"),
+            .base_url = try gpa.dupe(u8, "https://my-llm.example.com/v1"),
+            .api_key = try gpa.dupe(u8, "sk-test1234"),
+            .model = .{
+                .id = try gpa.dupe(u8, "llama-3"),
+            },
+        },
+    };
+
+    var cloned_custom = try original_custom.clone(gpa);
+    defer cloned_custom.deinit(gpa);
+    original_custom.deinit(gpa);
+
+    try std.testing.expectEqual(Provider.openai_compatible, cloned_custom.provider());
+    try std.testing.expectEqualStrings("my-llm", cloned_custom.providerName());
+    try std.testing.expectEqualStrings("https://my-llm.example.com/v1", cloned_custom.baseUrl().?);
+    try std.testing.expectEqualStrings("sk-test1234", cloned_custom.apiKey().?);
+    try std.testing.expectEqualStrings("llama-3", cloned_custom.model().id);
+    try std.testing.expect(!cloned_custom.useResponsesEndpoint());
+    try std.testing.expectEqual(@as(?[]const u8, null), cloned_custom.systemPrompt());
+    try std.testing.expectEqual(@as(?[]const u8, null), cloned_custom.bashClassifierUrl());
+}

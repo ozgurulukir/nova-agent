@@ -251,3 +251,26 @@ test "validateAndCoerceCallArgs coerces numeric strings but preserves non-numeri
         try std.testing.expect(std.mem.indexOf(u8, msg, "count") != null);
     }
 }
+
+test "validateAndCoerceCallArgs coerces quoted booleans" {
+    const gpa = std.testing.allocator;
+    const props = [_]tools.Schema.Property{
+        .{ .name = "run_in_background", .kind = .boolean, .description = "", .required = false },
+    };
+    const schema: tools.Schema = .{ .properties = &props };
+    const call: ai.ToolCall = .{
+        .call_id = .{ .value = try gpa.dupe(u8, "call_background") },
+        .name = try gpa.dupe(u8, "bash"),
+        .arguments = try gpa.dupe(u8, "{\"run_in_background\":\"true\"}"),
+    };
+    defer {
+        gpa.free(call.call_id.value);
+        gpa.free(call.name);
+        gpa.free(call.arguments);
+    }
+
+    var result = try validateAndCoerceCallArgs(gpa, schema, call);
+    defer result.deinit(gpa);
+    try std.testing.expect(result.validation.isValid());
+    try std.testing.expectEqualStrings("{\"run_in_background\":true}", result.args);
+}

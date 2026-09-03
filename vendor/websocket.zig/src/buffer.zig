@@ -280,3 +280,96 @@ pub const Pool = struct {
     }
 };
 
+const t = @import("t.zig");
+test "buffer: no pool" {
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 100 });
+
+    const buffer = try p.alloc(100);
+    defer p.free(buffer);
+    try t.expectEqual(.dynamic, buffer.type);
+    try t.expectEqual(100, buffer.data.len);
+}
+
+test "buffer: pool" {
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 2, .size = 10, .max = 15 });
+    defer p.deinit();
+
+    {
+        // bigger than allowed
+        try t.expectError(error.TooLarge, p.alloc(16));
+    }
+
+    {
+        // bigger than our buffers in pool
+        const buffer = try p.alloc(15);
+        defer p.free(buffer);
+        try t.expectEqual(.dynamic, buffer.type);
+        try t.expectEqual(15, buffer.data.len);
+    }
+
+    {
+        // smaller than our buffers in pool
+        const buf1 = try p.alloc(4);
+        try t.expectEqual(.pooled, buf1.type);
+        try t.expectEqual(4, buf1.data.len);
+
+        const buf2 = try p.alloc(5);
+        try t.expectEqual(.pooled, buf2.type);
+        try t.expectEqual(5, buf2.data.len);
+        try t.expectEqual(true, buf1.data.ptr != buf2.data.ptr);
+
+        // no more buffers in the pool, creats a dynamic buffer
+        const buf3 = try p.alloc(6);
+        try t.expectEqual(.dynamic, buf3.type);
+        try t.expectEqual(6, buf3.data.len);
+
+        p.release(buf1);
+
+        const buf4 = try p.alloc(7);
+        try t.expectEqual(.pooled, buf4.type);
+        try t.expectEqual(7, buf4.data.len);
+        try t.expectEqual(true, buf1.data.ptr == buf4.data.ptr);
+
+        p.release(buf2);
+        p.release(buf3);
+    }
+}
+
+test "buffer: grow" {
+    var p = try Provider.init(t.io, t.allocator, .{ .count = 1, .size = 10, .max = 30 });
+    defer p.deinit();
+
+    {
+        // grow a dynamic buffer
+        var buf1 = try p.alloc(15);
+        @memcpy(buf1.data[0..5], "hello");
+        const buf2 = try p.grow(buf1, 5, 20);
+        defer p.free(buf2);
+        try t.expectEqual(20, buf2.data.len);
+        try t.expectString("hello", buf2.data[0..5]);
+    }
+
+    {
+        // grow a static buffer
+        var buf1 = Buffer{ .type = .static, .data = try t.allocator.alloc(u8, 15) };
+        defer t.allocator.free(buf1.data);
+        @memcpy(buf1.data[0..6], "hello2");
+
+        const buf2 = try p.grow(buf1, 6, 21);
+        defer p.free(buf2);
+        try t.expectEqual(21, buf2.data.len);
+        try t.expectString("hello2", buf2.data[0..6]);
+    }
+
+    {
+        // grow a pooled buffer
+        var buf1 = try p.alloc(8);
+
+        @memcpy(buf1.data[0..7], "hello2a");
+        const buf2 = try p.grow(buf1, 7, 14);
+        defer p.free(buf2);
+        try t.expectEqual(14, buf2.data.len);
+        try t.expectString("hello2a", buf2.data[0..7]);
+        try t.expectEqual(1, p.pool.available);
+    }
+}
