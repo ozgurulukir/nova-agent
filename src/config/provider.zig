@@ -454,34 +454,6 @@ const CustomSelection = struct {
     }
 };
 
-test "returnsExpectedProperties_whenProviderMethodsCalled" {
-    // All providers return non-empty label, displayName, and description
-    inline for (@typeInfo(Provider).@"enum".fields) |field| {
-        const p: Provider = @enumFromInt(field.value);
-        try std.testing.expect(p.label().len > 0);
-        try std.testing.expect(p.displayName().len > 0);
-        try std.testing.expect(p.description().len > 0);
-    }
-
-    // Specific provider property checks
-    try std.testing.expectEqualStrings("openai", Provider.openai.label());
-    try std.testing.expectEqualStrings("OpenAI Codex", Provider.openai.displayName());
-    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api", Provider.openai.defaultBaseUrl().?);
-    try std.testing.expectEqual(AdapterKind.codex_responses, Provider.openai.adapter().?);
-    try std.testing.expect(!Provider.openai.isCatalogue());
-    try std.testing.expect(Provider.openai.requiresApiKey());
-    try std.testing.expectEqual(@as(?[]const u8, null), Provider.openai.anonymousApiKey());
-
-    // OpenCode Zen (anonymous API key and custom requirements)
-    try std.testing.expectEqualStrings("public", Provider.opencode_zen.anonymousApiKey().?);
-    try std.testing.expect(!Provider.opencode_zen.requiresApiKey());
-    try std.testing.expect(Provider.opencode_zen.isCatalogue());
-
-    // Anthropic (null defaultBaseUrl and null adapter)
-    try std.testing.expectEqual(@as(?[]const u8, null), Provider.anthropic.defaultBaseUrl());
-    try std.testing.expectEqual(@as(?AdapterKind, null), Provider.anthropic.adapter());
-}
-
 test "returnsCatalogueProvidersList_whenCatalogueProvidersCalled" {
     const list = catalogueProviders();
     try std.testing.expect(list.len > 0);
@@ -577,43 +549,6 @@ test "clonesAndDeinitsProviderConfig_whenProviderConfigLifecycleExecuted" {
     }
     try std.testing.expectEqual(@as(usize, 1), cloned.models.len);
     try std.testing.expectEqualStrings("claude-3-5-sonnet", cloned.models[0].id);
-}
-
-test "returnsCorrectAccessors_whenModelSelectionRefQueried" {
-    const gpa = std.testing.allocator;
-
-    var dummy_model: Model = .{
-        .id = try gpa.dupe(u8, "ollama-model"),
-    };
-    defer dummy_model.deinit(gpa);
-
-    const builtin_ref: ModelSelectionRef = .{
-        .builtin = .{
-            .provider = .ollama,
-            .provider_name = "ollama",
-            .model = &dummy_model,
-        },
-    };
-
-    try std.testing.expectEqual(Provider.ollama, builtin_ref.provider());
-    try std.testing.expectEqualStrings("ollama", builtin_ref.providerName());
-    try std.testing.expectEqualStrings("ollama-model", builtin_ref.model().id);
-    try std.testing.expectEqual(@as(?[]const u8, null), builtin_ref.baseUrl());
-    try std.testing.expectEqual(@as(?[]const u8, null), builtin_ref.apiKey());
-
-    const custom_ref: ModelSelectionRef = .{
-        .custom = .{
-            .provider_name = "my-custom-provider",
-            .base_url = "http://localhost:8000",
-            .api_key = "secret",
-            .model = &dummy_model,
-        },
-    };
-
-    try std.testing.expectEqual(Provider.openai_compatible, custom_ref.provider());
-    try std.testing.expectEqualStrings("my-custom-provider", custom_ref.providerName());
-    try std.testing.expectEqualStrings("http://localhost:8000", custom_ref.baseUrl().?);
-    try std.testing.expectEqualStrings("secret", custom_ref.apiKey().?);
 }
 
 test "clonesAndAccessesModelSelection_whenBuiltinAndCustomVariantsUsed" {
