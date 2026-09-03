@@ -175,6 +175,11 @@ pub const App = struct {
     /// True once a snapshot has failed and we've told the user. Stops the
     /// per-turn failure notice from repeating every turn while git is wedged.
     checkpoint_warned: bool = false,
+    /// True while a terminal bracketed paste is in flight (between `paste_start`
+    /// and `paste_end`). While set, routeKey must not submit on the paste's own
+    /// Enter/CR bytes — each newline in a multiline paste inserts a newline
+    /// into the prompt instead (see event_router.zig).
+    pasting: bool = false,
     mode: Mode = .normal,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     resume_folded_projects: std.ArrayList([]u8) = .empty,
@@ -404,6 +409,14 @@ pub const App = struct {
 
     pub fn inputRealLength(self: *const App) usize {
         return self.inputs.input.buf.realLength();
+    }
+
+    pub fn isPasting(self: *const App) bool {
+        return self.pasting;
+    }
+
+    pub fn setPasting(self: *App, pasting: bool) void {
+        self.pasting = pasting;
     }
 
     pub fn isNormalMode(self: *const App) bool {

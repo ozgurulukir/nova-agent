@@ -44,6 +44,20 @@ pub fn captureEvent(
             try clipboard_helper.pasteToFocusedInput(app, text);
             ctx.consumeAndRedraw();
         },
+        .paste_start => {
+            // Bracketed paste window opens (ESC [200~). The pasted bytes arrive
+            // as ordinary key presses; routeKey must treat their newlines as
+            // content, not submit triggers, until paste_end.
+            app.setPasting(true);
+            ctx.consumeEvent();
+        },
+        .paste_end => {
+            // Always clear: paste_end is the terminal state, and swallowing it
+            // also recovers a stray window (e.g. the terminal dropped the end
+            // marker mid-paste).
+            app.setPasting(false);
+            ctx.consumeEvent();
+        },
         else => {},
     }
 }
@@ -200,6 +214,23 @@ fn routeKey(
             ctx.consumeAndRedraw();
         } else {
             ctx.consumeEvent();
+        }
+        return;
+    }
+    // While a bracketed paste is in flight, its bytes are CONTENT, not
+    // commands. Newlines in the paste become prompt newlines (the same
+    // mechanism as Shift+Enter) instead of submitting, and a leading '/'
+    // must not open the command menu. Non-newline bytes are left
+    // unconsumed here on purpose: vxfw only forwards a key to the focused
+    // input when the root capture did not consume it, which is how typed
+    // characters reach the buffer today.
+    if (app.isPasting() and app.isNormalMode()) {
+        if (key.matches('j', .{ .ctrl = true }) or
+            key.matches(vaxis.Key.enter, .{ .shift = true }) or
+            command_router.isEnterKey(key))
+        {
+            try app.insertInputNewline();
+            ctx.consumeAndRedraw();
         }
         return;
     }
@@ -518,4 +549,94 @@ test "Escape in normal mode with non-empty input clears the input" {
 
     try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.realLength());
     try std.testing.expect(app.nav.quit == .none);
+}
+
+test "bracketed paste: multiline paste inserts newlines and does not submit" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    // The paste window opens, and the terminal sends the first line's
+    // characters as ordinary keys. Characters are left unconsumed by the
+    // root so vxfw forwards them to the focused input — emulate that by
+    // inserting them where the input would.
+    try captureEvent(&app, &root, &ctx, .paste_start);
+    try std.testing.expect(app.isPasting());
+    try app.inputs.input.insertSliceAtCursor("line1");
+
+    // CR (a CRLF paste's newline) must become a prompt newline, not a
+    // submit: the input keeps its contents and gains a second line.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+    try std.testing.expect(app.isPasting());
+
+    // LF pastes (bare-newline clipboards) arrive as a Ctrl+J key without
+    // .text — that must also be a newline, not a submit.
+    try app.inputs.input.insertSliceAtCursor("line2");
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = 'j', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(app.isPasting());
+
+    try app.inputs.input.insertSliceAtCursor("line3");
+    try captureEvent(&app, &root, &ctx, .paste_end);
+    try std.testing.expect(!app.isPasting());
+
+    try std.testing.expectEqualStrings(
+        "line1\nline2\nline3",
+        app.inputs.input.buf.firstHalf(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.inputs.input.buf.secondHalf().len);
+}
+
+test "bracketed paste: paste_start with a leading slash does not open the command menu" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try captureEvent(&app, &root, &ctx, .paste_start);
+    try std.testing.expect(app.isPasting());
+
+    // Outside a paste this exact key (input empty) switches to the command
+    // menu; during a paste it must stay in normal mode.
+    try captureEvent(&app, &root, &ctx, .{ .key_press = .{ .codepoint = '/' } });
+
+    try std.testing.expect(app.getMode() == .normal);
+    try std.testing.expect(app.isPasting());
+
+    try captureEvent(&app, &root, &ctx, .paste_end);
+    try std.testing.expect(!app.isPasting());
+}
+
+test "bracketed paste: stray paste_end clears the flag" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+    app.bindInputCallbacks();
+
+    var root: RootWidget = .{ .app = &app };
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try std.testing.expect(!app.isPasting());
+    // Simulates a terminal dropping the end marker of an earlier paste: the
+    // flag must never stay armed.
+    try captureEvent(&app, &root, &ctx, .paste_end);
+    try std.testing.expect(!app.isPasting());
 }
