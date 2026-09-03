@@ -326,4 +326,5 @@ test {
     _ = @import("paths.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("auth/keyring.zig");
+    _ = @import("config/provider.zig");
 }
