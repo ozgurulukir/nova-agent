@@ -219,23 +219,20 @@ fn transcriptHasUser(app: *App, needle: []const u8) bool {
 }
 
 const runtime_mod = @import("../runtime.zig");
+const isolatedHome = @import("test_fixture.zig").isolatedHome;
 
 test "appendSkillInvocationsToTranscript appends formatted skill title to transcript" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd_abs);
-    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
-    defer gpa.free(home_dir);
+    var home = try isolatedHome(gpa, io);
+    defer home.deinit(gpa);
     var agent = agent_mod.Agent.init(gpa, io, ".", .none);
     defer agent.deinit();
     var app = try tui.App.init(io, gpa, &agent);
     defer app.deinit();
 
     var runtime: runtime_mod.AgentRuntime = undefined;
-    try runtime.initNew(gpa, io, ".", home_dir, home_dir, "test system prompt", .{}, &.{}, null);
+    try runtime.initNew(gpa, io, ".", home.path, home.path, "test system prompt", .{}, &.{}, null);
     defer runtime.deinit();
     app.thread.engine = .{ .live = .{ .lane = .primary, .runtime = &runtime, .owns = false } };
 
