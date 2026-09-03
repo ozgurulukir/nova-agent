@@ -18,10 +18,15 @@ pub fn pasteToFocusedInput(app: *App, text: []const u8) !void {
     // clipboard can't leak newlines into a filter field.
     var normalized: ?[]u8 = null;
     const clean_text: []const u8 = if (app.getMode() == .normal) blk: {
-        const buf = try app.gpa.dupe(u8, text);
-        for (buf) |*b| b.* = if (b.* == '\r') '\n' else b.*;
+        const buf = try app.gpa.alloc(u8, text.len);
+        var out_len: usize = 0;
+        for (text, 0..) |byte, index| {
+            if (byte == '\r' and index + 1 < text.len and text[index + 1] == '\n') continue;
+            buf[out_len] = if (byte == '\r') '\n' else byte;
+            out_len += 1;
+        }
         normalized = buf;
-        break :blk buf;
+        break :blk buf[0..out_len];
     } else std.mem.trim(u8, text, "\r\n");
     defer if (normalized) |buf| app.gpa.free(buf);
     if (clean_text.len == 0) return;

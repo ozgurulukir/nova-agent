@@ -67,6 +67,9 @@ pub fn activeQuery(before_cursor: []const u8) ?Active {
 pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(gpa);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+
     var i: usize = 0;
     while (i < prompt.len) {
         const at_boundary = i == 0 or isBoundary(prompt[i - 1]);
@@ -74,8 +77,11 @@ pub fn collectMentions(gpa: std.mem.Allocator, prompt: []const u8) ![][]const u8
             var j = i + 1;
             while (j < prompt.len and !isBoundary(prompt[j])) j += 1;
             const path = trimTrailingPunctuation(prompt[i + 1 .. j]);
-            if (path.len > 0 and !containsPath(list.items, path)) {
-                try list.append(gpa, path);
+            if (path.len > 0) {
+                const gop = try seen.getOrPut(gpa, path);
+                if (!gop.found_existing) {
+                    try list.append(gpa, path);
+                }
             }
             i = j;
         } else {
@@ -289,13 +295,6 @@ fn trimTrailingPunctuation(path: []const u8) []const u8 {
         }
     }
     return path[0..end];
-}
-
-fn containsPath(paths: []const []const u8, candidate: []const u8) bool {
-    for (paths) |path| {
-        if (std.mem.eql(u8, path, candidate)) return true;
-    }
-    return false;
 }
 
 fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
