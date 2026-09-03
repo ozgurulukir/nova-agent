@@ -177,13 +177,13 @@ const runtime_mod = @import("../runtime.zig");
 /// `startDeliveryTurnOnCurrentThread` flush+clearQueue branch instead of
 /// starting a real worker turn. Same field shape as GitFixture's runtime
 /// (lane_lifecycle.zig), minus the git scaffolding.
-fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io) !*runtime_mod.AgentRuntime {
+fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !*runtime_mod.AgentRuntime {
     const runtime = try gpa.create(runtime_mod.AgentRuntime);
     errdefer gpa.destroy(runtime);
     runtime.gpa = gpa;
     runtime.io = io;
     runtime.cwd = ".";
-    runtime.home_dir = ".";
+    runtime.home_dir = home_dir;
     runtime.client = .none;
     runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
@@ -202,7 +202,13 @@ fn createNoProviderRuntime(gpa: std.mem.Allocator, io: std.Io) !*runtime_mod.Age
 test "M2: a QueueFull background drop gains no mirror entry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const runtime = try createNoProviderRuntime(gpa, io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+    const runtime = try createNoProviderRuntime(gpa, io, home_dir);
     defer gpa.destroy(runtime);
     defer runtime.agent.deinit();
     var app = try tui.App.init(io, gpa, &runtime.agent);
@@ -233,7 +239,13 @@ test "M2: a QueueFull background drop gains no mirror entry" {
 test "M2: a no-provider delivery clears the mirror in lockstep with the agent queue" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const runtime = try createNoProviderRuntime(gpa, io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+    const runtime = try createNoProviderRuntime(gpa, io, home_dir);
     defer gpa.destroy(runtime);
     defer runtime.agent.deinit();
     var app = try tui.App.init(io, gpa, &runtime.agent);
@@ -262,7 +274,13 @@ test "M2: a no-provider delivery clears the mirror in lockstep with the agent qu
 test "INV-BG-OWNER-1: late background completion drops cleanly when owning lane is deleted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const runtime = try createNoProviderRuntime(gpa, io);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+    const runtime = try createNoProviderRuntime(gpa, io, home_dir);
     defer gpa.destroy(runtime);
     defer runtime.agent.deinit();
     var app = try tui.App.init(io, gpa, &runtime.agent);

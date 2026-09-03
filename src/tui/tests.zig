@@ -715,7 +715,9 @@ test "compact request appends an animated status row while the summary is produc
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, ".config/nova");
-    const home_dir = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
     defer gpa.free(home_dir);
 
     var writer: session_mod.SessionWriter = undefined;
@@ -1268,11 +1270,18 @@ test "compatible base url falls back when cached local provider differs" {
 
 test "codex sign-in survives selecting local compatible provider" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.gpa = gpa;
     runtime.io = std.testing.io;
     runtime.cwd = ".";
-    runtime.home_dir = ".";
+    runtime.home_dir = home_dir;
     runtime.client = .none;
     runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
@@ -1386,11 +1395,18 @@ test "createRuntime wires the full tool set into the freshly-attached client" {
 
 test "switching from codex to catalogue provider resets cached connection" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.gpa = gpa;
     runtime.io = std.testing.io;
     runtime.cwd = ".";
-    runtime.home_dir = ".";
+    runtime.home_dir = home_dir;
     runtime.client = .none;
     runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
@@ -1903,11 +1919,18 @@ test "lanes chip rect hit test covers its row span only" {
 
 test "model selection is allowed after interrupt" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.gpa = gpa;
     runtime.io = std.testing.io;
     runtime.cwd = ".";
-    runtime.home_dir = ".";
+    runtime.home_dir = home_dir;
     runtime.client = .none;
     runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
@@ -1947,11 +1970,18 @@ test "model selection is allowed after interrupt" {
 
 test "interrupt restart flushes queued messages to the transcript when no provider" {
     const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_dir = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_dir);
+
     var runtime: runtime_mod.AgentRuntime = undefined;
     runtime.gpa = gpa;
     runtime.io = std.testing.io;
     runtime.cwd = ".";
-    runtime.home_dir = ".";
+    runtime.home_dir = home_dir;
     runtime.client = .none;
     runtime.base_system_prompt = "test";
     runtime.system_prompt = "test";
