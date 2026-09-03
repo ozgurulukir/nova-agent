@@ -183,6 +183,7 @@ pub const Client = struct {
             error.ConnectionTimedOut,
             error.BrokenPipe,
             error.HttpConnectionClosing,
+            error.HttpRequestTruncated,
             error.Unexpected,
             => error.ConnectionFailed,
             else => err,
@@ -221,11 +222,12 @@ pub const Client = struct {
             // stream error fields directly — `Connection.getReadError`
             // unwraps `.?` internally and panics when std synthesized the
             // ReadFailed without a socket error.
-            if (err == error.ReadFailed or err == error.WriteFailed) {
-                if (req.connection) |conn| {
-                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
-                    self.recordReadFailure(reason);
-                }
+            if (err == error.ReadFailed or err == error.WriteFailed or err == error.HttpRequestTruncated) {
+                const reason: anyerror = if (req.connection) |conn|
+                    if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err
+                else
+                    err;
+                self.recordReadFailure(reason);
             }
             return self.headPhaseFailure(err);
         };
@@ -376,11 +378,20 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
         }
 
         fn serve(self: *@This()) void {
+            var read_buf: [4096]u8 = undefined;
+            var write_buf: [8192]u8 = undefined;
             var stream = self.server.accept(self.srv_io) catch return;
-            // Close immediately without reading the request: the kernel then
-            // sees unread inbound data and answers with an RST, so the
-            // client's next operation (its remaining writes or the head
-            // read) fails with a connection-level error.
+            var reader = stream.reader(self.srv_io, &read_buf);
+            // Drain the request so the client can finish sending before the
+            // connection closes. This makes the failure occur in
+            // `receiveHead`, rather than nondeterministically during upload.
+            drainChunkedRequest(&reader.interface);
+            // Send an incomplete status line after the upload. This makes the
+            // client fail while receiving the response head, rather than
+            // racing the request upload against a closed socket.
+            var writer = stream.writer(self.srv_io, &write_buf);
+            writer.interface.writeAll("HTTP/1.1 200") catch return;
+            writer.interface.flush() catch return;
             stream.close(self.srv_io);
         }
     };
