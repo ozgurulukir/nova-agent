@@ -4,6 +4,7 @@ const posix = @import("../posix.zig");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
 const CompressionOpts = @import("../websocket.zig").Compression;
+const ServerHandshake = @import("../server/handshake.zig").Handshake;
 
 const Io = std.Io;
 const ascii = std.ascii;
@@ -32,6 +33,184 @@ fn ReadLoopHandler(comptime T: type) type {
         },
         else => @compileError("readLoop: expected handler to be a struct or pointer to a struct but found '" ++ @tagName(info) ++ "'"),
     }
+}
+
+// Resolve `host` and connect to `port` with the TCP connect bounded by
+// `timeout_ms`. The Threaded Io panics when asked for a connect timeout, so the
+// connect is driven manually: a non-blocking connect gated by poll(). The
+// returned stream's socket is left in blocking mode for the handshake and read
+// paths.
+fn connectTimeout(io: Io, host: []const u8, port: u16, timeout_ms: u32) !Io.net.Stream {
+    const host_name = try Io.net.HostName.init(host);
+
+    if ((comptime @import("builtin").os.tag == .windows) or timeout_ms == 0) {
+        return host_name.connect(io, port, .{ .mode = .stream });
+    }
+
+    var lookup_buf: [32]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue = Io.Queue(Io.net.HostName.LookupResult).init(&lookup_buf);
+    var lookup_future = io.async(Io.net.HostName.lookup, .{ host_name, io, &lookup_queue, .{ .port = port } });
+    defer lookup_future.cancel(io) catch {};
+
+    // A single deadline spans every resolved address. DNS can return many
+    // records, so giving each attempt a full timeout_ms would let a hostile
+    // relay stretch the total connect wait to N x timeout_ms and outlast the
+    // shutdown grace. Each attempt gets only the remaining budget; once it is
+    // exhausted we stop and report the last error.
+    const start_ns = Io.Timestamp.now(io, .awake).nanoseconds;
+    var last_err: ?ConnectAddrError = null;
+    while (lookup_queue.getOneUncancelable(io)) |res| switch (res) {
+        .address => |addr| {
+            const elapsed = @divTrunc(Io.Timestamp.now(io, .awake).nanoseconds - start_ns, std.time.ns_per_ms);
+            if (elapsed >= timeout_ms) return error.ConnectTimeout;
+            const remaining: u32 = if (elapsed <= 0) timeout_ms else timeout_ms - @as(u32, @intCast(elapsed));
+            return connectAddrTimeout(addr, remaining) catch |err| {
+                last_err = err;
+                continue;
+            };
+        },
+        .canonical_name => continue,
+    } else |err| switch (err) {
+        error.Closed => {},
+    }
+    if (last_err) |err| {
+        return err;
+    }
+    // No addresses at all: surface the resolver's error if it had one.
+    try lookup_future.await(io);
+    return error.UnknownHostName;
+}
+
+const ConnectAddrError = error{ ConnectFailed, ConnectTimeout, ConnectionRefused, NetworkUnreachable };
+
+fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) ConnectAddrError!Io.net.Stream {
+    const address: posix.Address = switch (addr) {
+        .ip4 => |a| .{ .in = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .addr = @bitCast(a.bytes),
+        } },
+        .ip6 => |a| .{ .in6 = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .flowinfo = a.flow,
+            .addr = a.bytes,
+            // Required for link-local (fe80::) addresses to pick the right
+            // interface; Interface.none has index 0.
+            .scope_id = a.interface.index,
+        } },
+    };
+
+    const sock_type = posix.SOCK.STREAM | posix.NONBLOCK | posix.CLOEXEC;
+    const fd = posix.socket(@intCast(address.any.family), sock_type, 0) catch return error.ConnectFailed;
+    errdefer posix.close(fd);
+
+    if (posix.connect(fd, &address.any, address.getOsSockLen())) |_| {
+        // Connected without blocking.
+    } else |err| switch (err) {
+        error.WouldBlock => {
+            var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+            // poll()'s timeout is a signed c_int; a misconfigured timeout larger
+            // than INT_MAX would panic on the cast, so clamp instead.
+            const poll_ms: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+            const ready = std.posix.poll(&pfd, poll_ms) catch return error.ConnectFailed;
+            if (ready == 0) return error.ConnectTimeout;
+            // poll() readiness does not imply success: an async connect failure
+            // is reported via SO_ERROR and need not set POLL.ERR/HUP, so this is
+            // the authoritative check.
+            var so_err: i32 = 0;
+            var so_len: posix.socklen_t = @sizeOf(i32);
+            switch (std.posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len))) {
+                .SUCCESS => {},
+                else => return error.ConnectFailed,
+            }
+            if (so_err != 0) return switch (@as(std.posix.E, @enumFromInt(so_err))) {
+                .CONNREFUSED => error.ConnectionRefused,
+                .TIMEDOUT => error.ConnectTimeout,
+                .HOSTUNREACH, .NETUNREACH => error.NetworkUnreachable,
+                else => error.ConnectFailed,
+            };
+        },
+        error.ConnectionRefused => return error.ConnectionRefused,
+        error.NetworkUnreachable => return error.NetworkUnreachable,
+        error.ConnectionTimedOut => return error.ConnectTimeout,
+        else => return error.ConnectFailed,
+    }
+
+    // The handshake and read/write paths expect a blocking socket.
+    const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return error.ConnectFailed;
+    _ = posix.fcntl(fd, posix.F.SETFL, flags & ~nonblock) catch return error.ConnectFailed;
+
+    return .{ .socket = .{ .handle = fd, .address = addr } };
+}
+
+// Bounds the TLS handshake: a thread waits up to `timeout_ms` on a wake pipe
+// and, if the handshake has not finished by then, shuts the socket down so the
+// blocking handshake read/write fails instead of hanging. `disarm` wakes the
+// thread and joins it before the socket may be closed, so it never touches a
+// reused fd.
+const HandshakeGuard = struct {
+    wake_r: posix.fd_t,
+    wake_w: posix.fd_t,
+    thread: std.Thread,
+
+    fn arm(fd: posix.socket_t, timeout_ms: u32, timed_out: *std.atomic.Value(bool)) !HandshakeGuard {
+        const fds = try posix.pipe2(.{ .CLOEXEC = true });
+        errdefer {
+            posix.close(fds[0]);
+            posix.close(fds[1]);
+        }
+        const thread = try std.Thread.spawn(.{}, watch, .{ fd, timeout_ms, fds[0], timed_out });
+        return .{ .wake_r = fds[0], .wake_w = fds[1], .thread = thread };
+    }
+
+    fn watch(fd: posix.socket_t, timeout_ms: u32, wake_r: posix.fd_t, timed_out: *std.atomic.Value(bool)) void {
+        var pfd = [_]std.posix.pollfd{.{ .fd = wake_r, .events = std.posix.POLL.IN, .revents = 0 }};
+        const poll_ms: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+        const ready = std.posix.poll(&pfd, poll_ms) catch return;
+        if (ready == 0) {
+            timed_out.store(true, .release);
+            posix.shutdown(fd, .both) catch {};
+        }
+    }
+
+    fn disarm(self: *HandshakeGuard) void {
+        _ = posix.write(self.wake_w, "x") catch {};
+        self.thread.join();
+        posix.close(self.wake_r);
+        posix.close(self.wake_w);
+    }
+};
+
+// The TLS handshake reads/writes on a blocking socket, so it cannot be
+// time-bounded from the caller (a socket receive timeout surfaces as EAGAIN,
+// which std.crypto.tls treats as a bug). A watchdog that shuts the socket down
+// forces those blocking operations to fail instead of hanging; the timed_out
+// flag then reports that failure as a timeout rather than as the read error
+// the shutdown provoked.
+fn initTLSClientTimeout(io: Io, allocator: Allocator, net_stream: Io.net.Stream, config: *const Client.Config) !*TLSClient {
+    if (comptime @import("builtin").os.tag == .windows) {
+        // HandshakeGuard is POSIX-only (pipe + poll); see connectTimeout.
+        return TLSClient.init(io, allocator, net_stream, config);
+    }
+    if (config.connect_timeout_ms == 0) {
+        return TLSClient.init(io, allocator, net_stream, config);
+    }
+
+    var timed_out: std.atomic.Value(bool) = .init(false);
+    var guard = try HandshakeGuard.arm(net_stream.socket.handle, config.connect_timeout_ms, &timed_out);
+    const tls_client = TLSClient.init(io, allocator, net_stream, config) catch |err| {
+        guard.disarm();
+        if (timed_out.load(.acquire)) return error.TlsHandshakeTimeout;
+        return err;
+    };
+    guard.disarm();
+    if (timed_out.load(.acquire)) {
+        // The watchdog fired just as the handshake completed: the socket has
+        // been shut down, so the "successful" client is unusable.
+        tls_client.deinit();
+        return error.TlsHandshakeTimeout;
+    }
+    return tls_client;
 }
 
 pub const Client = struct {
@@ -64,6 +243,18 @@ pub const Client = struct {
         mask_fn: *const fn (Io) [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
+        // Upper bound (ms) applied independently to the TCP connect and the TLS
+        // handshake, so a blackholed or stalling relay cannot hang init() (and
+        // thus a clean shutdown) indefinitely. The real bound on init() is
+        // DNS + connect + handshake: connect and handshake are each bounded by
+        // this value (a single deadline spans all resolved addresses on the
+        // connect side), so the two together are ~2x this value. DNS resolution
+        // is NOT bounded — the Threaded Io cannot cancel host_name.lookup — so a
+        // hung resolver is a known residual outside this bound.
+        // 0 disables the timeout (consistent with readTimeout). On Windows the
+        // timeout is currently not enforced: the enforcement mechanisms are
+        // POSIX-only and the std Io api cannot yet bound a connect.
+        connect_timeout_ms: u32 = 10000,
     };
 
     pub const HandshakeOpts = struct {
@@ -84,12 +275,16 @@ pub const Client = struct {
             return error.InvalidConfiguraion;
         }
 
-        const host_name = try Io.net.HostName.init(config.host);
-        const net_stream = try host_name.connect(io, config.port, .{ .mode = .stream });
+        const net_stream = try connectTimeout(io, config.host, config.port, config.connect_timeout_ms);
+        // Own the connected socket for the rest of init: on any later failure
+        // (TLS handshake, buffer-provider create, reader_buf alloc) this closes
+        // the fd so it can't leak on either the TLS or non-TLS path. On success
+        // no errdefer fires and the fd is moved into the returned Client.
+        errdefer net_stream.close(io);
 
         var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(io, allocator, net_stream, &config);
+            tls_client = try initTLSClientTimeout(io, allocator, net_stream, &config);
         }
         const stream = Stream.init(io, net_stream, tls_client);
 
@@ -285,7 +480,7 @@ pub const Client = struct {
         return self.stream.writeTimeout(ms);
     }
 
-    pub fn readTimeout(self: *const Client, ms: u32) !void {
+    pub fn readTimeout(self: *Client, ms: u32) !void {
         return self.stream.readTimeout(ms);
     }
 
@@ -399,6 +594,7 @@ pub const Stream = struct {
     io: Io,
     stream: Io.net.Stream,
     tls_client: ?*TLSClient = null,
+    read_timeout_ms: u32 = 0,
 
     pub fn init(io: Io, stream: Io.net.Stream, tls_client: ?*TLSClient) Stream {
         return .{
@@ -443,13 +639,72 @@ pub const Stream = struct {
         if (self.tls_client) |tls_client| {
             var w: std.Io.Writer = .fixed(buf);
             while (true) {
+                // The TLS reader decrypts into its own buffer; stream() returns
+                // >0 only once that buffer holds plaintext. A single stream()
+                // will often (typically?) returns 0 without yielding a plaintext
+                // message. We have to loop until we get a visible message..
+                if (tls_client.client.reader.bufferedLen() == 0 and !hasBufferedTlsRecord(tls_client.client.input) and !try self.pollReadable()) {
+                    return error.WouldBlock;
+                }
                 const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
                 if (n != 0) {
                     return n;
                 }
             }
         }
+        if (comptime @import("builtin").os.tag == .windows) {
+            var data = [_][]u8{buf};
+            // netRead returns net.Stream.Reader.Error which includes Timeout,
+            // SocketUnconnected, NetworkDown, etc. – map all to ReadFailed
+            // to keep the inferred error set compatible with callers.
+            return self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &data) catch |err| switch (err) {
+                error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+                else => return error.ReadFailed,
+            };
+        }
+        if (!try self.pollReadable()) {
+            return error.WouldBlock;
+        }
         return posix.read(self.stream.socket.handle, buf);
+    }
+
+    // Ciphertext already drained off the socket sits in
+    // tls_client.client.input, invisible to poll(). If a complete
+    // record is buffered there, stream() can decrypt it without
+    // touching the socket, so we must not poll (the socket may
+    // legitimately be empty). But a *partial* record makes stream()
+    // do a blocking socket read to complete it, so in that case we
+    // still poll to honor the read timeout.
+    fn hasBufferedTlsRecord(input: *std.Io.Reader) bool {
+        const buffered = input.buffered();
+        if (buffered.len < std.crypto.tls.record_header_len) {
+            return false;
+        }
+        const record_len = std.mem.readInt(u16, buffered[3..5], .big);
+        return buffered.len >= std.crypto.tls.record_header_len + record_len;
+    }
+
+    fn pollReadable(self: *Stream) !bool {
+        if (comptime @import("builtin").os.tag == .windows) {
+            return true;
+        }
+        if (self.read_timeout_ms == 0) {
+            return true;
+        }
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = self.stream.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        // poll()'s timeout is a signed c_int. Clamp rather than cast: a timeout
+        // above INT_MAX panics in safe builds, and in ReleaseFast wraps to a
+        // negative value, which makes poll() block forever and silently defeats
+        // the timeout it is implementing.
+        const poll_ms: i32 = @intCast(@min(self.read_timeout_ms, @as(u32, std.math.maxInt(i32))));
+        // A poll failure is a real read failure, not "no data": surface it
+        // (mapped into this read path's error set) rather than swallowing it.
+        const ready = std.posix.poll(&pfd, poll_ms) catch return error.ReadFailed;
+        return ready != 0;
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -469,13 +724,13 @@ pub const Stream = struct {
 
     const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
     pub fn writeTimeout(self: *const Stream, ms: u32) !void {
-        if (self.tls_client != null) return;
         return self.setTimeout(posix.SO.SNDTIMEO, ms);
     }
 
-    pub fn readTimeout(self: *const Stream, ms: u32) !void {
-        if (self.tls_client != null) return;
-        return self.setTimeout(posix.SO.RCVTIMEO, ms);
+    pub fn readTimeout(self: *Stream, ms: u32) !void {
+        // Stored and applied via poll() in read(); see the note there for why this
+        // does not use SO_RCVTIMEO.
+        self.read_timeout_ms = ms;
     }
 
     fn setTimeout(self: *const Stream, opt_name: u32, ms: u32) !void {
@@ -772,7 +1027,7 @@ const HandShakeReply = struct {
         }
     }
 
-    pub fn parseExtension(value: []const u8) !?HandshakeCompression {
+    pub fn parseExtension(value: []const u8) !?ServerHandshake.Compression {
         var deflate = false;
         var client_max_bits: u8 = 15;
         var client_no_context_takeover = false;
@@ -816,7 +1071,278 @@ const HandShakeReply = struct {
     }
 };
 
-const HandshakeCompression = struct {
-    client_no_context_takeover: bool,
-    server_no_context_takeover: bool,
+const t = @import("../t.zig");
+test "Client: handshake" {
+    {
+        // empty response
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+    }
+
+    {
+        // invalid websocket response
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 200 OK\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+    }
+
+    {
+        // missing upgrade header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+    }
+
+    {
+        // wrong upgrade header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: nope\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidUpgradeHeader, client.handshake("/", .{}));
+    }
+
+    {
+        // missing connection header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+    }
+
+    {
+        // wrong connection header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: something\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidConnectionHeader, client.handshake("/", .{}));
+    }
+
+    {
+        // missing Sec-Websocket-Accept header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidHandshakeResponse, client.handshake("/", .{}));
+    }
+
+    {
+        // wrong Sec-Websocket-Accept header
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: hack\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.InvalidWebsocketAcceptHeader, client.handshake("/", .{}));
+    }
+
+    {
+        // ok for successful
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try client.handshake("/", .{});
+        try t.expectEqual(0, client._reader.pos);
+    }
+
+    {
+        // ok for successful, with overread
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        var writer = pair.client.writer(t.io, &.{});
+        try writer.interface.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\nSome Random Data Which is Part Of the Next Message");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try client.handshake("/", .{});
+        try t.expectEqual(50, client._reader.pos);
+    }
+}
+
+test "Client: write/read" {
+    var client = try Client.init(t.io, t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    var buf = [_]u8{ 'o', 'v', 'e', 'r' };
+    try client.write(&buf);
+    try client.readTimeout(1000);
+
+    const message = (try client.read()) orelse unreachable;
+    try t.expectEqual(.text, message.type);
+    try t.expectString("9000", message.data);
+
+    client.close(.{}) catch unreachable;
+}
+
+test "Client: close with code" {
+    var client = try Client.init(t.io, t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    client.close(.{ .code = 4002 }) catch unreachable;
+}
+
+test "Client: with code and reason" {
+    var client = try Client.init(t.io, t.allocator, .{
+        .port = 9292,
+        .host = "127.0.0.1",
+    });
+    defer client.deinit();
+
+    try client.handshake("/", .{
+        .timeout_ms = 1000,
+    });
+
+    client.close(.{ .code = 4002, .reason = "goodbye" }) catch unreachable;
+}
+
+test "Client: Handler" {
+    var h = try ClientHandler.init(t.io, t.allocator);
+    defer h.deinit();
+
+    var buf: [6]u8 = undefined;
+    {
+        @memcpy(buf[0..3], "dyn");
+        try h.client.write(buf[0..3]);
+    }
+
+    {
+        @memcpy(buf[0..4], "ping");
+        try h.client.write(buf[0..4]);
+    }
+
+    {
+        @memcpy(buf[0..4], "pong");
+        try h.client.write(buf[0..4]);
+    }
+
+    {
+        @memcpy(buf[0..6], "close1");
+        try h.client.write(buf[0..6]);
+    }
+
+    try h.client.readLoop(&h);
+
+    // if pong is true then ping and message have to be true
+    // because each asserts the previous
+    try t.expectEqual(true, h.pong);
+    try t.expectEqual(true, h.closed);
+}
+
+fn testClient(stream: Io.net.Stream) Client {
+    const bp = t.allocator.create(buffer.Provider) catch unreachable;
+    bp.* = buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
+
+    const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
+
+    return .{
+        .io = t.io,
+        ._closed = false,
+        ._own_bp = true,
+        ._mask_fn = generateMask,
+        ._compression_opts = null,
+        .stream = .{ .io = t.io, .stream = stream },
+        ._reader = Reader.init(reader_buf, bp, null),
+    };
+}
+
+const ClientHandler = struct {
+    ping: bool = false,
+    pong: bool = false,
+    closed: bool = false,
+    message: bool = false,
+    client: Client,
+
+    fn init(io: Io, allocator: Allocator) !ClientHandler {
+        var client = try Client.init(io, allocator, .{
+            .port = 9292,
+            .host = "127.0.0.1",
+        });
+        errdefer client.deinit();
+
+        try client.handshake("/", .{
+            .timeout_ms = 1000,
+        });
+
+        return .{
+            .client = client,
+        };
+    }
+
+    fn deinit(self: *ClientHandler) void {
+        self.client.deinit();
+    }
+
+    pub fn serverMessage(self: *ClientHandler, data: []u8, tpe: proto.Message.TextType) !void {
+        try t.expectEqual(.text, tpe);
+        try t.expectString("over 9000!", data);
+        self.message = true;
+    }
+
+    pub fn serverPing(self: *ClientHandler, data: []u8) !void {
+        try t.expectEqual(true, self.message);
+        try t.expectString("a-ping", data);
+        self.ping = true;
+    }
+
+    pub fn serverPong(self: *ClientHandler, data: []u8) !void {
+        try t.expectEqual(true, self.ping);
+        try t.expectString("a-pong", data);
+        self.pong = true;
+    }
+
+    pub fn close(self: *ClientHandler) void {
+        self.client.close(.{}) catch unreachable;
+        self.closed = true;
+    }
 };

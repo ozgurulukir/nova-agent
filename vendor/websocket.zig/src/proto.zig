@@ -146,8 +146,9 @@ pub const Reader = struct {
         AccessDenied,
         LockViolation,
         OperationAborted,
-        // Windows recv (ws2_32) addition
+        // Windows recv (ws2_32) additions
         NetworkSubsystemFailed,
+        FileDescriptorNotASocket,
     };
     pub fn fill(self: *Reader, source: anytype) FillError!void {
         const pos = self.pos;
@@ -597,4 +598,280 @@ pub fn calculateFrameLen(comptime msg: []const u8) usize {
     if (msg.len <= 125) return msg.len + 2;
     if (msg.len < 65536) return msg.len + 4;
     return msg.len + 10;
+}
+
+const t = @import("t.zig");
+test "mask" {
+    var r = t.getRandom();
+    const random = r.random();
+    const m = [4]u8{ 10, 20, 55, 200 };
+
+    var original = try t.allocator.alloc(u8, 10000);
+    var payload = try t.allocator.alloc(u8, 10000);
+
+    var size: usize = 0;
+    while (size < 1000) {
+        const slice = original[0..size];
+        random.bytes(slice);
+        @memcpy(payload[0..size], slice);
+        mask(m[0..], payload[0..size]);
+
+        for (slice, 0..) |b, i| {
+            try t.expectEqual(b ^ m[i & 3], payload[i]);
+        }
+
+        size += 1;
+    }
+    t.allocator.free(original);
+    t.allocator.free(payload);
+}
+
+test "Reader: read too large" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    pair.textFrame(true, "hello world");
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 16, .static = 16 });
+    defer reader.deinit();
+    try t.expectError(error.TooLarge, testRead(&reader, pair));
+}
+
+test "Reader: read too large over multiple fragments" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    pair.textFrame(false, "hello world");
+    pair.cont(false, " !!!_!!! ");
+    pair.cont(true, "how are you doing?");
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 32, .static = 32 });
+    defer reader.deinit();
+    try t.expectError(error.TooLarge, testRead(&reader, pair));
+}
+
+test "Reader: exact read into static with no overflow" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    pair.textFrame(true, "hello!");
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 12, .static = 12 });
+    defer reader.deinit();
+    try t.expectString("hello!", (try testRead(&reader, pair)).data);
+}
+
+test "Reader: fuzz" {
+    defer t.reset();
+    var r = t.getRandom();
+    const random = r.random();
+
+    for (0..250) |_| {
+        defer _ = t.arena.reset(.{ .retain_capacity = {} });
+        const arena = t.arena.allocator();
+
+        const MAX_FRAGMENTS = random.intRangeAtMost(u32, 1, 4);
+        const MESSAGE_TO_SEND = random.intRangeAtMost(u32, 1, 500);
+        const MAX_PAYLOAD_SIZE = random.intRangeAtMost(u32, 200, 1000);
+        const MAX_MESSAGE_SIZE = MAX_PAYLOAD_SIZE + 14;
+        var scrap = try arena.alloc(u8, MAX_PAYLOAD_SIZE);
+
+        var writer = t.Writer.init();
+        defer writer.deinit();
+
+        var expected = try arena.alloc(Message, MESSAGE_TO_SEND);
+
+        var is_fragmented = false;
+        var fragment_count: usize = 0;
+        var fragment: std.ArrayList(u8) = .empty;
+
+        var i: usize = 0;
+        while (i < MESSAGE_TO_SEND) {
+            if (is_fragmented == false) {
+                // this is rare
+                is_fragmented = random.intRangeAtMost(u8, 0, 8) == 0;
+                fragment_count = 0;
+            }
+
+            // a non-fragmented message is always "fin"
+            // and we'll force a "fin" after ~ 4 messages.
+            const is_fin = is_fragmented == false or random.intRangeAtMost(u8, 0, 3) == 0 or fragment_count == MAX_FRAGMENTS;
+            switch (random.intRangeAtMost(u16, 0, 11)) {
+                0...8 => { // we mostly expect text or binary messages
+                    const buf = scrap[0..random.intRangeAtMost(u32, 0, MAX_PAYLOAD_SIZE)];
+                    random.bytes(buf);
+                    if (is_fragmented == false) {
+                        writer.textFrame(true, buf);
+                        expected[i] = .{ .type = .text, .data = try arena.dupe(u8, buf) };
+                        i += 1;
+                    } else {
+                        if (fragment_count == 0) {
+                            // the first part of our fragmented message
+                            writer.textFrame(is_fin, buf);
+                        } else {
+                            writer.cont(is_fin, buf);
+                        }
+                        fragment_count += 1;
+
+                        try fragment.appendSlice(arena, try arena.dupe(u8, buf));
+
+                        if (is_fin) {
+                            // this was the last message in our fragment
+                            expected[i] = .{ .type = .text, .data = try arena.dupe(u8, fragment.items) };
+
+                            i += 1;
+                            is_fragmented = false;
+                            fragment.clearRetainingCapacity();
+                        }
+                    }
+                },
+                9 => {
+                    // empty ping
+                    writer.ping();
+                    expected[i] = .{ .type = .ping, .data = "" };
+                    i += 1;
+                },
+                10 => {
+                    // ping with data
+                    const buf = scrap[0..random.intRangeAtMost(u32, 1, 125)];
+                    random.bytes(buf);
+                    writer.pingPayload(buf);
+                    expected[i] = .{ .type = .ping, .data = try arena.dupe(u8, buf) };
+                    i += 1;
+                },
+                11 => {
+                    writer.pong();
+                    expected[i] = .{ .type = .pong, .data = "" };
+                    i += 1;
+                },
+                else => unreachable,
+            }
+        }
+
+        // test with various buffer sizes, and large buffer pools enabled/disabled
+        const static_size = random.intRangeAtMost(u32, 20, MAX_MESSAGE_SIZE + 200);
+        const large_buffer_count = random.intRangeAtMost(u16, 0, 1);
+        const large_buffer_size = random.intRangeAtMost(u32, static_size, MAX_MESSAGE_SIZE * 2);
+
+        // fragmentation could make messages very large
+        var reader = testReader(.{ .max = MAX_MESSAGE_SIZE * (MAX_FRAGMENTS + 1), .static = static_size, .count = large_buffer_count, .size = large_buffer_size });
+        defer reader.large_buffer_provider.deinit();
+        defer reader.deinit();
+
+        i = 0;
+        while (true) {
+            reader.fill(&writer) catch |err| switch (err) {
+                error.Closed => {
+                    try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
+                    break;
+                },
+                else => return err,
+            };
+
+            while (true) {
+                const has_more, const message = (try reader.read()) orelse break;
+                try t.expectEqual(expected[i].type, message.type);
+                try t.expectString(expected[i].data, message.data);
+                reader.done(message.type);
+
+                i += 1;
+                if (has_more == false) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+test "Fragmented" {
+    {
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 500 });
+        var f = try Fragmented.init(&bp, false, .text, "hello");
+        defer f.deinit();
+
+        try t.expectString("hello", f.buf.items);
+
+        try f.add(" ");
+        try t.expectString("hello ", f.buf.items);
+
+        try f.add("world");
+        try t.expectString("hello world", f.buf.items);
+    }
+
+    {
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 10 });
+        var f = try Fragmented.init(&bp, false, .text, "hello");
+        defer f.deinit();
+        try f.add(" ");
+        try t.expectError(error.TooLarge, f.add("world"));
+    }
+
+    {
+        var bp = try buffer.Provider.init(t.io, t.allocator, .{ .count = 0, .size = 0, .max = 5000 });
+
+        var r = std.Random.DefaultPrng.init(0);
+        var random = r.random();
+
+        var count: usize = 0;
+        var buf: [100]u8 = undefined;
+        while (count < 1000) : (count += 1) {
+            var payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
+            random.bytes(payload);
+
+            var f = try Fragmented.init(&bp, false, .binary, payload);
+            defer f.deinit();
+
+            var expected: std.ArrayList(u8) = .empty;
+            defer expected.deinit(t.allocator);
+            try expected.appendSlice(t.allocator, payload);
+
+            const number_of_adds = random.uintAtMost(usize, 30);
+            for (0..number_of_adds) |_| {
+                payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
+                random.bytes(payload);
+                try f.add(payload);
+                try expected.appendSlice(t.allocator, payload);
+            }
+            payload = buf[0 .. random.uintAtMost(usize, 99) + 1];
+            random.bytes(payload);
+            try expected.appendSlice(t.allocator, payload);
+
+            try t.expectString(expected.items, try f.last(payload));
+        }
+    }
+}
+
+fn testReader(opts: anytype) Reader {
+    const T = @TypeOf(opts);
+
+    const aa = t.arena.allocator();
+
+    const bp = aa.create(buffer.Provider) catch unreachable;
+    bp.* = buffer.Provider.init(t.io, t.allocator, .{
+        .max = if (@hasField(T, "max")) opts.max else 20,
+        .size = if (@hasField(T, "size")) opts.size else 0,
+        .count = if (@hasField(T, "count")) opts.count else 0,
+    }) catch unreachable;
+
+    const static_size = if (@hasField(T, "static")) opts.static else 16;
+    const reader_buf = aa.alloc(u8, static_size) catch unreachable;
+    return Reader.init(reader_buf, bp, null);
+}
+
+fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        try reader.fill(pair.server.socket.handle);
+        if (try reader.read()) |result| {
+            return result.@"1";
+        }
+    } else {
+        return error.LoopReadOverflow;
+    }
 }
