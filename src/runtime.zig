@@ -7,6 +7,7 @@ const auth_mod = @import("auth/store.zig");
 const codex_mod = @import("auth/codex.zig");
 const compaction = @import("context/compaction.zig");
 const config_mod = @import("config/config.zig");
+const provider_types = @import("config/provider.zig");
 const context_assembly = @import("context/assembly.zig");
 const modelsdev = @import("models/registry.zig");
 const plugin_prompt = @import("plugin_prompt.zig");
@@ -565,7 +566,13 @@ pub const AgentRuntime = struct {
                 }
                 break :blk provider.anonymousApiKey() orelse "";
             };
-            try self.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
+            try self.attachOpenAiCompatibleClient(
+                base_url,
+                api_key,
+                model_id,
+                effort,
+                config.providerHeadersByName(config.provider_name orelse provider.label()),
+            );
             return;
         };
         const base_url = blk: {
@@ -609,7 +616,7 @@ pub const AgentRuntime = struct {
             .builtin => |b| b.model.id,
             .custom => |c| c.model.id,
         };
-        try self.attachOpenAiCompatibleClient(base_url, api_key, model_id_to_attach, effort);
+        try self.attachOpenAiCompatibleClient(base_url, api_key, model_id_to_attach, effort, config.providerHeadersByName(ms.providerName()));
     }
 
     fn tryAttachOpenAiResponsesFromConfig(
@@ -618,12 +625,21 @@ pub const AgentRuntime = struct {
         config: config_mod.Config,
     ) !void {
         const ms = config.model_selection orelse return;
+        // Resolve the wire dialect here too: `buildProviderHeaders` consumes
+        // it for the OpenRouter attribution arm, so a stale value from a
+        // previous attach would mis-emit `X-Title` on this one.
+        self.wire_dialect = ai.WireDialect.resolve(
+            provider,
+            config.provider_name orelse "",
+            config.base_url orelse "",
+        );
+        self.disable_prompt_cache = config.context.disable_prompt_cache orelse false;
         const base_url = if (ms.baseUrl()) |url| if (url.len > 0) url else provider.defaultBaseUrl() orelse return else provider.defaultBaseUrl() orelse return;
         const reasoning: ai.Reasoning = .{
             .effort = ms.model().reasoning.resolve(),
             .summary = .auto,
         };
-        try self.attachOpenAiResponsesClient(base_url, ms.apiKey() orelse "", ms.model().id, reasoning);
+        try self.attachOpenAiResponsesClient(base_url, ms.apiKey() orelse "", ms.model().id, reasoning, config.providerHeadersByName(ms.providerName()));
     }
 
     /// Establish a Codex session — uses OAuth credentials to identify
@@ -726,14 +742,33 @@ pub const AgentRuntime = struct {
         self.assertClientInvariant();
     }
 
+    /// Expand `{env:VAR}` in the user's raw provider headers and merge them
+    /// with the provider-required auto headers (OpenCode Zen routing, which
+    /// the provider mandates as of 2026-09-05, plus OpenRouter attribution).
+    /// Precedence — user-configured names win — is resolved inside
+    /// `provider_headers.build`; the result is fully owned, freed with
+    /// `provider_headers.freeHeaders`.
+    fn buildProviderHeaders(
+        self: *AgentRuntime,
+        base_url: []const u8,
+        user_headers: []const config_mod.ProviderHeader,
+    ) ![]ai.provider_headers.Header {
+        const expanded = try provider_types.expandProviderHeaders(self.gpa, user_headers);
+        defer ai.provider_headers.freeHeaders(self.gpa, expanded);
+        return ai.provider_headers.build(self.gpa, base_url, self.wire_dialect, expanded);
+    }
+
     pub fn attachOpenAiCompatibleClient(
         self: *AgentRuntime,
         base_url: []const u8,
         api_key: []const u8,
         model_id: []const u8,
         effort: ai.ReasoningEffort,
+        user_headers: []const config_mod.ProviderHeader,
     ) !void {
         const model_info = self.lookupModelInfo(model_id);
+        const provider_specs = try self.buildProviderHeaders(base_url, user_headers);
+        defer ai.provider_headers.freeHeaders(self.gpa, provider_specs);
         const client = try self.gpa.create(ai.openai_compatible.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
@@ -751,13 +786,9 @@ pub const AgentRuntime = struct {
             .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
             .disable_prompt_cache = self.disable_prompt_cache,
             .session_id = self.session_writer.session.id.slice(),
+            .headers = provider_specs,
         });
         errdefer client.deinit();
-        // OpenRouter app-attribution: identify Nova on the marketplace for
-        // ranking/discoverability and rate-limit priority. Owned by the client.
-        if (self.wire_dialect == .openrouter) {
-            client.app_title = try self.gpa.dupe(u8, "Nova");
-        }
         self.replaceClient(.{ .openai_compatible = client });
         self.agent.context_window_tokens = compaction.contextWindowTokens(model_info, self.context_settings.override_context_window);
         self.agent.resetContextUsage();
@@ -777,13 +808,14 @@ pub const AgentRuntime = struct {
                 .is_reasoning_model = compaction.isReasoningModel(model_info),
                 .request_timeout_seconds = self.context_settings.request_timeout_seconds orelse ai.default_request_timeout_seconds,
                 .disable_prompt_cache = self.disable_prompt_cache,
+                // The zen session header is mandatory routing, so the
+                // summarizer needs the same session id the main client has.
+                .session_id = self.session_writer.session.id.slice(),
+                .headers = provider_specs,
             }) catch {
                 self.gpa.destroy(compaction_client);
                 break :attach_compaction;
             };
-            if (self.wire_dialect == .openrouter) {
-                compaction_client.app_title = self.gpa.dupe(u8, "Nova") catch null;
-            }
             self.setCompactionClient(.{ .openai_compatible = compaction_client });
         }
         attach_naming: {
@@ -796,6 +828,8 @@ pub const AgentRuntime = struct {
                 .reasoning = .{ .effort = effort },
                 .is_reasoning_model = compaction.isReasoningModel(model_info),
                 .disable_prompt_cache = self.disable_prompt_cache,
+                .session_id = self.session_writer.session.id.slice(),
+                .headers = provider_specs,
             }) catch {
                 self.gpa.destroy(naming_client);
                 break :attach_naming;
@@ -810,8 +844,11 @@ pub const AgentRuntime = struct {
         api_key: []const u8,
         model_id: []const u8,
         reasoning: ai.Reasoning,
+        user_headers: []const config_mod.ProviderHeader,
     ) !void {
         const model_info = self.lookupModelInfo(model_id);
+        const provider_specs = try self.buildProviderHeaders(base_url, user_headers);
+        defer ai.provider_headers.freeHeaders(self.gpa, provider_specs);
         const client = try self.gpa.create(ai.openai_responses.Client);
         errdefer self.gpa.destroy(client);
         try client.init(self.gpa, self.io, .{
@@ -824,6 +861,7 @@ pub const AgentRuntime = struct {
             .strict = self.strict_outputs,
             .session_id = self.session_writer.session.id.slice(),
             .disable_prompt_cache = self.disable_prompt_cache,
+            .headers = provider_specs,
             .system_prompt = self.system_prompt,
         });
         errdefer client.deinit();
@@ -841,6 +879,7 @@ pub const AgentRuntime = struct {
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
                 .disable_prompt_cache = self.disable_prompt_cache,
+                .headers = provider_specs,
                 // Minimal carrier prompt, not the full agent system prompt (C4).
                 .system_prompt = compaction.summarizer_system_prompt,
             }) catch {
@@ -859,6 +898,7 @@ pub const AgentRuntime = struct {
                 .reasoning = reasoning,
                 .session_id = self.session_writer.session.id.slice(),
                 .disable_prompt_cache = self.disable_prompt_cache,
+                .headers = provider_specs,
                 .system_prompt = self.system_prompt,
             }) catch {
                 self.gpa.destroy(naming_client);
@@ -1093,7 +1133,7 @@ test "attach rebuilds tools from the registry once it is wired" {
     runtime.agent.tool_registry = reg;
 
     // A model switch re-attaches; with the registry wired the rebuild runs.
-    try runtime.attachOpenAiCompatibleClient("http://localhost:11434", "", "test-model", .medium);
+    try runtime.attachOpenAiCompatibleClient("http://localhost:11434", "", "test-model", .medium, &.{});
     const client = switch (runtime.client) {
         .openai_compatible => |c| c,
         else => return error.TestUnexpectedResult,
@@ -1109,6 +1149,63 @@ test "codex refresh starts before token expiry" {
     try std.testing.expect(codexRefreshNeeded(now_ms - 1, now_ms));
     try std.testing.expect(codexRefreshNeeded(now_ms + codex_refresh_margin_ms, now_ms));
     try std.testing.expect(!codexRefreshNeeded(now_ms + codex_refresh_margin_ms + 1, now_ms));
+}
+
+test "zen attach wires routing headers and session id into all chat clients" {
+    // Regression for two behaviors: (a) the mandatory OpenCode Zen routing
+    // headers (required by the provider as of 2026-09-05) must land on the
+    // main, compaction, and naming clients alike, with a user-configured
+    // same-name header replacing the auto value; (b) the chat-path
+    // compaction and naming clients used to receive no session_id at all,
+    // leaving the zen session header empty on summarizer/branch-naming
+    // traffic.
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd_abs = try std.process.currentPathAlloc(std.testing.io, gpa);
+    defer gpa.free(cwd_abs);
+    const home_abs = try std.fs.path.join(gpa, &.{ cwd_abs, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(home_abs);
+
+    var runtime: AgentRuntime = undefined;
+    try runtime.initNew(gpa, std.testing.io, home_abs, home_abs, home_abs, "test system prompt", .{}, &.{}, null);
+    defer runtime.deinit();
+
+    const user_headers = [_]config_mod.ProviderHeader{
+        .{ .name = @constCast("x-opencode-session"), .value = @constCast("pinned-session") },
+    };
+    try runtime.attachOpenAiCompatibleClient("https://opencode.ai/zen/v1", "public", "test-model", .medium, &user_headers);
+
+    const main_client = switch (runtime.owned_client.?) {
+        .openai_compatible => |client| client,
+        else => return error.TestUnexpectedResult,
+    };
+    const compaction_client = switch (runtime.owned_compaction_client.?) {
+        .openai_compatible => |client| client,
+        else => return error.TestUnexpectedResult,
+    };
+    const naming_client = switch (runtime.owned_naming_client.?) {
+        .openai_compatible => |client| client,
+        else => return error.TestUnexpectedResult,
+    };
+
+    for ([_]*const ai.openai_compatible.Client{ main_client, compaction_client, naming_client }) |client| {
+        const specs = client.provider_headers_owned;
+        try std.testing.expectEqual(@as(usize, 2), specs.len);
+        // The user's pinned session value replaced the auto header, in place.
+        try std.testing.expectEqualStrings("x-opencode-session", specs[0].name);
+        try std.testing.expectEqualStrings("pinned-session", specs[0].value.literal);
+        try std.testing.expectEqualStrings(ai.provider_headers.zen_client_header, specs[1].name);
+        try std.testing.expectEqualStrings(ai.provider_headers.zen_client_value, specs[1].value.literal);
+    }
+
+    // The session-id gap fill: summarizer and naming traffic now carry the
+    // session id the zen header resolves against.
+    try std.testing.expect(compaction_client.config.session_id.len > 0);
+    try std.testing.expect(naming_client.config.session_id.len > 0);
+    try std.testing.expectEqualStrings(main_client.config.session_id, compaction_client.config.session_id);
+    try std.testing.expectEqualStrings(main_client.config.session_id, naming_client.config.session_id);
 }
 
 test "runtime selects responses adapter when requested" {

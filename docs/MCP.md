@@ -79,6 +79,11 @@ than silently producing a broken command or URL.
 > `{env:VAR}` placeholder back — never the resolved value — so a secret is never
 > persisted to disk.
 
+The same `{env:VAR}` mechanism (raw placeholders on disk, expansion at use time,
+secrets never written back) also covers AI provider headers
+(`providers.<name>.headers`), expanded once per client attach — see
+[Configuration Guide — Provider Configuration](CONFIG.md#provider-configuration).
+
 Two common auth shapes for remote servers:
 
 ```json

@@ -257,6 +257,7 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 | Field                          | Type       | Description                                                                                                                                                                                                                                                                                                                   |
 | ------------------------------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `baseURL`                      | `string`   | Custom base URL for this provider. Legacy key `base_url` is parsed for backward compatibility but is not schema-valid; new configs must use `baseURL`.                                                                                                                                                                                                                                                    |
+| `headers`                      | `object`   | Extra HTTP headers (string values) sent on every outbound request to this provider through the chat-completions and Responses-API clients (main turns, summarizer, branch naming) and on the model picker's `/v1/models` probes. Not applied to the Codex OAuth transport. Values support `{env:VAR}` placeholders, expanded once per client attach; see the notes below. A header with the same name as an auto-attached one (e.g. `x-opencode-session` for OpenCode Zen) **replaces** it. Reserved transport headers (`authorization`, `content-type`, `host`, `content-length`, `transfer-encoding`, `connection`) are rejected at parse — credentials belong in `auth.json`. Header names must be single-line tokens (no `:`, whitespace, or line breaks); values with line breaks are rejected. Max 8 entries. |
 | `models`                       | `object`   | Per-model overrides keyed by model id.                                                                                                                                                                                                                                                                                        |
 | `models.<id>.reasoningEffort`  | `string`   | One of `default`, `minimal`, `low`, `none`, `medium`, `high`, `xhigh`. `default` sends no reasoning parameter (model decides); `none` disables thinking explicitly. Internally stored as a `ReasoningSetting` union: when unset in a config layer, the lower layer's value is preserved during merge; when set, it overrides. |
 | `models.<id>.contextWindow`    | `integer`  | Context window size in tokens. Overrides the catalogue lookup; falls back to `context.overrideContextWindow`. Minimum 1024.                                                                                                                                                                                                   |
@@ -288,6 +289,32 @@ Each entry in `providers` is keyed by provider name. Builtin labels (`openai`, `
 > **Custom provider session persistence**: Custom provider names (e.g., `"qwen-cloud"`) are preserved in `config.json` via the `defaultModel` field (e.g., `"qwen-cloud/qwen3.7-plus"`) and the `providers` map. On restart, Nova resolves the provider from `defaultModel`, hydrates `baseURL` from the `providers` map via `hydrateActiveModel`, and looks up the API key in `auth.json` using the provider name.
 >
 > **Dynamic providers (models.dev)** persist their identity through `defaultModel: "provider-id/model-id"` (e.g., `"stepfun-ai/step-3.7-flash"`). The `providers` map stores the `baseURL` and per-model metadata. Runtime-only fields (`dynamic_provider_id`, `dynamic_provider_name`) are never serialized; after restart, all rehydration paths fall back to the serialized `provider_name` from `defaultModel` and the `providers` map. `hydrateActiveModel` includes a recovery fallback for configs written before the `provider_name` serialization fix (where `provider_name` was the generic `"openai_compatible"` label).
+
+**Example — provider with custom headers:**
+
+```json
+{
+  "defaultModel": "my-gateway/qwen3.7-plus",
+  "providers": {
+    "my-gateway": {
+      "baseURL": "https://gw.internal.example.com/v1",
+      "headers": {
+        "x-gateway-tenant": "acme",
+        "x-gateway-token": "{env:GATEWAY_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Header values keep their `{env:VAR}` placeholders on disk (a settings save never writes a resolved secret back); expansion happens once per client attach, with the same mechanics and secrets invariant as MCP server values — see the [MCP Integration Guide](MCP.md#environment-variable-expansion-envvar). An unset variable expands to an empty string (with a warning), and a header whose expanded value is empty is skipped rather than sent empty-valued.
+
+**Auto-attached provider headers.** Some providers require routing/identity headers that Nova attaches automatically — no configuration needed:
+
+- **OpenCode Zen** (any base URL under `opencode.ai/zen`, e.g. the builtin `opencode_zen` provider and the models.dev `opencode` / `opencode-go` entries): `x-opencode-session` (the stable per-conversation session id — improves token-cache locality and is required by the provider since 2026-09-05) and `x-opencode-client: nova`, on every outbound request including the model picker's `/v1/models` probe. These are routing identity, not cache hints: `context.disablePromptCache` does **not** suppress them.
+- **OpenRouter**: the `X-Title: Nova` app-attribution header.
+
+A user-configured header with the same (case-insensitive) name replaces the auto-attached value — e.g. pinning `x-opencode-session` to a fixed value, or overriding `x-opencode-client` for a gateway front. The merge policy lives in one place (`src/ai/provider_headers.zig`); see [Patterns — Outbound provider headers pattern](PATTERNS.md) for the full data flow.
 
 ### MCP Server Configuration
 
