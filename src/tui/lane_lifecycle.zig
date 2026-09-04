@@ -3531,6 +3531,8 @@ test "cleanupLaneWorktreeAndBranch terminates background processes and removes w
 
     // cleanupLaneWorktreeAndBranch runs safely with background manager attached
     cleanupLaneWorktreeAndBranch(&app, ".", "nonexistent/worktree/path", "nova/fake-branch");
+
+    try std.testing.expectEqual(@as(usize, 0), app.background.?.jobs.items.len);
 }
 
 test "WorktreeJob start and completion lifecycle" {

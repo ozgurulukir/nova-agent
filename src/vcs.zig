@@ -816,7 +816,25 @@ test "worktreePrune executes cleanly on empty or populated repo" {
     defer gpa.free(repo);
 
     try expectOk(gpa, io, repo, &.{ "init", "-q" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.name", "t" });
+    try expectOk(gpa, io, repo, &.{ "config", "user.email", "t@t" });
+    try expectOk(gpa, io, repo, &.{ "commit", "--allow-empty", "-qm", "baseline" });
+
+    const wt_name = try std.fmt.allocPrint(gpa, "{s}-wt", .{name});
+    defer gpa.free(wt_name);
+    const wt_dir = try std.fs.path.join(gpa, &.{ cwd, wt_name });
+    defer gpa.free(wt_dir);
+
+    try worktreeAdd(gpa, io, repo, wt_dir, "nova/orphaned");
+    try std.Io.Dir.cwd().deleteTree(io, wt_name);
+
     try worktreePrune(gpa, io, repo);
+
+    const wts = try worktreeList(gpa, io, repo);
+    defer freeWorktreeList(gpa, wts);
+    for (wts) |wt| {
+        try std.testing.expect(!std.mem.eql(u8, wt.branch, "nova/orphaned"));
+    }
 }
 
 test "gcWorktreesDir prunes old directories and leaves recent directories untouched" {
