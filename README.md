@@ -23,7 +23,7 @@
   <sub>⚡ <em>Preview snippet. <a href="assets/demo.gif">Click to watch the full demo (18 MB)</a></em></sub>
 </p>
 
-Nova is an **oldschool, terminal-native AI agent** designed for pure speed and focus. No Electron, no browser tab, no heavy Node runtime. Just a single, compiled Zig binary that interfaces directly with your shell, connects to any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
+Nova is an **oldschool, terminal-native AI agent** designed for pure speed and focus. No Electron, no browser tab, no heavy Node runtime. Just a single, compiled Zig binary that interfaces directly with your shell, connects to OpenAI Codex (via ChatGPT OAuth) or any OpenAI-compatible provider, orchestrates parallel work across isolated git worktree lanes, and logs every turn to local SQLite.
 
 > [!NOTE]
 > **Fast, Stable, & Daily-Driven:** Nova is built for production workflows with native performance, zero-friction execution, and strict safety guardrails.
@@ -51,7 +51,7 @@ Unlike IDE plugins that interrupt you with modal dialogues for every file read o
 ## ✨ Key Highlights
 
 - **Native TUI with VXFW:** Instant startup, fluid scrolling, custom color themes, and zero web stack bloat.
-- **Any LLM Provider:** First-class support for OpenAI, Anthropic, Ollama, llama.cpp, OpenRouter, Cerebras, DeepSeek, and custom OpenAI-compatible endpoints.
+- **Any LLM Provider:** Native OpenAI ChatGPT & Codex OAuth integration (sign in without an API key), plus first-class support for OpenRouter, Ollama, llama.cpp, Cerebras, DeepSeek, Google Gemini, Mistral, xAI Grok, and any custom OpenAI-compatible endpoint (Claude models supported via OpenRouter or compatible gateways).
 - **Parallel Git Lanes:** Run multiple agent threads simultaneously in isolated git worktrees; monitor progress and merge results back when ready.
 - **Background Jobs:** Launch long-running builds, test suites, or dev servers asynchronously (`run_in_background: true`). Inspect live logs (`tail`), check progress (`status`), or cancel processes (`cancel`) via the native `background` tool or the `Ctrl+O` dashboard.
 - **Context Compaction:** Dynamic, token-calibrated retention budgets that automatically summarize long sessions below model watermark limits.
