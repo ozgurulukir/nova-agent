@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = std.log.scoped(.tui);
 
+const ai = @import("../ai.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const openai_compatible_mod = @import("../ai/openai_compatible.zig");
@@ -94,6 +95,9 @@ pub const Configured = struct {
     /// dynamic/config provider'ları için provider id'si (ör. "stepfun-ai").
     /// null → `provider.label()`'a düşer (katalog provider'ları için).
     auth_key_id: ?[]u8 = null, // gpa-owned
+    /// User-configured headers for this provider, `{env:VAR}` already
+    /// expanded at job construction. Owned by the job; freed in `deinit`.
+    headers: []ai.provider_headers.Header = &.{},
 };
 
 /// Snapshot of everything the worker needs. Owned by the job and freed when
@@ -106,6 +110,11 @@ pub const Job = struct {
     configured: []Configured,
     include_locals: bool,
     codex_signed_in: bool,
+    /// Session id for zen sticky routing, duped at job construction — the
+    /// App may switch (and tear down) the live runtime's session while the
+    /// worker probes, so borrows of session memory across the thread
+    /// boundary are forbidden. Empty when no live session exists.
+    session_id: []u8 = &.{},
     /// Set to `true` immediately before the worker returns, so the main
     /// thread can non-blockingly poll for completion without awaiting.
     done: *std.atomic.Value(bool),
@@ -116,8 +125,10 @@ pub const Job = struct {
             self.gpa.free(c.api_key);
             if (c.display_name) |d| self.gpa.free(d);
             if (c.auth_key_id) |id| self.gpa.free(id);
+            ai.provider_headers.freeHeaders(self.gpa, c.headers);
         }
         if (self.configured.len > 0) self.gpa.free(self.configured);
+        if (self.session_id.len > 0) self.gpa.free(self.session_id);
         self.* = undefined;
     }
 };
@@ -165,6 +176,9 @@ const LoadCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
+    /// Borrowed from the Job — workers never outlive it (`run` joins the
+    /// futures before `job.deinit`).
+    session_id: []const u8,
 };
 
 /// Worker entry point for one provider. Isolated so a slow/unreachable host
@@ -174,7 +188,7 @@ fn loadOneProvider(ctx: *LoadCtx) Result {
     const gpa = ctx.gpa;
     var partial: Result = .{ .gpa = gpa };
     const before = partial.models.items.len;
-    if (loadConfiguredCtx(gpa, ctx.io, ctx.configured, &partial)) |_| {
+    if (loadConfiguredCtx(gpa, ctx.io, ctx.configured, ctx.session_id, &partial)) |_| {
         const added = partial.models.items.len - before;
         partial.outcomes.append(gpa, .{ .provider = ctx.configured.provider, .ok = added > 0 }) catch {};
     } else |err| {
@@ -205,6 +219,7 @@ fn loadConnectedParallel(job: *Job, result: *Result) !void {
                 .gpa = job.gpa,
                 .io = job.io,
                 .configured = configured,
+                .session_id = job.session_id,
             };
             futures[idx] = job.io.concurrent(loadOneProvider, .{&ctxs[idx]}) catch |err| blk: {
                 log.warn("model load {s}: spawn failed: {s}", .{ configured.provider.label(), @errorName(err) });
@@ -258,7 +273,7 @@ fn mergeResult(gpa: std.mem.Allocator, agg: *Result, partial: *Result) !void {
 /// neither aborts the others nor vanishes without explanation. Only an
 /// allocation failure recording the outcome propagates.
 fn loadAndRecord(job: *Job, configured: Configured, result: *Result) !void {
-    try loadAndRecordCtx(job.gpa, job.io, configured, result);
+    try loadAndRecordCtx(job.gpa, job.io, configured, job.session_id, result);
 }
 
 /// Context-parameterized variant used by both the sequential `single_provider`
@@ -267,10 +282,11 @@ fn loadAndRecordCtx(
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
+    session_id: []const u8,
     result: *Result,
 ) !void {
     const before = result.models.items.len;
-    if (loadConfiguredCtx(gpa, io, configured, result)) |_| {
+    if (loadConfiguredCtx(gpa, io, configured, session_id, result)) |_| {
         const added = result.models.items.len - before;
         try result.outcomes.append(gpa, .{ .provider = configured.provider, .ok = added > 0 });
     } else |err| {
@@ -279,14 +295,11 @@ fn loadAndRecordCtx(
     }
 }
 
-fn loadConfigured(job: *Job, configured: Configured, result: *Result) !void {
-    try loadConfiguredCtx(job.gpa, job.io, configured, result);
-}
-
 fn loadConfiguredCtx(
     gpa: std.mem.Allocator,
     io: std.Io,
     configured: Configured,
+    session_id: []const u8,
     result: *Result,
 ) !void {
     // base_url may be "" when synthesized from session metadata or legacy
@@ -295,7 +308,10 @@ fn loadConfiguredCtx(
         configured.base_url
     else
         configured.provider.defaultBaseUrl() orelse return;
-    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, configured.api_key);
+    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, configured.api_key, .{
+        .session_id = session_id,
+        .user_headers = configured.headers,
+    });
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);
@@ -337,7 +353,9 @@ fn loadLocal(job: *Job, provider: config_mod.Provider, result: *Result) !void {
 fn loadLocalCtx(gpa: std.mem.Allocator, io: std.Io, provider: config_mod.Provider, result: *Result) !void {
     const base_url = provider.defaultBaseUrl() orelse return;
     const api_key = providerLocalApiKey(provider);
-    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, api_key);
+    // Local endpoints never match the zen marker and carry no user headers;
+    // defaults omit every extra header, matching the pre-header wire bytes.
+    const fetched = try openai_compatible_mod.listModels(gpa, io, base_url, api_key, .{});
     defer {
         for (fetched) |*entry| entry.deinit(gpa);
         gpa.free(fetched);

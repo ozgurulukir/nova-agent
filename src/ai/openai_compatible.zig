@@ -6,6 +6,7 @@ const os = @import("../os.zig");
 const http = @import("../http.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const provider_headers = @import("provider_headers.zig");
 const stream_parser = @import("stream_parser.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
@@ -59,12 +60,12 @@ pub const Client = struct {
     /// gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
     http_client: std.http.Client,
-    /// Optional OpenRouter app-attribution headers. Sent verbatim as
-    /// `X-Title` / `HTTP-Referer` when non-null — both are OpenRouter
-    /// conventions (ranking/discoverability + rate-limit priority). Owned;
-    /// freed in `deinit`. Null for non-OpenRouter dialects.
-    app_title: ?[]u8 = null,
-    app_referer: ?[]u8 = null,
+    /// Owned copy of `ai.Config.headers` (auto provider headers — OpenCode
+    /// Zen routing, OpenRouter attribution — merged with the user's
+    /// `providers.<name>.headers`, precedence already resolved at attach
+    /// time by `provider_headers.build`). Materialized per request in
+    /// `sendOnce`. Freed in `deinit`.
+    provider_headers_owned: []provider_headers.Header = &.{},
     /// Monotonic counter for synthesised tool_call ids when the inference
     /// server omits them. OpenAI's protocol requires stable ids linking
     /// assistant tool_calls to their `tool` result messages, so we mint
@@ -97,6 +98,10 @@ pub const Client = struct {
         var owned_config = config;
         owned_config.base_url = "";
         owned_config.api_key = "";
+        // Borrowed at init; the deep copy lives in provider_headers_owned.
+        // Blank it like base_url/api_key so no future read dangles after the
+        // attach frame (which owns the specs) returns.
+        owned_config.headers = &.{};
         owned_config.model = try gpa.dupe(u8, config.model);
         errdefer gpa.free(owned_config.model);
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
@@ -104,6 +109,8 @@ pub const Client = struct {
 
         const tools_json = try tool_schema.buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict, .completions);
         errdefer gpa.free(tools_json);
+        const provider_headers_owned = try provider_headers.cloneHeaders(gpa, config.headers);
+        errdefer provider_headers.freeHeaders(gpa, provider_headers_owned);
 
         target.* = .{
             .gpa = gpa,
@@ -114,8 +121,7 @@ pub const Client = struct {
             .tools_json = tools_json,
             .strict = config.strict,
             .http_client = .{ .allocator = gpa, .io = io },
-            .app_title = null,
-            .app_referer = null,
+            .provider_headers_owned = provider_headers_owned,
         };
     }
 
@@ -126,8 +132,7 @@ pub const Client = struct {
         self.gpa.free(self.tools_json);
         if (self.authorization) |a| self.gpa.free(a);
         self.gpa.free(self.url);
-        if (self.app_title) |t| self.gpa.free(t);
-        if (self.app_referer) |r| self.gpa.free(r);
+        provider_headers.freeHeaders(self.gpa, self.provider_headers_owned);
         if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
@@ -306,25 +311,22 @@ pub const Client = struct {
         // may retry the same payload verbatim. Connection/read drops here
         // are mapped to `error.ConnectionFailed` (retryable); protocol-level
         // rejects pass through unchanged (permanent).
-        // OpenRouter app-attribution headers (X-Title / HTTP-Referer). These
-        // live on this frame's stack and must outlive the request — `req` is
-        // fully consumed (`receiveHead` + stream) before this function returns.
-        var extra_headers: [2]std.http.Header = undefined;
-        var extra_count: usize = 0;
-        if (self.app_title) |title| {
-            extra_headers[extra_count] = .{ .name = "X-Title", .value = title };
-            extra_count += 1;
-        }
-        if (self.app_referer) |referer| {
-            extra_headers[extra_count] = .{ .name = "HTTP-Referer", .value = referer };
-            extra_count += 1;
-        }
+        // Provider headers (user + auto, merged at attach time). The buffer
+        // lives on this frame's stack and must outlive the request — `req`
+        // is fully consumed (`receiveHead` + stream) before this function
+        // returns.
+        var extra_headers: [provider_headers.max_outbound_headers]std.http.Header = undefined;
+        const extra = blk: {
+            var set = provider_headers.HeaderSet.init(&extra_headers);
+            set.append(self.provider_headers_owned, .{ .session_id = self.config.session_id });
+            break :blk set.slice();
+        };
         var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
                 .content_type = .{ .override = http.content_type_json },
             },
-            .extra_headers = extra_headers[0..extra_count],
+            .extra_headers = extra,
         }) catch |err| return self.headPhaseFailure(err);
         defer req.deinit();
 

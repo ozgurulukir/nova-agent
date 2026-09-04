@@ -1,8 +1,10 @@
 const std = @import("std");
 const log = std.log.scoped(.ai);
 
+const ai = @import("../ai.zig");
 const http = @import("../http.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const provider_headers = @import("provider_headers.zig");
 
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
@@ -18,11 +20,22 @@ pub const ModelEntry = struct {
     }
 };
 
+pub const Options = struct {
+    /// Session id for zen sticky routing; when empty the session header is
+    /// omitted (an empty-valued header is itself often a 400) but
+    /// `x-opencode-client` still identifies Nova.
+    session_id: []const u8 = "",
+    /// User-configured headers for this provider, `{env:VAR}` already
+    /// expanded by the caller. Borrowed for the call.
+    user_headers: []const provider_headers.Header = &.{},
+};
+
 pub fn listModels(
     gpa: std.mem.Allocator,
     io: std.Io,
     base_url: []const u8,
     api_key: []const u8,
+    options: Options,
 ) ![]ModelEntry {
     std.debug.assert(base_url.len > 0);
 
@@ -37,11 +50,21 @@ pub fn listModels(
         null;
     defer if (authorization) |a| gpa.free(a);
 
+    // OpenCode counts the picker's model probes among the traffic that must
+    // carry the routing headers, so the probe gets the same merge policy as
+    // the inference clients (auto headers + user headers, user wins).
+    const specs = try provider_headers.build(gpa, v1_root, ai.WireDialect.resolve(null, "", v1_root), options.user_headers);
+    defer provider_headers.freeHeaders(gpa, specs);
+    var extra_headers: [provider_headers.max_outbound_headers]std.http.Header = undefined;
+    var header_set = provider_headers.HeaderSet.init(&extra_headers);
+    header_set.append(specs, .{ .session_id = options.session_id });
+
     var http_client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http_client.deinit();
 
     var request = try http_client.request(.GET, try std.Uri.parse(url), .{
         .headers = .{ .authorization = if (authorization) |a| .{ .override = a } else .omit },
+        .extra_headers = header_set.slice(),
     });
     defer request.deinit();
     try request.sendBodiless();

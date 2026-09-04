@@ -6,6 +6,7 @@ pub const codex_responses = @import("ai/codex_responses.zig");
 pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const openai_responses = @import("ai/openai_responses.zig");
+pub const provider_headers = @import("ai/provider_headers.zig");
 pub const text_tool_call = @import("ai/text_tool_call.zig");
 
 pub const Tool = tools_common.Tool;
@@ -210,6 +211,14 @@ pub const Config = struct {
     retry_base_delay_ms: u64 = 500,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
+    /// Resolved provider headers for this client: provider-required auto
+    /// headers (OpenCode Zen routing, OpenRouter attribution) merged with
+    /// the user's `providers.<name>.headers`, user winning on name
+    /// collision (`provider_headers.build`, called once at attach time —
+    /// `{env:VAR}` placeholders are already expanded by then). BORROWED at
+    /// init: each client deep-dupes what it keeps via
+    /// `provider_headers.cloneHeaders`.
+    headers: []const provider_headers.Header = &.{},
     system_prompt: []const u8 = "You are a helpful assistant.",
 };
 

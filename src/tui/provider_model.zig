@@ -32,6 +32,24 @@ fn cachedProvider(self: *const App) ?config_mod.Provider {
     return self.cached_config.providerFromName();
 }
 
+/// The live session's id, for zen sticky-routing on synchronous UI-thread
+/// probes. Empty when no live runtime/session exists — the session header
+/// is then omitted rather than sent empty-valued.
+fn activeSessionId(self: *const App) []const u8 {
+    const runtime = self.liveRuntime() orelse return "";
+    if (!runtime.session_writer_started) return "";
+    return runtime.session_writer.session.id.slice();
+}
+
+/// Owned copy of `activeSessionId` for background jobs, which must not
+/// borrow runtime memory across the thread boundary — the App may switch
+/// (and tear down) the live runtime while the job probes.
+fn ownedSessionId(self: *App) ![]u8 {
+    const live = activeSessionId(self);
+    if (live.len == 0) return &.{};
+    return self.gpa.dupe(u8, live);
+}
+
 pub fn openProviderPicker(self: *App) !void {
     // Every fallible step runs BEFORE the mode flip: on error the app stays
     // in its prior mode and the caller reports the failure — a half-open
@@ -276,6 +294,7 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
             self.gpa.free(c.api_key);
             if (c.display_name) |d| self.gpa.free(d);
             if (c.auth_key_id) |a| self.gpa.free(a);
+            ai.provider_headers.freeHeaders(self.gpa, c.headers);
         }
         if (configured.len > 0) self.gpa.free(configured);
     }
@@ -300,6 +319,7 @@ pub fn startModelLoad(self: *App, catalog: ModelCatalog, merge: bool) !void {
         .configured = configured,
         .include_locals = catalog == .connected_provider,
         .codex_signed_in = self.isCodexSignedIn(),
+        .session_id = try ownedSessionId(self),
         .done = &self.pickers.models.load.loading.done,
     };
     try model_loader_job.spawnLoadFuture(self, job);
@@ -315,6 +335,7 @@ pub fn collectConfiguredProviders(self: *App, catalog: ModelCatalog) ![]model_lo
             self.gpa.free(c.base_url);
             self.gpa.free(c.api_key);
             if (c.display_name) |d| self.gpa.free(d);
+            ai.provider_headers.freeHeaders(self.gpa, c.headers);
         }
         list.deinit(self.gpa);
     }
@@ -397,12 +418,15 @@ pub fn appendConfiguredDynamic(
     errdefer self.gpa.free(name);
     const id = try self.gpa.dupe(u8, auth_key_id);
     errdefer self.gpa.free(id);
+    const headers = try config_mod.expandProviderHeaders(self.gpa, self.cached_config.providerHeadersByName(auth_key_id));
+    errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
     try list.append(self.gpa, .{
         .provider = .openai_compatible,
         .base_url = url,
         .api_key = key,
         .display_name = name,
         .auth_key_id = id,
+        .headers = headers,
     });
 }
 
@@ -420,7 +444,12 @@ pub fn appendConfigured(
     errdefer self.gpa.free(key);
     const id: ?[]u8 = if (auth_key_id) |k| try self.gpa.dupe(u8, k) else null;
     errdefer if (id) |owned| self.gpa.free(owned);
-    try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key, .auth_key_id = id });
+    const headers = try config_mod.expandProviderHeaders(
+        self.gpa,
+        self.cached_config.providerHeadersByName(auth_key_id orelse provider.label()),
+    );
+    errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
+    try list.append(self.gpa, .{ .provider = provider, .base_url = url, .api_key = key, .auth_key_id = id, .headers = headers });
 }
 
 pub const model_loader_job = @import("model_loader_job.zig");
@@ -734,6 +763,11 @@ pub fn startOpenAiCompatibleModelLoad(
     errdefer self.gpa.free(name);
     const owned_auth_key_id: ?[]u8 = if (auth_key_id) |id| try self.gpa.dupe(u8, id) else null;
     errdefer if (owned_auth_key_id) |id| self.gpa.free(id);
+    const headers = try config_mod.expandProviderHeaders(
+        self.gpa,
+        self.cached_config.providerHeadersByName(auth_key_id orelse "openai_compatible"),
+    );
+    errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
 
     configured[0] = .{
         .provider = .openai_compatible,
@@ -741,6 +775,7 @@ pub fn startOpenAiCompatibleModelLoad(
         .api_key = k,
         .display_name = name,
         .auth_key_id = owned_auth_key_id,
+        .headers = headers,
     };
 
     const job = try self.gpa.create(model_loader.Job);
@@ -767,6 +802,7 @@ pub fn startOpenAiCompatibleModelLoad(
         .configured = configured,
         .include_locals = false,
         .codex_signed_in = false,
+        .session_id = try ownedSessionId(self),
         .done = &self.pickers.models.load.loading.done,
     };
     try model_loader_job.spawnLoadFuture(self, job);
@@ -794,7 +830,12 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
     errdefer self.gpa.free(base_url);
     const api_key = try self.gpa.dupe(u8, key);
     errdefer self.gpa.free(api_key);
-    configured[0] = .{ .provider = provider, .base_url = base_url, .api_key = api_key };
+    const headers = try config_mod.expandProviderHeaders(
+        self.gpa,
+        self.cached_config.providerHeadersByName(provider.label()),
+    );
+    errdefer ai.provider_headers.freeHeaders(self.gpa, headers);
+    configured[0] = .{ .provider = provider, .base_url = base_url, .api_key = api_key, .headers = headers };
 
     self.pickers.models.load = .{ .loading = .{
         .future = undefined,
@@ -808,6 +849,7 @@ pub fn startProviderModelLoad(self: *App, provider: config_mod.Provider, key: []
         .configured = configured,
         .include_locals = false,
         .codex_signed_in = self.isCodexSignedIn(),
+        .session_id = try ownedSessionId(self),
         .done = &self.pickers.models.load.loading.done,
     };
     try model_loader_job.spawnLoadFuture(self, job);
@@ -1230,7 +1272,17 @@ pub fn loadLocalCompatibleCatalogs(self: *App) !void {
 pub fn loadLocalCompatibleCatalog(self: *App, provider: config_mod.Provider) !void {
     const base_url = provider.defaultBaseUrl() orelse return;
     const api_key = providerLocalApiKey(provider);
-    const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
+    // Local endpoints never match the zen marker, but user-configured
+    // headers for the provider still apply (a local gateway may require
+    // them) — parity with `startProviderModelLoad` for the same provider.
+    const user_headers = try config_mod.expandProviderHeaders(
+        self.gpa,
+        self.cached_config.providerHeadersByName(provider.label()),
+    );
+    defer ai.provider_headers.freeHeaders(self.gpa, user_headers);
+    const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key, .{
+        .user_headers = user_headers,
+    });
     defer {
         for (fetched) |*entry| entry.deinit(self.gpa);
         self.gpa.free(fetched);
@@ -1252,7 +1304,17 @@ pub fn fetchCompatibleCatalog(self: *App) !void {
     const base_url = self.cached_config.base_url.?;
     const api_key = self.cached_config.api_key.?;
     const provider = cachedProvider(self) orelse .openai_compatible;
-    const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key);
+    // Synchronous UI-thread call: the session id borrow and the expanded
+    // headers both stay valid for the duration of the fetch.
+    const user_headers = try config_mod.expandProviderHeaders(
+        self.gpa,
+        self.cached_config.providerHeadersByName(self.cached_config.provider_name orelse provider.label()),
+    );
+    defer ai.provider_headers.freeHeaders(self.gpa, user_headers);
+    const fetched = try openai_compatible_mod.listModels(self.gpa, self.io, base_url, api_key, .{
+        .session_id = activeSessionId(self),
+        .user_headers = user_headers,
+    });
     defer {
         for (fetched) |*entry| entry.deinit(self.gpa);
         self.gpa.free(fetched);
@@ -1493,7 +1555,14 @@ pub fn attachOpenAiCompatibleClient(
         self.cached_config.provider_name orelse "",
         base_url,
     );
-    try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort);
+    // Raw user headers, borrowed from cached_config for the synchronous
+    // attach — the runtime expands and merges them (user wins over the
+    // zen/OpenRouter auto headers) inside the attach.
+    const provider_label = if (cachedProvider(self)) |provider| provider.label() else "openai_compatible";
+    const user_headers = self.cached_config.providerHeadersByName(
+        self.cached_config.provider_name orelse provider_label,
+    );
+    try runtime.attachOpenAiCompatibleClient(base_url, api_key, model_id, effort, user_headers);
     self.thread.agent.?.client = runtime.client;
     injectPluginTools(self);
     // See connectCodexClient — without this, plugin tools sit in the

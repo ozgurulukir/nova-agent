@@ -31,6 +31,9 @@ pub const Model = provider_types.Model;
 pub const BaseUrl = provider_types.BaseUrl;
 pub const ReasoningSetting = provider_types.ReasoningSetting;
 pub const ProviderModel = provider_types.ProviderModel;
+pub const ProviderHeader = provider_types.ProviderHeader;
+pub const max_provider_headers = provider_types.max_provider_headers;
+pub const expandProviderHeaders = provider_types.expandProviderHeaders;
 pub const ProviderConfig = provider_types.ProviderConfig;
 pub const ModelSelectionRef = provider_types.ModelSelectionRef;
 pub const ModelSelection = provider_types.ModelSelection;
@@ -46,6 +49,7 @@ pub const cloneHeaders = mcp_types.cloneHeaders;
 pub const freeHeaders = mcp_types.freeHeaders;
 pub const mcpServerFromUrl = mcp_types.mcpServerFromUrl;
 pub const expandMcpServer = mcp_types.expandMcpServer;
+pub const expandEnvValue = mcp_types.expandEnvValue;
 
 // --- Plugin config re-exports ---
 
@@ -264,6 +268,16 @@ pub const Config = struct {
     pub fn providerFromName(self: *const Config) ?Provider {
         const name = self.provider_name orelse return null;
         return providers_by_name.get(name) orelse .openai_compatible;
+    }
+
+    /// Raw (unexpanded, `{env:VAR}`-preserving) user headers configured under
+    /// `providers.<name>.headers`. Empty when the provider has none. Borrowed
+    /// from the config tree — expansion happens at AI-client attach time.
+    pub fn providerHeadersByName(self: *const Config, name: []const u8) []const ProviderHeader {
+        for (self.providers) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.headers;
+        }
+        return &.{};
     }
 
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
