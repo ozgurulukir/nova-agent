@@ -83,6 +83,11 @@
           "format": "uri",
           "description": "Custom base URL for this provider. Legacy key 'base_url' is parsed for backward compatibility but is not schema-valid; new configs must use 'baseURL'."
         },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra HTTP headers sent on every outbound request to this provider through the chat-completions and Responses-API clients (main turns, summarizer, branch naming), and on the model picker's /v1/models probes for the provider. Not applied to the Codex OAuth transport. Values support '{env:VAR}' placeholders, expanded once per client attach (per fetch for picker probes); keep secrets in the environment, not config.json. A header with the same name as an auto-attached one (e.g. x-opencode-session for OpenCode Zen) replaces it. Reserved transport headers (authorization, content-type, host, ...) are rejected at parse; credentials belong in auth.json. Max 8 entries."
+        },
         "models": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/ModelConfig" },

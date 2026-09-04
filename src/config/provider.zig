@@ -5,7 +5,9 @@
 //! everything) and directly by modules that only need the type surface.
 
 const std = @import("std");
+const log = std.log.scoped(.config);
 const ai = @import("../ai.zig");
+const mcp = @import("mcp.zig");
 
 pub const Provider = enum {
     openai,
@@ -213,12 +215,59 @@ pub const ReasoningSetting = union(enum) {
 /// risk for good.
 pub const ProviderModel = Model;
 
+/// An extra HTTP header sent on every outbound AI request to this provider
+/// (e.g. a gateway auth token). Same shape and `{env:VAR}` semantics as the
+/// MCP header type, aliased so the two stay one concept: raw placeholders on
+/// disk, expansion at use time (AI-client attach for providers, connect for
+/// MCP servers).
+pub const ProviderHeader = mcp.McpHeader;
+
+/// Parse-time cap on `providers.<name>.headers` entries. Kept in lockstep
+/// with the wire-side budget (`provider_headers.max_user_headers`) so a
+/// full user list always fits every send-site buffer.
+pub const max_provider_headers: usize = ai.provider_headers.max_user_headers;
+
+/// Expand `{env:VAR}` in raw provider headers into owned wire specs
+/// (`.literal` values). Caller frees with `provider_headers.freeHeaders`;
+/// empty input yields the empty static slice. Shared by the runtime's
+/// client-attach path and the picker's model probe — the two places raw
+/// config headers become wire headers.
+pub fn expandProviderHeaders(gpa: std.mem.Allocator, raw: []const ProviderHeader) ![]ai.provider_headers.Header {
+    if (raw.len == 0) return &.{};
+    var out: std.ArrayList(ai.provider_headers.Header) = .empty;
+    errdefer {
+        ai.provider_headers.freeHeaderValues(gpa, out.items);
+        out.deinit(gpa);
+    }
+    for (raw) |header| {
+        const value = try mcp.expandEnvValue(gpa, header.value);
+        // Validate AFTER expansion: parse-time validation sees only the raw
+        // `{env:VAR}` placeholder, so an env var carrying CR/LF (trailing
+        // newline from `$(cat token)`, PEMs) would otherwise inject onto the
+        // wire. (HeaderSet.append re-checks at send time as backstop.)
+        if (!ai.provider_headers.isValidHeaderValue(value)) {
+            log.warn("provider header '{s}' expanded to a value with invalid bytes; skipping", .{header.name});
+            gpa.free(value);
+            continue;
+        }
+        errdefer gpa.free(value);
+        const name = try gpa.dupe(u8, header.name);
+        errdefer gpa.free(name);
+        try out.append(gpa, .{ .name = name, .value = .{ .literal = value } });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 pub const ProviderConfig = struct {
     /// The JSON map key. For builtins this equals `provider.label()`;
     /// for custom providers it's the user-chosen name (e.g. "qwen-cloud").
     name: []u8,
     provider: Provider,
     base_url: BaseUrl = .default,
+    /// Extra outbound HTTP headers, `{ "Name": "value {env:VAR}" }`. Owned;
+    /// raw placeholders are preserved through serialize so resolved secrets
+    /// never reach disk.
+    headers: []ProviderHeader = &.{},
     models: []ProviderModel = &.{},
 
     pub fn deinit(self: *ProviderConfig, gpa: std.mem.Allocator) void {
@@ -227,6 +276,7 @@ pub const ProviderConfig = struct {
             .custom => |s| gpa.free(s),
             .default => {},
         }
+        mcp.freeHeaders(gpa, self.headers);
         for (self.models) |*model| model.deinit(gpa);
         if (self.models.len > 0) gpa.free(self.models);
         self.* = undefined;
@@ -242,6 +292,7 @@ pub const ProviderConfig = struct {
             .custom => |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) },
             .default => {},
         }
+        out.headers = try mcp.cloneHeaders(gpa, self.headers);
         out.models = try gpa.alloc(ProviderModel, self.models.len);
         for (self.models, 0..) |model, index| out.models[index] = try model.clone(gpa);
         return out;
@@ -603,4 +654,23 @@ test "clonesAndAccessesModelSelection_whenBuiltinAndCustomVariantsUsed" {
     try std.testing.expect(!cloned_custom.useResponsesEndpoint());
     try std.testing.expectEqual(@as(?[]const u8, null), cloned_custom.systemPrompt());
     try std.testing.expectEqual(@as(?[]const u8, null), cloned_custom.bashClassifierUrl());
+}
+
+test "expandProviderHeaders deep-copies and owns expanded values" {
+    const gpa = std.testing.allocator;
+    const raw = [_]ProviderHeader{
+        .{ .name = @constCast("x-a"), .value = @constCast("plain") },
+        .{ .name = @constCast("x-b"), .value = @constCast("no {env: placeholder") },
+    };
+    const expanded = try expandProviderHeaders(gpa, &raw);
+    defer ai.provider_headers.freeHeaders(gpa, expanded);
+
+    try std.testing.expectEqual(@as(usize, 2), expanded.len);
+    try std.testing.expectEqualStrings("x-a", expanded[0].name);
+    try std.testing.expectEqualStrings("plain", expanded[0].value.literal);
+    try std.testing.expectEqualStrings("no {env: placeholder", expanded[1].value.literal);
+
+    const empty = try expandProviderHeaders(gpa, &.{});
+    defer ai.provider_headers.freeHeaders(gpa, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

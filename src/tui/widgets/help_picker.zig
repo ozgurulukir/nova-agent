@@ -143,7 +143,6 @@ test "scopeTag returns correct formatted bracketed tag for each scope" {
     try std.testing.expectEqualStrings("[lanes] ", scopeTag(.lanes));
 }
 
-
 /// The help overlay's outer height in rows, as sized by `overlaySize` in
 /// `overlay.zig`. Lives here (not there) so the scroll clamp and the layout
 /// read one value.

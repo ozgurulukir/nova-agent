@@ -10,6 +10,7 @@ const ai = @import("../ai.zig");
 const http = @import("../http.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
 const openai_compatible = @import("openai_compatible.zig");
+const provider_headers = @import("provider_headers.zig");
 const stream_part = @import("stream_part.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
@@ -34,21 +35,18 @@ const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const body_buffer_bytes = http.body_buffer_bytes;
 
 pub const ResponsesConfig = struct {
-    pub const HeaderValue = union(enum) {
-        literal: []const u8,
-        account_id,
-        session_id,
-    };
-
-    pub const Header = struct {
-        name: []const u8,
-        value: HeaderValue,
-    };
+    // Transport-protocol header specs, unified with the provider-header
+    // vocabulary in `provider_headers.zig` (INV-RESP-1 sibling leaf).
+    pub const HeaderValue = provider_headers.HeaderValue;
+    pub const Header = provider_headers.Header;
 
     pub const BaseUrlMode = enum { openai_v1, raw };
 
     base_url_mode: BaseUrlMode = .openai_v1,
     endpoint_path: []const u8 = "/responses",
+    /// Static profile table (codex handshake set); borrowed for the
+    /// client's lifetime, so it must reference permanent storage — the
+    /// owned, dynamic channel is `Client.provider_headers_owned`.
     headers: []const Header = &.{},
     user_agent: ?[]const u8 = null,
     text_verbosity: ?[]const u8 = null,
@@ -80,6 +78,10 @@ pub const Client = struct {
     /// function-calling on gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
     responses_config: ResponsesConfig,
+    /// Owned copy of `ai.Config.headers` (auto provider headers merged with
+    /// the user's, precedence already resolved at attach time). Materialized
+    /// per request by `extraHeaders` alongside the static profile table.
+    provider_headers_owned: []provider_headers.Header = &.{},
     http_client: std.http.Client,
     call_seq: u64 = 0,
     last_error_detail: ?[]u8 = null,
@@ -94,6 +96,10 @@ pub const Client = struct {
         var owned_config = config;
         owned_config.base_url = "";
         owned_config.api_key = "";
+        // Borrowed at init; the deep copy lives in provider_headers_owned.
+        // Blank it like base_url/api_key so no future read dangles after the
+        // attach frame (which owns the specs) returns.
+        owned_config.headers = &.{};
         owned_config.model = try gpa.dupe(u8, config.model);
         errdefer gpa.free(owned_config.model);
         owned_config.account_id = try gpa.dupe(u8, config.account_id);
@@ -104,6 +110,8 @@ pub const Client = struct {
         errdefer gpa.free(owned_config.system_prompt);
         const tools_json = try tool_schema.buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict, .responses);
         errdefer gpa.free(tools_json);
+        const provider_headers_owned = try provider_headers.cloneHeaders(gpa, config.headers);
+        errdefer provider_headers.freeHeaders(gpa, provider_headers_owned);
         target.* = .{
             .gpa = gpa,
             .io = io,
@@ -113,6 +121,7 @@ pub const Client = struct {
             .tools_json = tools_json,
             .strict = config.strict,
             .responses_config = responses_config,
+            .provider_headers_owned = provider_headers_owned,
             .http_client = .{ .allocator = gpa, .io = io },
         };
     }
@@ -126,6 +135,7 @@ pub const Client = struct {
         self.gpa.free(self.tools_json);
         self.gpa.free(self.authorization);
         self.gpa.free(self.url);
+        provider_headers.freeHeaders(self.gpa, self.provider_headers_owned);
         if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
@@ -192,7 +202,7 @@ pub const Client = struct {
 
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         self.clearErrorDetail();
-        var extra_headers_buffer: [8]std.http.Header = undefined;
+        var extra_headers_buffer: [provider_headers.max_outbound_headers]std.http.Header = undefined;
         const extra_headers = self.extraHeaders(&extra_headers_buffer);
         var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
@@ -263,19 +273,19 @@ pub const Client = struct {
         };
     }
 
-    fn extraHeaders(self: *const Client, buffer: *[8]std.http.Header) []const std.http.Header {
-        std.debug.assert(self.responses_config.headers.len <= buffer.len);
-        for (self.responses_config.headers, 0..) |header, index| {
-            buffer[index] = .{
-                .name = header.name,
-                .value = switch (header.value) {
-                    .literal => |value| value,
-                    .account_id => self.config.account_id,
-                    .session_id => self.config.session_id,
-                },
-            };
-        }
-        return buffer[0..self.responses_config.headers.len];
+    fn extraHeaders(self: *const Client, buffer: []std.http.Header) []const std.http.Header {
+        var set = provider_headers.HeaderSet.init(buffer);
+        // Transport-protocol profile headers (codex handshake set) first,
+        // then the provider header set (user + auto, precedence resolved at
+        // attach). Profile headers win on name collision: `accept` and
+        // `OpenAI-Beta` are functional for the SSE transport, not styling.
+        const context = provider_headers.ValueContext{
+            .session_id = self.config.session_id,
+            .account_id = self.config.account_id,
+        };
+        set.append(self.responses_config.headers, context);
+        set.append(self.provider_headers_owned, context);
+        return set.slice();
     }
 };
 
@@ -505,4 +515,35 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream-phase ReadFailed");
     try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
+}
+
+test "extraHeaders materializes provider headers with zen routing and user precedence" {
+    const gpa = std.testing.allocator;
+    // The merged spec list the runtime would hand the client: zen auto
+    // headers with the user's client-attribution override applied.
+    const specs = try provider_headers.build(gpa, "https://opencode.ai/zen/v1", .minimal, &.{
+        .{ .name = "x-opencode-client", .value = .{ .literal = "custom-client" } },
+    });
+    defer provider_headers.freeHeaders(gpa, specs);
+    try std.testing.expectEqual(@as(usize, 2), specs.len);
+
+    var client: Client = undefined;
+    try client.init(gpa, std.testing.io, .{
+        .base_url = "https://opencode.ai/zen/v1",
+        .api_key = "test-key",
+        .model = "test-model",
+        .session_id = "sess-32",
+        .headers = specs,
+        .system_prompt = "",
+    }, .{ .log_name = "test" });
+    defer client.deinit();
+
+    var buffer: [provider_headers.max_outbound_headers]std.http.Header = undefined;
+    const headers = client.extraHeaders(&buffer);
+
+    try std.testing.expectEqual(@as(usize, 2), headers.len);
+    try std.testing.expectEqualStrings(provider_headers.zen_session_header, headers[0].name);
+    try std.testing.expectEqualStrings("sess-32", headers[0].value);
+    try std.testing.expectEqualStrings(provider_headers.zen_client_header, headers[1].name);
+    try std.testing.expectEqualStrings("custom-client", headers[1].value);
 }

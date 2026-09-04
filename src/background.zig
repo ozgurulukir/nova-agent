@@ -891,12 +891,24 @@ const windows = if (os.is_windows) struct {
     };
 
     // Stub functions - never called on non-Windows (call sites guarded by comptime)
-    pub fn GetProcessId(_: HANDLE) DWORD { unreachable; }
-    pub fn CreateJobObjectW(_: ?*anyopaque, _: ?LPCWSTR) ?HANDLE { unreachable; }
-    pub fn SetInformationJobObject(_: HANDLE, _: DWORD, _: LPVOID, _: DWORD) BOOL { unreachable; }
-    pub fn AssignProcessToJobObject(_: HANDLE, _: HANDLE) BOOL { unreachable; }
-    pub fn TerminateJobObject(_: HANDLE, _: DWORD) BOOL { unreachable; }
-    pub fn CloseHandle(_: HANDLE) void { unreachable; }
+    pub fn GetProcessId(_: HANDLE) DWORD {
+        unreachable;
+    }
+    pub fn CreateJobObjectW(_: ?*anyopaque, _: ?LPCWSTR) ?HANDLE {
+        unreachable;
+    }
+    pub fn SetInformationJobObject(_: HANDLE, _: DWORD, _: LPVOID, _: DWORD) BOOL {
+        unreachable;
+    }
+    pub fn AssignProcessToJobObject(_: HANDLE, _: HANDLE) BOOL {
+        unreachable;
+    }
+    pub fn TerminateJobObject(_: HANDLE, _: DWORD) BOOL {
+        unreachable;
+    }
+    pub fn CloseHandle(_: HANDLE) void {
+        unreachable;
+    }
 };
 
 pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {

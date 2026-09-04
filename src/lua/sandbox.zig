@@ -405,7 +405,6 @@ test "sandbox: blocks rawget and rawset" {
     L.pop(1);
 }
 
-
 test "sandbox: blocks os.exit" {
     var L = try createSandboxedState(.{});
     defer {

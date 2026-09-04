@@ -14,6 +14,8 @@ const ai = @import("../ai.zig");
 const platform = @import("platform");
 const paths = @import("../paths.zig");
 
+const log = std.log.scoped(.config);
+
 const config_mod = @import("config.zig");
 const provider_types = @import("provider.zig");
 const mcp_types = @import("mcp.zig");
@@ -55,6 +57,7 @@ const Model = provider_types.Model;
 const BaseUrl = provider_types.BaseUrl;
 const ReasoningSetting = provider_types.ReasoningSetting;
 const ProviderModel = provider_types.ProviderModel;
+const ProviderHeader = provider_types.ProviderHeader;
 const ProviderConfig = provider_types.ProviderConfig;
 const ModelSelection = provider_types.ModelSelection;
 const providers_by_name = provider_types.providers_by_name;
@@ -327,6 +330,16 @@ fn applyProviderOverlay(gpa: std.mem.Allocator, target: *Config, updates: Provid
         switch (updates.base_url) {
             .custom => |s| try replaceBaseUrl(gpa, &provider.base_url, s),
             .default => {},
+        }
+        // Headers replace wholesale when the higher layer carries any —
+        // same semantics as `.custom` base URL. An absent (empty) list
+        // means "not specified in this layer", keeping the lower layer's.
+        // Clone BEFORE freeing the old list (the `replaceBaseUrl` ordering):
+        // freeing first leaves a dangling pointer behind on OOM.
+        if (updates.headers.len > 0) {
+            const next_headers = try cloneHeaders(gpa, updates.headers);
+            freeHeaders(gpa, provider.headers);
+            provider.headers = next_headers;
         }
         try applyProviderModelsOverlay(gpa, provider, updates.models);
         target.providers[index] = provider.*;
@@ -946,10 +959,95 @@ fn parseProviderConfig(gpa: std.mem.Allocator, name: []const u8, provider: Provi
     };
     errdefer out.deinit(gpa);
     if (stringFieldCompat(value, "baseURL", "base_url")) |s| out.base_url = .{ .custom = try gpa.dupe(u8, s) };
+    if (value.object.get("headers")) |headers_value| {
+        if (headers_value == .object) out.headers = try parseProviderHeaders(gpa, headers_value);
+    }
     if (value.object.get("models")) |models_value| {
         if (models_value == .object) out.models = try parseProviderModels(gpa, models_value);
     }
     return out;
+}
+
+/// Header names std.http manages through its request options. A duplicate
+/// arriving via `extra_headers` would be sent twice or fight the transport,
+/// so they are rejected at parse time rather than silently misbehaving.
+const reserved_header_names = [_][]const u8{
+    "authorization", "content-type", "host", "content-length", "transfer-encoding", "connection",
+};
+
+fn isReservedHeaderName(name: []const u8) bool {
+    for (reserved_header_names) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return true;
+    }
+    return false;
+}
+
+/// Header fields must be single-line and token-safe: a `:`/whitespace in
+/// the name or a CR/LF in either field would corrupt or inject into the
+/// wire format.
+fn isValidHeaderField(name: []const u8, value: []const u8) bool {
+    if (name.len == 0) return false;
+    if (value.len == 0) return false;
+    for (name) |c| {
+        if (c == ':' or c == '\r' or c == '\n' or c == ' ') return false;
+    }
+    for (value) |c| {
+        if (c == '\r' or c == '\n') return false;
+    }
+    return true;
+}
+
+/// Parse `providers.<name>.headers` (object of string → string). Invalid
+/// entries are skipped with a warn; the list is capped at
+/// `max_provider_headers` so a full config always fits every send-site
+/// buffer on the wire side.
+fn parseProviderHeaders(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderHeader {
+    var headers: std.ArrayList(ProviderHeader) = .empty;
+    errdefer {
+        freeHeaders(gpa, headers.items);
+        headers.deinit(gpa);
+    }
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (headers.items.len == provider_types.max_provider_headers) {
+            log.warn("providers headers exceed {d} entries; ignoring the rest", .{provider_types.max_provider_headers});
+            break;
+        }
+        if (entry.value_ptr.* != .string) continue;
+        const name = entry.key_ptr.*;
+        const header_value = entry.value_ptr.string;
+        if (!isValidHeaderField(name, header_value)) {
+            log.warn("ignoring invalid provider header '{s}' (empty field, whitespace/colon in name, or line break)", .{name});
+            continue;
+        }
+        if (isReservedHeaderName(name)) {
+            log.warn("ignoring reserved provider header '{s}' — credentials belong in auth.json", .{name});
+            continue;
+        }
+        // Per-field dupes before the append: a failure mid-element must not
+        // orphan the already-duped field (the list errdefer only covers
+        // fully-appended entries).
+        const owned_name = try gpa.dupe(u8, name);
+        errdefer gpa.free(owned_name);
+        const owned_value = try gpa.dupe(u8, header_value);
+        errdefer gpa.free(owned_value);
+        try headers.append(gpa, .{ .name = owned_name, .value = owned_value });
+    }
+    return headers.toOwnedSlice(gpa);
+}
+
+/// Write a raw `{ "name": "value" }` header map — placeholders preserved so
+/// a settings save never drops entries nor leaks a resolved secret to disk.
+/// Shared by the provider and MCP-server writers (same McpHeader type).
+fn writeHeaderMap(writer: *std.Io.Writer, headers: []const McpHeader) !void {
+    try writer.writeByte('{');
+    for (headers, 0..) |header, index| {
+        if (index > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(header.name, .{}, writer);
+        try writer.writeByte(':');
+        try std.json.Stringify.value(header.value, .{}, writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn parseProviderModels(gpa: std.mem.Allocator, value: std.json.Value) ![]ProviderModel {
@@ -1560,6 +1658,10 @@ fn writeProvider(writer: *std.Io.Writer, provider: ProviderConfig) !void {
         },
         .default => {},
     }
+    if (provider.headers.len > 0) {
+        try writeKey(writer, "headers", &wrote_any);
+        try writeHeaderMap(writer, provider.headers);
+    }
     if (provider.models.len > 0) {
         try writeKey(writer, "models", &wrote_any);
         try writeProviderModels(writer, provider.models);
@@ -1651,14 +1753,7 @@ fn writeMcpServer(writer: *std.Io.Writer, server: McpServerConfig) !void {
             // the parser, which reads this same `headers` object.
             if (t.headers.len > 0) {
                 try writeKeyNoIndent(writer, "headers", &wrote_any);
-                try writer.writeByte('{');
-                for (t.headers, 0..) |h, i| {
-                    if (i > 0) try writer.writeByte(',');
-                    try std.json.Stringify.value(h.name, .{}, writer);
-                    try writer.writeByte(':');
-                    try std.json.Stringify.value(h.value, .{}, writer);
-                }
-                try writer.writeByte('}');
+                try writeHeaderMap(writer, t.headers);
             }
         },
     }
@@ -3364,4 +3459,78 @@ test "parsePlugins keeps string settings and ignores non-object forms" {
             try std.testing.expectEqual(@as(usize, 0), p.settings.len);
         }
     }
+}
+
+test "provider headers parse with validation and round-trip raw placeholders" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"providers":{"opencode_zen":{"headers":{
+        \\  "x-custom":"value {env:SECRET}",
+        \\  "bad:name":"rejected",
+        \\  "with-newline":"a\nb",
+        \\  "authorization":"skip-me",
+        \\  "empty":""
+        \\}}}}
+    ;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer {
+        for (diagnostics.items) |*d| d.deinit(gpa);
+        diagnostics.deinit(gpa);
+    }
+    var cfg = try parseFile(gpa, "test", json, &diagnostics);
+    defer cfg.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    const headers = cfg.providers[0].headers;
+    // Only the one valid, non-reserved entry survives; invalid names
+    // (colon), line breaks, reserved names, and empty values are skipped.
+    try std.testing.expectEqual(@as(usize, 1), headers.len);
+    try std.testing.expectEqualStrings("x-custom", headers[0].name);
+    try std.testing.expectEqualStrings("value {env:SECRET}", headers[0].value);
+
+    // Serialize keeps the raw placeholder — a settings save never leaks a
+    // resolved secret to disk.
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    try serialize(gpa, &buf.writer, cfg);
+    try std.testing.expect(std.mem.indexOf(u8, buf.written(), "\"x-custom\":\"value {env:SECRET}\"") != null);
+}
+
+test "provider headers overlay replaces wholesale and absent keeps lower" {
+    const gpa = std.testing.allocator;
+    var target: Config = .{};
+    defer target.deinit(gpa);
+
+    var lower: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "p"),
+        .provider = .openai_compatible,
+    };
+    lower.headers = try cloneHeaders(gpa, &.{.{ .name = @constCast("x-old"), .value = @constCast("v") }});
+    errdefer lower.deinit(gpa);
+    target.providers = try gpa.alloc(ProviderConfig, 1);
+    errdefer gpa.free(target.providers);
+    target.providers[0] = lower;
+
+    var updates: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "p"),
+        .provider = .openai_compatible,
+    };
+    defer updates.deinit(gpa);
+    updates.headers = try cloneHeaders(gpa, &.{.{ .name = @constCast("x-new"), .value = @constCast("v2") }});
+    try applyProviderOverlay(gpa, &target, updates);
+
+    // A higher layer carrying headers replaces the lower layer's list.
+    try std.testing.expectEqual(@as(usize, 1), target.providers[0].headers.len);
+    try std.testing.expectEqualStrings("x-new", target.providers[0].headers[0].name);
+
+    // An overlay WITHOUT headers leaves the target's list untouched —
+    // "absent" must not read as "clear".
+    var updates_without_headers: ProviderConfig = .{
+        .name = try gpa.dupe(u8, "p"),
+        .provider = .openai_compatible,
+    };
+    defer updates_without_headers.deinit(gpa);
+    try applyProviderOverlay(gpa, &target, updates_without_headers);
+    try std.testing.expectEqual(@as(usize, 1), target.providers[0].headers.len);
+    try std.testing.expectEqualStrings("x-new", target.providers[0].headers[0].name);
 }
