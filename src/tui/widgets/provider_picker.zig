@@ -81,10 +81,11 @@ pub const ProviderHandle = union(enum) {
     }
 
     /// Position within `catalogueProviders()` for badge lookup. Null for
-    /// non-builtin entries (their badge comes from the API-key map).
+    /// non-catalogue entries (their badge comes from the API-key map).
     pub fn catalogueIndex(self: ProviderHandle) ?usize {
         const b = switch (self) {
             .builtin => |v| v,
+            .dynamic => |d| if (d.catalogue) d.provider else return null,
             else => return null,
         };
         for (config_mod.catalogueProviders(), 0..) |candidate, index| {
@@ -589,14 +590,14 @@ test "provider picker viewport scrolling renders selected dynamic row" {
         .{ .dynamic = .{ .id = "p1", .name = "Provider 1", .description = "Desc 1", .base_url = "https://p1.ai", .adapter = .openai_compatible, .requires_api_key = true } },
         .{ .dynamic = .{ .id = "p2", .name = "Provider 2", .description = "Desc 2", .base_url = "https://p2.ai", .adapter = .openai_compatible, .requires_api_key = true } },
     };
-    // builtins + 2 dynamics; selection=8 should land on "Provider 2"
+    // builtins + 2 dynamics; selection = count + 2 lands on "Provider 2"
     var entries: [count + 2]ProviderHandle = undefined;
     for (config_mod.catalogueProviders(), 0..) |b, idx| entries[idx] = .{ .builtin = b };
     entries[count] = dyn[0];
     entries[count + 1] = dyn[1];
 
     var content: Content = .{
-        .state = .{ .selection = 8, .entries = &entries },
+        .state = .{ .selection = count + 2, .entries = &entries },
         .codex_signed_in = false,
         .statuses = &.{},
     };

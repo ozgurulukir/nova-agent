@@ -69,7 +69,7 @@ Standardize overlay list viewports using `panel.ViewportWindow.compute(selection
 
 ### Provider polymorphism pattern
 
-Unify static builtin `config_mod.Provider`, dynamic `modelsdev.Provider`, and user-defined `config_mod.ProviderConfig` handles using `ProviderHandle = union(enum) { builtin, dynamic, config }` in `src/tui/widgets/provider_picker.zig`. All three share the same accessor surface (`id()`, `displayName()`, `description()`, `defaultBaseUrl()`, `requiresApiKey()`, `catalogueIndex()`). The `/connect` picker builds a single merged list via `buildMergedProviderList` in `src/tui/provider_model.zig`: builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name, **except** entries already covered by the models.dev registry — a `reg.lookup(cp.name)` guard prevents the persisted `ProviderConfig` entry from shadowing the `.dynamic` handle and converting the provider to a "custom" entry in the picker).
+Unify static builtin `config_mod.Provider`, dynamic `modelsdev.Provider`, and user-defined `config_mod.ProviderConfig` handles using `ProviderHandle = union(enum) { builtin, dynamic, config }` in `src/tui/widgets/provider_picker.zig`. All three share the same accessor surface (`id()`, `displayName()`, `description()`, `defaultBaseUrl()`, `requiresApiKey()`, `catalogueIndex()`). Since the 2026-09-04 builtin-provider unification, `modelsdev.Provider` is a direct alias of `config_provider.ProviderDef` and the registry carries no local builtin table — the single compile-time catalogue is `builtin_providers` (18 entries) in `src/config/provider.zig`, and `loadBuiltins()` returns it zero-copy; keep new provider metadata in that table only. The `/connect` picker builds a single merged list via `buildMergedProviderList` in `src/tui/provider_model.zig`: builtin catalogue → models.dev registry (overrides builtins with same id) → config providers (overrides everything with same name, **except** entries already covered by the models.dev registry — a `reg.lookup(cp.name)` guard prevents the persisted `ProviderConfig` entry from shadowing the `.dynamic` handle and converting the provider to a "custom" entry in the picker).
 
 ### Provider key masking pattern
 
@@ -205,7 +205,7 @@ Use `union(enum)` instead of flat structs with optional fields whenever a value 
 
 ### HTTP fetch decompression pattern
 
-`fetchApiJson` in `src/models/registry.zig` must honor `response.head.content_encoding`: gzip/deflate/zstd responses from Cloudflare-backed hosts (models.dev) are decompressed via `response.readerDecompressing` before caching; identity responses pass through unchanged. Using a plain `response.reader` stores compressed bytes in the cache, which `parseModelsDevJson` rejects, silently falling back to builtins-only (14 providers). `listModels` in `src/ai/openai_compatible_models.zig` already follows this pattern; `fetchApiJson` must match it.
+`fetchApiJson` in `src/models/registry.zig` must honor `response.head.content_encoding`: gzip/deflate/zstd responses from Cloudflare-backed hosts (models.dev) are decompressed via `response.readerDecompressing` before caching; identity responses pass through unchanged. Using a plain `response.reader` stores compressed bytes in the cache, which `parseModelsDevJson` rejects, silently falling back to builtins-only (18 providers). `listModels` in `src/ai/openai_compatible_models.zig` already follows this pattern; `fetchApiJson` must match it.
 
 ### Dynamic provider connection pattern
 

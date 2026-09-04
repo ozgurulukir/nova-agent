@@ -97,6 +97,7 @@ pub const WireDialect = enum {
             return switch (p) {
                 .openai => .openai,
                 .openrouter => .openrouter,
+                .alibaba => .dashscope,
                 else => .minimal,
             };
         }
@@ -106,7 +107,8 @@ pub const WireDialect = enum {
         if (std.mem.eql(u8, id_lower, "openai")) return .openai;
         if (std.mem.eql(u8, id_lower, "dashscope") or
             std.mem.eql(u8, id_lower, "qwen") or
-            std.mem.eql(u8, id_lower, "tongyi")) return .dashscope;
+            std.mem.eql(u8, id_lower, "tongyi") or
+            std.mem.eql(u8, id_lower, "alibaba")) return .dashscope;
         // 3. Base URL heuristic (covers user-defined providers).
         if (std.mem.indexOf(u8, base_url, "openrouter.ai") != null) return .openrouter;
         if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return .openai;
@@ -756,6 +758,7 @@ test "WireDialect.resolve maps builtin providers correctly" {
     // Builtin enum takes priority.
     try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(.openai, "", ""));
     try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(.openrouter, "", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(.alibaba, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama_cloud, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.cerebras, "", ""));
@@ -768,6 +771,7 @@ test "WireDialect.resolve maps dynamic provider ids" {
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "dashscope", ""));
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "qwen", ""));
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "tongyi", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "alibaba", ""));
     try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(null, "openrouter", ""));
     try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(null, "openai", ""));
     // DeepSeek and unknown → minimal.
