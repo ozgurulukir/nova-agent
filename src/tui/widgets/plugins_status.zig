@@ -63,7 +63,11 @@ pub const Content = struct {
             const is_selected = i == self.state.selection;
             const style = if (is_selected) p.selected_item else p.thinking_body;
             const status_icon = if (plugin.active) "●" else "○";
-            const line = std.fmt.bufPrint(&line_buf, "  {s} {s}", .{ status_icon, plugin.name }) catch continue;
+            // A name longer than line_buf falls back to a per-frame
+            // allocation so the entry is never dropped from the list; the
+            // common path stays allocation-free.
+            const line = std.fmt.bufPrint(&line_buf, "  {s} {s}", .{ status_icon, plugin.name }) catch
+                try std.fmt.allocPrint(ctx.arena, "  {s} {s}", .{ status_icon, plugin.name });
             try panel.lineStyledAt(&surface, row, line, ctx, 2, style);
             row += 1;
         }
@@ -77,7 +81,6 @@ pub const PluginEntry = struct {
     name: []const u8,
     active: bool,
 };
-
 
 test "plugins_status Content.draw renders plugins list correctly" {
     const CountingAllocator = @import("counting_allocator").CountingAllocator;
@@ -124,43 +127,37 @@ test "plugins_status Content.draw renders plugins list correctly" {
     try std.testing.expectEqualStrings("  ○ git-tools", line5);
 }
 
-
-test "plugins_status Content.draw allocation count benchmark" {
+test "plugins_status renders plugin names longer than the stack buffer" {
     const CountingAllocator = @import("counting_allocator").CountingAllocator;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var state: State = .{ .selection = 0 };
-    // Create 10 plugins
-    var plugins_buf: [10]PluginEntry = undefined;
-    for (&plugins_buf, 0..) |*p_entry, i| {
-        p_entry.* = .{
-            .name = "plugin-name-test",
-            .active = (i % 2 == 0),
-        };
-    }
-
+    var long_name: [300]u8 = undefined;
+    @memset(&long_name, 'x');
+    const plugins = [_]PluginEntry{
+        .{ .name = &long_name, .active = true },
+    };
     var content: Content = .{
         .state = &state,
-        .plugins = &plugins_buf,
-    };
-
-    const ctx: vxfw.DrawContext = .{
-        .arena = arena.allocator(),
-        .min = .{},
-        .max = .{ .width = 80, .height = 16 },
-        .cell_size = .{ .width = 10, .height = 20 },
+        .plugins = &plugins,
     };
 
     var counting: CountingAllocator = .{ .child = arena.allocator() };
-    const counting_ctx: vxfw.DrawContext = .{
+    const ctx: vxfw.DrawContext = .{
         .arena = counting.allocator(),
-        .min = ctx.min,
-        .max = ctx.max,
-        .cell_size = ctx.cell_size,
+        .min = .{},
+        .max = .{ .width = 40, .height = 8 },
+        .cell_size = .{ .width = 10, .height = 20 },
     };
 
-    _ = try content.widget().draw(counting_ctx);
+    const surface = try content.widget().draw(ctx);
 
-    std.debug.print("\n[BENCHMARK] Total Allocations in plugins_status Content.draw (10 plugins): allocs={d}, bytes={d}\n", .{ counting.count, counting.bytes });
+    // The oversized name must still render (clipped to the surface width):
+    // the old `catch continue` dropped the entry from the list entirely.
+    var row_buf: [128]u8 = undefined;
+    const rendered = panel.readRow(&surface, 4, &row_buf);
+    try std.testing.expect(rendered.len >= 20);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, "  ● "));
+    try std.testing.expect(std.mem.startsWith(u8, rendered[6..], long_name[0..16]));
 }
