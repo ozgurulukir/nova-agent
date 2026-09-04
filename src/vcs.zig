@@ -197,6 +197,27 @@ pub fn isRepo(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, out.stdout, " \t\r\n"), "true");
 }
 
+test "isAvailable_returnsTrue_whenGitIsPresent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+    try std.testing.expect(isAvailable(gpa, io));
+}
+
+test "isRepo_returnsTrue_whenInsideGitWorkingTree" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+    try std.testing.expect(isRepo(gpa, io, "."));
+}
+
+test "isRepo_returnsFalse_whenOutsideGitWorkingTree" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    if (!isAvailable(gpa, io)) return error.SkipZigTest;
+    try std.testing.expect(!isRepo(gpa, io, "/tmp"));
+}
+
 /// Get the current git branch name of `dir`, or null if detached / not a repo.
 /// Caller owns the returned slice.
 pub fn currentBranch(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ?[]u8 {
