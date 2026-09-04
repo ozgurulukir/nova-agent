@@ -359,6 +359,7 @@ fn handleVersionFlag(init: std.process.Init, gpa: std.mem.Allocator) !bool {
 }
 
 test {
+    _ = @import("tui/widgets/plugins_status.zig");
     std.testing.refAllDecls(@This());
     // The TUI tests moved out of `tui.zig` into `src/tui/tests.zig`; reference
     // the file here so its test blocks are compiled into the test run (a file
