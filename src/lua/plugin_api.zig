@@ -2675,6 +2675,12 @@ fn applyLineRange(content: []const u8, start_line: ?u32, end_line: ?u32) []const
 }
 
 /// Count lines in text.
+///
+/// DELIBERATE semantic variant of the shell tools' observation counter
+/// (`tools/shell.zig` `Impl::countLines`): empty text counts as 1 line and
+/// there is no trailing-newline compensation. This feeds the Lua-facing
+/// `read_file` display counting, not shell observation truncation, and is
+/// pinned by its own tests below. Do not unify the two.
 fn countLines(text: []const u8) u32 {
     var count: u32 = 1;
     for (text) |ch| {
