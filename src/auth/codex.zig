@@ -105,10 +105,23 @@ const AuthorizationFlow = struct {
 };
 
 pub fn login(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8) !Credentials {
+    return loginWith(gpa, io, home_dir, .{});
+}
+
+const LoginOptions = struct {
+    /// The test seam exists to keep `xdg-open` out of the suite: spawning a
+    /// real browser from a unit test is a user-visible side effect, and its
+    /// variable latency was what starved the mock callback client's connect
+    /// retries (see `MockCallbackClient`).
+    open_browser: bool = true,
+    callback_timeout_ms: u64 = callback_wait_timeout_ms,
+};
+
+fn loginWith(gpa: std.mem.Allocator, io: std.Io, home_dir: []const u8, opts: LoginOptions) !Credentials {
     var flow = try createAuthorizationFlow(gpa, io);
     defer flow.deinit(gpa);
-    try openBrowser(gpa, io, flow.url);
-    const code = try waitForAuthorizationCode(gpa, io, auth_port, callback_wait_timeout_ms, flow.state);
+    if (opts.open_browser) try openBrowser(gpa, io, flow.url);
+    const code = try waitForAuthorizationCode(gpa, io, auth_port, opts.callback_timeout_ms, flow.state);
     defer gpa.free(code);
     var credentials = try exchangeAuthorizationCode(gpa, io, code, flow.verifier);
     errdefer credentials.deinit(gpa);
@@ -595,8 +608,17 @@ const MockCallbackClient = struct {
 
     fn run(self: MockCallbackClient) void {
         var address = std.Io.net.IpAddress.parseIp4(auth_host, auth_port) catch return;
+        // 2000 × 5ms ≈ 10s of connect retries. This budget must comfortably
+        // exceed any pre-bind work on the tested side: when it was 100 tries
+        // (~500ms), pre-bind latency — historically an xdg-open spawn inside
+        // login, plus scheduling jitter after the ~500 tests that run before
+        // this one — could outlive it, the client gave up before the listener
+        // existed, and the 120s watchdog then surfaced the deadline as
+        // error.Timeout instead of the error under test. A generous budget
+        // only costs time on the failure path — the success path connects on
+        // the first try.
         var retry: usize = 0;
-        while (retry < 100) : (retry += 1) {
+        while (retry < 2000) : (retry += 1) {
             if (address.connect(self.io, .{ .mode = .stream })) |stream| {
                 var local_stream = stream;
                 defer local_stream.close(self.io);
@@ -669,5 +691,12 @@ test "login handles callback state mismatch and cleans up resources" {
     const thread = try std.Thread.spawn(.{}, MockCallbackClient.run, .{client});
     defer thread.join();
 
-    try std.testing.expectError(error.StateMismatch, login(gpa, io, home_dir));
+    // open_browser=false keeps a real xdg-open out of the suite (and out of
+    // the race with the mock client); the shortened deadline bounds a
+    // hypothetical regression to seconds instead of the production 120 s
+    // watchdog wait.
+    try std.testing.expectError(error.StateMismatch, loginWith(gpa, io, home_dir, .{
+        .open_browser = false,
+        .callback_timeout_ms = 10_000,
+    }));
 }
