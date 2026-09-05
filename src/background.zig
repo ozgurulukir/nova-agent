@@ -66,16 +66,18 @@ pub const BackgroundManager = struct {
         /// the temp file — stdin `-Command -` drops multi-line constructs, see
         /// `pwsh_exec.zig`'s module doc).
         command_mode: CommandMode,
-        /// Prefix/suffix wrapped around `command` to merge stderr into stdout and
-        /// normalize the exit code, so the reader can stay a `Buffer(1)` (stderr is
-        /// part of the command text, not a separate pipe) in every mode.
+        /// Prefix/suffix wrapped around `command` to normalize the exit code and
+        /// (for bash) merge stderr into stdout, so the log preserves
+        /// chronological order in both modes. The reader is always `Buffer(2)`
+        /// over both pipes: for bash the stderr pipe stays silent because
+        /// `exec 2>&1` redirects in-shell; for pwsh the pipe carries stderr and
+        /// the reader merges it.
         ///
         /// - bash: prefix `"exec 2>&1\n"`, suffix `""`.
         /// - pwsh: prefix `""`, suffix `"\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }"`
         ///   — the trailing check normalizes exit codes; there is NO `& { ... } 2>&1`
         ///   wrap (that block is dropped under stdin-mode shapes, see
-        ///   `pwsh_exec.zig`), so for pwsh the reader merges the stderr pipe
-        ///   instead (`Buffer(2)`).
+        ///   `pwsh_exec.zig`).
         stderr_merge_prefix: []const u8,
         stderr_merge_suffix: []const u8,
     };

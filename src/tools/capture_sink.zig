@@ -152,6 +152,7 @@ pub fn Sink(comptime config: type) type {
         spill_bytes: usize = 0,
 
         pub fn ingest(self: *Self, gpa: std.mem.Allocator, io: std.Io, chunk: []const u8) !void {
+            assert(chunk.len > 0);
             const chunk_ends_newline = chunk[chunk.len - 1] == '\n';
             const new_total = self.total_bytes + chunk.len;
             const new_lines = self.newline_count + countNewlines(chunk);
@@ -200,6 +201,9 @@ pub fn Sink(comptime config: type) type {
             self.tail.shrinkRetainingCapacity(self.tail.items.len - start);
         }
 
+        /// Consume the sink into a `Capture`: the tail buffer and the spill
+        /// path move into the result, so this is terminal — pair `deinit`
+        /// only with the error path (before `finish` has succeeded).
         pub fn finish(self: *Self, gpa: std.mem.Allocator, io: std.Io, code: u8, timed_out: bool) !Capture {
             const tail = try self.tail.toOwnedSlice(gpa);
             if (self.spill) |spill| spill.file.close(io);

@@ -181,8 +181,6 @@ fn exitCheckedScript(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}\nif (-not $?) {{ exit 1 }} else {{ exit $LASTEXITCODE }}", .{ color_disable, command });
 }
 
-/// Inline-vs-spill thresholds for `capture`. Reused from `bash_exec` so both
-/// shells honor identical observation budgets.
 /// Inline-vs-spill thresholds for `capture`. Shared via `capture_sink` (bash
 /// re-exports the same type) so both shells honor identical observation budgets.
 pub const CaptureLimits = capture_sink.CaptureLimits;
