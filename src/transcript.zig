@@ -278,6 +278,25 @@ pub const Transcript = struct {
         return false;
     }
 
+    /// Test-visibility probe: true when any user-, agent-, or notice-visible
+    /// message body contains `needle`. The variant set is load-bearing: TUI
+    /// tests assert negatives (background-job results, final-state lines,
+    /// discarded results) that must never match `.tool`/`.thinking`/`.skill`
+    /// bodies — model- or tool-authored text that is not a visible user-facing
+    /// message. Do NOT widen this to `bodyPtr()`'s variant list.
+    pub fn containsText(self: *const Transcript, needle: []const u8) bool {
+        for (self.messages.items) |m| {
+            const body: []const u8 = switch (m) {
+                .user => |x| x.body,
+                .agent => |x| x.body,
+                .notice => |x| x.body,
+                else => continue,
+            };
+            if (std.mem.indexOf(u8, body, needle) != null) return true;
+        }
+        return false;
+    }
+
     pub fn appendAgentDelta(
         self: *Transcript,
         gpa: std.mem.Allocator,
@@ -656,6 +675,37 @@ pub const Mirror = struct {
     tool_expanded_title: ?[]const u8,
     stderr_body: ?[]const u8,
 };
+
+test "containsText searches only user/agent/notice bodies" {
+    const gpa = std.testing.allocator;
+    var transcript: Transcript = .{};
+    defer transcript.deinit(gpa);
+
+    _ = try transcript.append(gpa, .user, "user", "NEEDLE from user");
+    _ = try transcript.append(gpa, .agent, "agent", "agent NEEDLE body");
+    _ = try transcript.append(gpa, .notice, "notice", "notice NEEDLE body");
+    try std.testing.expect(transcript.containsText("NEEDLE"));
+
+    // Every other variant must be invisible to the probe — widening the
+    // variant set flips negative assertions across the TUI tests.
+    _ = try transcript.append(gpa, .thinking, "thinking", "NEEDLE_THINKING");
+    _ = try transcript.append(gpa, .skill, "skill", "NEEDLE_SKILL");
+    _ = try transcript.append(gpa, .status, "status", "NEEDLE_STATUS");
+    _ = try transcript.append(gpa, .success, "success", "NEEDLE_SUCCESS");
+    _ = try transcript.append(gpa, .info, "info", "NEEDLE_INFO");
+    _ = try transcript.append(gpa, .logo, "logo", "NEEDLE_LOGO");
+    _ = try transcript.appendTool(gpa, "tool", "NEEDLE_TOOL", false);
+
+    try std.testing.expect(!transcript.containsText("NEEDLE_THINKING"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_SKILL"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_STATUS"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_SUCCESS"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_INFO"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_LOGO"));
+    try std.testing.expect(!transcript.containsText("NEEDLE_TOOL"));
+    // Positives still hold after the excluded variants were appended.
+    try std.testing.expect(transcript.containsText("NEEDLE"));
+}
 
 test "thinking and tool messages are compact until toggled" {
     const gpa = std.testing.allocator;

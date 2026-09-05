@@ -2260,19 +2260,6 @@ fn addFakeWorkingLane(gpa: std.mem.Allocator, app: *App, id: []const u8) !*Threa
     return lane;
 }
 
-fn transcriptContains(lane: *Thread, needle: []const u8) bool {
-    for (lane.transcript.messages.items) |m| {
-        const body: []const u8 = switch (m) {
-            .user => |x| x.body,
-            .agent => |x| x.body,
-            .notice => |x| x.body,
-            else => continue,
-        };
-        if (std.mem.indexOf(u8, body, needle) != null) return true;
-    }
-    return false;
-}
-
 test "serviceLaneBridge refuses a driver spawn without a task" {
     const gpa = std.testing.allocator;
     var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
@@ -2390,9 +2377,9 @@ test "beginSubmit refuses on an idle lane with a guiding notice, not a crash" {
     const started = try app.beginSubmit();
     try std.testing.expect(!started);
     // The notice names both escape hatches.
-    try std.testing.expect(transcriptContains(app.thread, "idle"));
-    try std.testing.expect(transcriptContains(app.thread, "lane enter"));
-    try std.testing.expect(transcriptContains(app.thread, "lane spawn"));
+    try std.testing.expect(app.thread.transcript.containsText("idle"));
+    try std.testing.expect(app.thread.transcript.containsText("lane enter"));
+    try std.testing.expect(app.thread.transcript.containsText("lane spawn"));
     // Input preserved — not consumed by toOwnedSlice.
     try std.testing.expectEqualStrings("let me work here", app.inputs.input.buf.firstHalf());
 }
@@ -2549,8 +2536,8 @@ test "lane spawn into a rested worker preserves the transcript and appends" {
     try std.testing.expect(lane.engine == .live);
     // Transcript preserved (TD-5): old messages still there + new ones appended.
     try std.testing.expect(lane.transcript.messages.items.len > old_msg_count);
-    try std.testing.expect(transcriptContains(lane, "first result"));
-    try std.testing.expect(transcriptContains(lane, "second task"));
+    try std.testing.expect(lane.transcript.containsText("first result"));
+    try std.testing.expect(lane.transcript.containsText("second task"));
 }
 
 test "lane await resolves an idle lane immediately and polls a running one" {
@@ -2768,7 +2755,7 @@ test "lane cancel reaches idle with a visible cancel notice" {
     defer app.gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
     try std.testing.expect(lane.turn.state == .idle); // the two-phase reset landed
-    try std.testing.expect(transcriptContains(lane, agent_worker.cancel_message));
+    try std.testing.expect(lane.transcript.containsText(agent_worker.cancel_message));
     try std.testing.expect(lane.acknowledged);
 }
 
@@ -2788,7 +2775,7 @@ test "S11: a gone spawner drops the completion without crashing" {
     const changed = try deliverPendingLaneCompletions(&app);
     try std.testing.expect(!changed);
     try std.testing.expect(lane.completion_delivered); // dropped, not delivered
-    try std.testing.expect(!transcriptContains(app.threads.slice()[0], "late result"));
+    try std.testing.expect(!app.threads.slice()[0].transcript.containsText("late result"));
 }
 
 test "M1: completion routes to the spawner by generation, not by agent pointer" {
@@ -2813,8 +2800,8 @@ test "M1: completion routes to the spawner by generation, not by agent pointer" 
     _ = try deliverPendingLaneCompletions(&app);
     try std.testing.expect(worker.completion_delivered);
     // The notice landed on the spawner lane (generation 7), not the primary.
-    try std.testing.expect(transcriptContains(spawner, "result consumed"));
-    try std.testing.expect(!transcriptContains(app.threads.slice()[0], "result consumed"));
+    try std.testing.expect(spawner.transcript.containsText("result consumed"));
+    try std.testing.expect(!app.threads.slice()[0].transcript.containsText("result consumed"));
 }
 
 test "S11: an acknowledged worker delivers a notice only — no answer turn" {
@@ -2836,7 +2823,7 @@ test "S11: an acknowledged worker delivers a notice only — no answer turn" {
     try std.testing.expect(changed);
     try std.testing.expect(lane.completion_delivered);
     try std.testing.expectEqual(before + 1, app.threads.slice()[0].transcript.messages.items.len);
-    try std.testing.expect(transcriptContains(app.threads.slice()[0], "result consumed"));
+    try std.testing.expect(app.threads.slice()[0].transcript.containsText("result consumed"));
     try std.testing.expect(app.threads.slice()[0].turn.state == .idle); // no answer turn
 }
 
@@ -2953,7 +2940,7 @@ test "S11: a finished spawned worker rests — runtime freed, transcript + workt
     try std.testing.expect(vcs.isRepo(gpa, io, lane_path));
     try std.testing.expect(lane.completion_delivered);
     // The spawner got the completion notice.
-    try std.testing.expect(transcriptContains(app.threads.slice()[0], "finished"));
+    try std.testing.expect(app.threads.slice()[0].transcript.containsText("finished"));
 }
 
 test "S11: a failed spawned worker is reported honestly, not as done" {
@@ -2985,9 +2972,9 @@ test "S11: a failed spawned worker is reported honestly, not as done" {
     try std.testing.expect(lane.completion_delivered);
     // The spawner is told the truth: FAILED + the reason, never "done".
     const spawner = app.threads.slice()[0];
-    try std.testing.expect(transcriptContains(spawner, "FAILED"));
-    try std.testing.expect(transcriptContains(spawner, "ConnectionLost"));
-    try std.testing.expect(!transcriptContains(spawner, "final state: done"));
+    try std.testing.expect(spawner.transcript.containsText("FAILED"));
+    try std.testing.expect(spawner.transcript.containsText("ConnectionLost"));
+    try std.testing.expect(!spawner.transcript.containsText("final state: done"));
 }
 
 test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
@@ -3022,9 +3009,9 @@ test "S11: a cancelled spawned worker is delivered as FAILED, not done" {
     try std.testing.expect(changed);
     try std.testing.expect(lane.completion_delivered);
     const spawner = app.threads.slice()[0];
-    try std.testing.expect(transcriptContains(spawner, "FAILED"));
-    try std.testing.expect(transcriptContains(spawner, "Interrupted."));
-    try std.testing.expect(!transcriptContains(spawner, "final state: done"));
+    try std.testing.expect(spawner.transcript.containsText("FAILED"));
+    try std.testing.expect(spawner.transcript.containsText("Interrupted."));
+    try std.testing.expect(!spawner.transcript.containsText("final state: done"));
 }
 
 test "lane merge: dirty primary refused (M3), conflict rolls back, dirty source refused (M3b) until committed" {
@@ -3209,7 +3196,7 @@ test "B2: discardUndeliveredCompletion notifies the spawner for a finished spawn
     discardUndeliveredCompletion(&app, worker);
 
     try std.testing.expect(worker.completion_delivered);
-    try std.testing.expect(transcriptContains(spawner, "result discarded"));
+    try std.testing.expect(spawner.transcript.containsText("result discarded"));
 }
 
 test "B2: discardUndeliveredCompletion is a no-op for a non-spawned lane" {
@@ -3270,7 +3257,7 @@ test "B2: discardUndeliveredCompletion drops silently when the spawner is gone" 
 
     try std.testing.expect(worker.completion_delivered); // dropped, not delivered
     for (app.threads.slice()) |l| {
-        try std.testing.expect(!transcriptContains(l, "result discarded"));
+        try std.testing.expect(!l.transcript.containsText("result discarded"));
     }
 }
 
@@ -3354,7 +3341,7 @@ test "B2: a refused close does not prematurely suppress the completion" {
     // The discard did NOT fire: the worker is still pending delivery, and the
     // spawner got no notice.
     try std.testing.expect(!worker.completion_delivered);
-    try std.testing.expect(!transcriptContains(spawner, "discarded"));
+    try std.testing.expect(!spawner.transcript.containsText("discarded"));
 }
 
 test "deleteLaneOp deletes open idle lane" {
@@ -3510,7 +3497,7 @@ test "deleteLaneOp discards a live worker's idle-turn completion (B2)" {
     const result = postAndService(io, &app, &req);
     defer app.gpa.free(result.text);
     try std.testing.expectEqual(@as(u8, 0), result.code);
-    try std.testing.expect(transcriptContains(spawner, "result discarded"));
+    try std.testing.expect(spawner.transcript.containsText("result discarded"));
     try std.testing.expectEqual(@as(usize, 1), app.threads.len()); // lane removed
 }
 
