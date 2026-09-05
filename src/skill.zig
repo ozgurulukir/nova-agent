@@ -1,6 +1,8 @@
 //! Project skill discovery, prompt formatting, and explicit invocation expansion.
 const std = @import("std");
 
+const sigil_query = @import("sigil_query.zig");
+
 const assert = std.debug.assert;
 const log = std.log.scoped(.skill);
 
@@ -165,20 +167,10 @@ pub fn formatSkillsList(gpa: std.mem.Allocator, skills: []const Skill) ![]u8 {
     return out.toOwnedSlice();
 }
 
-pub fn activeQuery(before_cursor: []const u8) ?struct { start: usize, query: []const u8 } {
-    var index: usize = before_cursor.len;
-    while (index > 0) : (index -= 1) {
-        const byte = before_cursor[index - 1];
-        if (isBoundary(byte)) return null;
-        if (byte == '$') {
-            const start = index - 1;
-            if (start == 0 or isBoundary(before_cursor[start - 1])) {
-                return .{ .start = start, .query = before_cursor[start + 1 ..] };
-            }
-            return null;
-        }
-    }
-    return null;
+/// The active `$skill` token ending at the cursor, given the text *before*
+/// the cursor. Shared backward-scan rules with `@`-mentions (sigil_query.zig).
+pub fn activeQuery(before_cursor: []const u8) ?sigil_query.Token {
+    return sigil_query.activeQuery(before_cursor, '$');
 }
 
 pub fn filterNames(gpa: std.mem.Allocator, skills: []const Skill, query: []const u8) ![][]const u8 {
@@ -494,20 +486,10 @@ pub fn writeXmlEscaped(writer: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
-fn isBoundary(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
-}
-
-fn trimTrailingPunctuation(value: []const u8) []const u8 {
-    var end = value.len;
-    while (end > 0) : (end -= 1) {
-        switch (value[end - 1]) {
-            '.', ',', ';', ':', '!', '?' => {},
-            else => break,
-        }
-    }
-    return value[0..end];
-}
+// Shared sigil-token boundary/punctuation rules (see sigil_query.zig) so the
+// autocomplete scan and collectInvocations can never drift apart.
+const isBoundary = sigil_query.isBoundary;
+const trimTrailingPunctuation = sigil_query.trimTrailingPunctuation;
 
 fn contains(values: []const []const u8, candidate: []const u8) bool {
     for (values) |value| {

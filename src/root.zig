@@ -407,6 +407,9 @@ test {
     // Platform-tolerant path comparison root leaf (extracted from
     // tui/lanes.zig); referenced explicitly so its inline tests run.
     _ = @import("paths.zig");
+    // Shared `@`/`$` sigil-token scanner leaf (extracted from at_mention.zig
+    // and skill.zig); referenced explicitly so its inline tests run.
+    _ = @import("sigil_query.zig");
     _ = @import("agent/compactor.zig");
     _ = @import("auth/keyring.zig");
     _ = @import("config/provider.zig");
