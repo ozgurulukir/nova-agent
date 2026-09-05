@@ -230,7 +230,7 @@ test "M2: a QueueFull background drop gains no mirror entry" {
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
-    try std.testing.expect(transcriptContains(app.thread, "finished — exit 0"));
+    try std.testing.expect(app.thread.transcript.containsText("finished — exit 0"));
 }
 
 test "M2: a no-provider delivery clears the mirror in lockstep with the agent queue" {
@@ -260,8 +260,8 @@ test "M2: a no-provider delivery clears the mirror in lockstep with the agent qu
     try std.testing.expectEqual(@as(usize, 0), app.thread.queued.items.len);
     try std.testing.expectEqual(@as(u32, 0), runtime.agent.message_queue.len());
     try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
-    try std.testing.expect(transcriptContains(app.thread, "finished — exit 0"));
-    try std.testing.expect(!transcriptContains(app.thread, "job result"));
+    try std.testing.expect(app.thread.transcript.containsText("finished — exit 0"));
+    try std.testing.expect(!app.thread.transcript.containsText("job result"));
 }
 
 test "INV-BG-OWNER-1: late background completion drops cleanly when owning lane is deleted" {
@@ -286,17 +286,4 @@ test "INV-BG-OWNER-1: late background completion drops cleanly when owning lane 
 
     // Must drop the delivery without crashing or dereferencing stale memory.
     try std.testing.expectEqual(@as(usize, 0), app.background_modal_state.pending.items.len);
-}
-
-fn transcriptContains(lane: *tui.Thread, needle: []const u8) bool {
-    for (lane.transcript.messages.items) |m| {
-        const body: []const u8 = switch (m) {
-            .user => |x| x.body,
-            .agent => |x| x.body,
-            .notice => |x| x.body,
-            else => continue,
-        };
-        if (std.mem.indexOf(u8, body, needle) != null) return true;
-    }
-    return false;
 }
