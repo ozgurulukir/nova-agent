@@ -102,11 +102,12 @@ fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(haystack, needle);
 }
 
-/// Case-insensitive substring match, shared by the command-palette filter and
-/// the transcript-search matcher (`widgets/search.zig`) so the two never drift.
+/// Case-insensitive substring match, shared by the command-palette filter,
+/// the tree-selector filter (`widgets/tree_selector.zig`) and the transcript
+/// search path so the filters never drift.
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len > haystack.len) return false;
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 test "matchesCommandFilter matches slash prefix and descriptions" {
