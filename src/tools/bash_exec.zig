@@ -1,25 +1,17 @@
 const std = @import("std");
 const os = @import("../os.zig");
+const capture_sink = @import("capture_sink.zig");
 const temp_files = @import("temp_files.zig");
 
 const assert = std.debug.assert;
 
-pub const Result = struct {
-    stdout: []u8,
-    stderr: []u8,
-    code: u8,
-    display: ?[]u8 = null,
+/// Shared capture machinery (Result/Capture/CaptureLimits/Sink/drainChild)
+/// lives in `capture_sink.zig`; the bash spawn shapes stay here.
+pub const Result = capture_sink.Result;
+pub const Capture = capture_sink.Capture;
+pub const CaptureLimits = capture_sink.CaptureLimits;
+const capture_read_reserve = capture_sink.capture_read_reserve;
 
-    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
-        gpa.free(self.stdout);
-        gpa.free(self.stderr);
-        if (self.display) |display| gpa.free(display);
-        self.* = undefined;
-    }
-};
-
-const stdout_bytes_limit: usize = 512 * 1024;
-const stderr_bytes_limit: usize = 512 * 1024;
 pub const timeout_seconds_default: u32 = 30;
 /// Foreground timeout cap. 1h is 120× the default — generous for any
 /// interactive command — while `run_in_background` is the documented escape
@@ -100,77 +92,15 @@ fn runUnderBash(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
 
     if (options.stdin) |stdin_bytes| {
         if (child.stdin) |stdin_file| {
-            writer = try std.Thread.spawn(.{}, writeStdinAndClose, .{ io, stdin_file, stdin_bytes });
+            writer = try std.Thread.spawn(.{}, capture_sink.writeStdinAndClose, .{ io, stdin_file, stdin_bytes });
             child.stdin = null; // ownership moved to the writer
         }
     }
-    return drainChild(gpa, io, &child, options.timeout);
-}
-
-fn writeStdinAndClose(io: std.Io, stdin_file: std.Io.File, data: []const u8) void {
-    // Best-effort: on EPIPE (the child exited before reading all of it) or any
-    // other write error, drop the data and close. The main thread is never
-    // blocked writing stdin, so it always drains stdout and the child progresses.
-    stdin_file.writeStreamingAll(io, data) catch {};
-    stdin_file.close(io);
-}
-
-fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
-    assert(child.stdout != null);
-    assert(child.stderr != null);
-    // Convert the idle-reset timeout to an absolute deadline once, so the cap is
-    // TOTAL runtime: every fill below waits against the same timestamp, and a
-    // chatty command can no longer push the deadline out (TD-2). `error.Timeout`
-    // propagates to the caller exactly as before.
-    const deadline = timeout.toDeadline(io);
-
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
-    while (multi_reader.fill(64, deadline)) |_| {
-        if (stdout_reader.buffered().len > stdout_bytes_limit) return error.StreamTooLong;
-        if (stderr_reader.buffered().len > stderr_bytes_limit) return error.StreamTooLong;
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
-    }
-
-    try multi_reader.checkAnyError();
-    const term = try child.wait(io);
-
-    const stdout_slice = try multi_reader.toOwnedSlice(0);
-    errdefer gpa.free(stdout_slice);
-    const stderr_slice = try multi_reader.toOwnedSlice(1);
-    errdefer gpa.free(stderr_slice);
-
-    return .{
-        .stdout = stdout_slice,
-        .stderr = stderr_slice,
-        .code = os.termCode(term),
-    };
+    return capture_sink.drainChild(gpa, io, &child, options.timeout);
 }
 
 /// Inline-vs-spill thresholds for `capture`.
-pub const CaptureLimits = struct {
-    /// Spill to disk (and mark the tail truncated) once either is exceeded.
-    bytes_max: usize,
-    lines_max: u32,
-    /// In-memory rolling-tail capacity. Must exceed `bytes_max`: the spill file
-    /// is seeded from the still-untrimmed tail the instant the threshold trips,
-    /// so the tail must hold the full output up to that point.
-    tail_bytes_max: usize,
-    /// Hard cap on the spill file size. The observation only ever shows the
-    /// last `bytes_max` bytes, so a command emitting endless output must not be
-    /// able to grow an unbounded file on disk; once the cap is hit the spill
-    /// stops growing while the in-memory tail keeps serving the observation.
-    spill_bytes_max: usize,
-};
-
+/// (`CaptureLimits`, like `Capture`/`Result`, is shared — see `capture_sink.zig`.)
 pub const CaptureOptions = struct {
     cwd: []const u8,
     command: []const u8,
@@ -179,34 +109,9 @@ pub const CaptureOptions = struct {
     limits: CaptureLimits,
 };
 
-/// Combined stdout+stderr capture of one command, streamed rather than buffered.
-///
-/// A bounded rolling `tail` is kept in memory; only once output exceeds the
-/// inline budget is the full stream spilled to `spill_path` on disk. Small
-/// commands — the common case — never touch the filesystem.
-pub const Capture = struct {
-    /// Trailing slice of the merged output, UTF-8-clean, bounded by
-    /// `limits.tail_bytes_max`. The complete output when `spill_path` is null.
-    tail: []u8,
-    total_bytes: u64,
-    total_lines: u32,
-    /// Full output on disk, set iff the inline budget was exceeded. Caller owns
-    /// the path string; the file itself is left in place for later retrieval.
-    spill_path: ?[]u8,
-    /// The command was killed for exceeding its timeout.
-    timed_out: bool,
-    /// Process exit code (255 for signal/unknown, 124 when `timed_out`).
-    code: u8,
-
-    pub fn deinit(self: *Capture, gpa: std.mem.Allocator) void {
-        gpa.free(self.tail);
-        if (self.spill_path) |path| gpa.free(path);
-        self.* = undefined;
-    }
-};
-
-const capture_read_reserve: usize = 64 * 1024;
-
+/// Combined stdout+stderr capture of one command, streamed rather than
+/// buffered — the type lives in `capture_sink.zig` (re-exported above); the
+/// bash spawn shape is `capture` below.
 /// Run `command` under bash, merging stderr into stdout (`exec 2>&1`) so the
 /// captured stream preserves chronological interleaving, and stream the result
 /// into a bounded tail with lazy spill. See `Capture`.
@@ -266,121 +171,14 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     return sink.finish(gpa, io, code, timed_out);
 }
 
-/// Streaming accumulator behind `capture`: keeps a bounded rolling tail and,
-/// once the inline budget is exceeded, spills the full output to a temp file.
-const Sink = struct {
-    limits: CaptureLimits,
-    tail: std.ArrayList(u8) = .empty,
-    total_bytes: u64 = 0,
-    newline_count: u32 = 0,
-    ended_with_newline: bool = false,
-    spill: ?Spill = null,
-    /// Bytes written to the spill file so far; capped by `limits.spill_bytes_max`.
-    spill_bytes: usize = 0,
-
-    const Spill = struct {
-        file: std.Io.File,
-        path: []u8,
-    };
-
-    fn ingest(self: *Sink, gpa: std.mem.Allocator, io: std.Io, chunk: []const u8) !void {
-        const chunk_ends_newline = chunk[chunk.len - 1] == '\n';
-        const new_total = self.total_bytes + chunk.len;
-        const new_lines = self.newline_count + countNewlines(chunk);
-        // Count an unterminated trailing line as a line, exactly like the
-        // `total_lines` reported in `finish`, so the spill trigger and the
-        // observation's truncation test agree: a spill file exists iff the tail
-        // is shown truncated.
-        const new_total_lines = new_lines + @intFromBool(!chunk_ends_newline);
-
-        // Decide to spill before appending/trimming. The tail is still untrimmed
-        // here (the byte threshold is below the trim threshold), so it holds the
-        // complete output so far and can seed the file; the current chunk is then
-        // written whole, so the file captures everything from this point on.
-        if (self.spill == null and (new_total > self.limits.bytes_max or new_total_lines > self.limits.lines_max)) {
-            self.spill = try openSpill(gpa, io);
-            try self.spill.?.file.writeStreamingAll(io, self.tail.items);
-            self.spill_bytes = self.tail.items.len;
-        }
-        // Cap the spill file at `spill_bytes_max` (TD-9): once reached, stop
-        // appending while the in-memory rolling tail keeps serving the
-        // observation. `spill_bytes_max >= tail_bytes_max` (asserted in
-        // `capture`), so the seed write always fits.
-        if (self.spill) |spill| {
-            const room = self.limits.spill_bytes_max -| self.spill_bytes;
-            if (room > 0) {
-                const n = @min(chunk.len, room);
-                try spill.file.writeStreamingAll(io, chunk[0..n]);
-                self.spill_bytes += n;
-            }
-        }
-
-        try self.tail.appendSlice(gpa, chunk);
-        self.total_bytes = new_total;
-        self.newline_count = new_lines;
-        self.ended_with_newline = chunk_ends_newline;
-        self.trimTail();
-    }
-
-    /// Drop leading bytes once the tail grows past twice its budget, keeping the
-    /// last `tail_bytes_max` bytes and not splitting a UTF-8 sequence.
-    fn trimTail(self: *Sink) void {
-        if (self.tail.items.len <= self.limits.tail_bytes_max * 2) return;
-        var start = self.tail.items.len - self.limits.tail_bytes_max;
-        while (start < self.tail.items.len and (self.tail.items[start] & 0xC0) == 0x80) start += 1;
-        std.mem.copyForwards(u8, self.tail.items[0 .. self.tail.items.len - start], self.tail.items[start..]);
-        self.tail.shrinkRetainingCapacity(self.tail.items.len - start);
-    }
-
-    fn finish(self: *Sink, gpa: std.mem.Allocator, io: std.Io, code: u8, timed_out: bool) !Capture {
-        const tail = try self.tail.toOwnedSlice(gpa);
-        if (self.spill) |spill| spill.file.close(io);
-        return .{
-            .tail = tail,
-            .total_bytes = self.total_bytes,
-            .total_lines = if (self.total_bytes == 0) 0 else self.newline_count + @intFromBool(!self.ended_with_newline),
-            .spill_path = if (self.spill) |spill| spill.path else null,
-            .timed_out = timed_out,
-            .code = code,
-        };
-    }
-
-    fn deinit(self: *Sink, gpa: std.mem.Allocator, io: std.Io) void {
-        self.tail.deinit(gpa);
-        if (self.spill) |spill| {
-            spill.file.close(io);
-            std.Io.Dir.deleteFile(.cwd(), io, spill.path) catch {};
-            gpa.free(spill.path);
-        }
-        self.* = undefined;
-    }
+/// Per-shell `capture_sink.Sink` instantiation: the spill log carries the
+/// bash prunable prefix (`nova-bash-`, pinned by temp_files tests) and spills
+/// into the one temp dir both bash and Nova agree on.
+const BashSinkConfig = struct {
+    pub const spill_prefix = temp_files.bash_spill_prefix;
+    pub const spillDir = tempDir;
 };
-
-fn countNewlines(bytes: []const u8) u32 {
-    var count: u32 = 0;
-    for (bytes) |byte| {
-        if (byte == '\n') count += 1;
-    }
-    return count;
-}
-
-fn openSpill(gpa: std.mem.Allocator, io: std.Io) !Sink.Spill {
-    const path = try tempSpillPath(gpa, io);
-    errdefer gpa.free(path);
-    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
-    return .{ .file = file, .path = path };
-}
-
-fn tempSpillPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    var random: [16]u8 = undefined;
-    io.random(&random);
-    const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, temp_files.bash_spill_prefix ++ "{s}.log", .{hex[0..]});
-    defer gpa.free(name);
-    const dir = try tempDir(gpa);
-    defer gpa.free(dir);
-    return std.fs.path.join(gpa, &.{ dir, name });
-}
+const Sink = capture_sink.Sink(BashSinkConfig);
 
 /// Resolve a temp directory that both the shell and Nova agree on.
 ///
@@ -534,13 +332,23 @@ fn pruneTempDir(io: std.Io, dir_path: []const u8, max_age_ns: u64) void {
     }
 }
 
+var bash_path_mutex: std.Io.Mutex = .init;
 var bash_path_value: ?[]const u8 = null;
 
+/// Mutex-guarded lazy init (mirrors `pwsh_exec.shellPath`): bash runs on the
+/// tool-call path and the background reader, so first resolution can race.
+/// On a lock failure fall back to the cached value, then to `"bash"` — the
+/// resolution is an optimization over the default PATH lookup anyway.
 fn bashPath(io: std.Io) []const u8 {
-    if (bash_path_value) |p| return p;
-    const resolved = resolveBashPath(io);
-    bash_path_value = resolved;
-    return resolved;
+    if (bash_path_mutex.lock(io)) |_| {
+        defer bash_path_mutex.unlock(io);
+        if (bash_path_value) |p| return p;
+        const resolved = resolveBashPath(io);
+        bash_path_value = resolved;
+        return resolved;
+    } else |_| {
+        return bash_path_value orelse "bash";
+    }
 }
 
 fn resolveBashPath(io: std.Io) []const u8 {

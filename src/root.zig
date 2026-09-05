@@ -398,6 +398,10 @@ test {
     // Temp-file prefix SSOT between the spill/script writers and the startup
     // pruner; referenced explicitly so its lockstep test runs.
     _ = @import("tools/temp_files.zig");
+    // Shared shell-capture machinery (bounded-tail Sink, child drainer)
+    // extracted from bash_exec/pwsh_exec; referenced explicitly so its
+    // inline tests run (silent-drop guard).
+    _ = @import("tools/capture_sink.zig");
     // Shared HTTP plumbing (buffers, media types, status predicates);
     // referenced explicitly so its inline tests run.
     _ = @import("http.zig");

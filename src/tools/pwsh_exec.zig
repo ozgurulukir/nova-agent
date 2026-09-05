@@ -24,8 +24,9 @@
 //! - `capture()` pipes BOTH stdout and stderr and merges them in the reader
 //!   (`MultiReader.Buffer(2)`), since PowerShell lacks a session-wide
 //!   `exec 2>&1` redirect.
-//! - `Sink`/`openSpill` are copied rather than reused: they are private to
-//!   `bash_exec.zig`. The spill-file prefix is `nova-pwsh-`.
+//! - The capture machinery (`Sink`, spill files, `drainChild`, result types)
+//!   is SHARED with `bash_exec.zig` via `capture_sink.zig` — the spill-file
+//!   prefix is the only per-shell bit (`nova-pwsh-`).
 //! - `tempDir()`/`namedTempPath()` are REUSED from `bash_exec` (no second
 //!   temp-walk; `pruneTempDir` matches both prefixes). Script temp files use the
 //!   `nova-pwsh-script-<hex>.ps1` prefix so a crash-stranded file is also pruned.
@@ -38,24 +39,12 @@ const os = @import("../os.zig");
 const assert = std.debug.assert;
 
 const bash_exec = @import("bash_exec.zig");
+const capture_sink = @import("capture_sink.zig");
 const temp_files = @import("temp_files.zig");
 
-pub const Result = struct {
-    stdout: []u8,
-    stderr: []u8,
-    code: u8,
-    display: ?[]u8 = null,
-
-    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
-        gpa.free(self.stdout);
-        gpa.free(self.stderr);
-        if (self.display) |display| gpa.free(display);
-        self.* = undefined;
-    }
-};
-
-const stdout_bytes_limit: usize = 512 * 1024;
-const stderr_bytes_limit: usize = 512 * 1024;
+/// Shared capture machinery — see `capture_sink.zig`.
+pub const Result = capture_sink.Result;
+pub const Capture = capture_sink.Capture;
 
 // Timeout constants/helpers reused from `bash_exec` so both shells honor the
 // same default/cap and deadline semantics.
@@ -132,11 +121,11 @@ fn runUnderPwsh(gpa: std.mem.Allocator, io: std.Io, options: RunOptions) !Result
 
     if (options.stdin) |stdin_bytes| {
         if (child.stdin) |stdin_file| {
-            writer = try std.Thread.spawn(.{}, writeStdinAndClose, .{ io, stdin_file, stdin_bytes });
+            writer = try std.Thread.spawn(.{}, capture_sink.writeStdinAndClose, .{ io, stdin_file, stdin_bytes });
             child.stdin = null; // ownership moved to the writer
         }
     }
-    return drainChild(gpa, io, &child, options.timeout);
+    return capture_sink.drainChild(gpa, io, &child, options.timeout);
 }
 
 /// Write `script` to a fresh `nova-pwsh-script-<hex>.ps1` temp file under the
@@ -162,11 +151,6 @@ fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8
 fn cleanupScriptTemp(gpa: std.mem.Allocator, io: std.Io, path: []const u8) void {
     std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
     gpa.free(path);
-}
-
-fn writeStdinAndClose(io: std.Io, stdin_file: std.Io.File, data: []const u8) void {
-    stdin_file.writeStreamingAll(io, data) catch {};
-    stdin_file.close(io);
 }
 
 /// Wrap `command` so PowerShell exits nonzero when any statement fails, WITHOUT
@@ -197,56 +181,11 @@ fn exitCheckedScript(gpa: std.mem.Allocator, command: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}{s}\nif (-not $?) {{ exit 1 }} else {{ exit $LASTEXITCODE }}", .{ color_disable, command });
 }
 
-fn drainChild(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, timeout: std.Io.Timeout) !Result {
-    assert(child.stdout != null);
-    assert(child.stderr != null);
-    const deadline = timeout.toDeadline(io);
-
-    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
-    var multi_reader: std.Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-
-    const stdout_reader = multi_reader.reader(0);
-    const stderr_reader = multi_reader.reader(1);
-
-    while (multi_reader.fill(64, deadline)) |_| {
-        if (stdout_reader.buffered().len > stdout_bytes_limit) return error.StreamTooLong;
-        if (stderr_reader.buffered().len > stderr_bytes_limit) return error.StreamTooLong;
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => |e| return e,
-    }
-
-    try multi_reader.checkAnyError();
-    const term = try child.wait(io);
-
-    const stdout_slice = try multi_reader.toOwnedSlice(0);
-    errdefer gpa.free(stdout_slice);
-    const stderr_slice = try multi_reader.toOwnedSlice(1);
-    errdefer gpa.free(stderr_slice);
-
-    return .{
-        .stdout = stdout_slice,
-        .stderr = stderr_slice,
-        .code = startProcessCode(term),
-    };
-}
-
-/// Map a PowerShell process termination to a `u8` exit code. The `& { ... }`
-/// wrap normalizes in-shell failures to an explicit `exit 1`/`exit $LASTEXITCODE`,
-/// so `.exited` carries the real value; a signal/unknown (e.g. a kill) maps to
-/// 255 like the bash tool.
-fn startProcessCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |value| value,
-        .signal, .stopped, .unknown => 255,
-    };
-}
-
 /// Inline-vs-spill thresholds for `capture`. Reused from `bash_exec` so both
 /// shells honor identical observation budgets.
-pub const CaptureLimits = bash_exec.CaptureLimits;
+/// Inline-vs-spill thresholds for `capture`. Shared via `capture_sink` (bash
+/// re-exports the same type) so both shells honor identical observation budgets.
+pub const CaptureLimits = capture_sink.CaptureLimits;
 pub const CaptureOptions = struct {
     cwd: []const u8,
     command: []const u8,
@@ -255,27 +194,7 @@ pub const CaptureOptions = struct {
     limits: CaptureLimits,
 };
 
-pub const Capture = struct {
-    /// Trailing slice of the merged output, UTF-8-clean, bounded by
-    /// `limits.tail_bytes_max`.
-    tail: []u8,
-    total_bytes: u64,
-    total_lines: u32,
-    /// Full output on disk, set iff the inline budget was exceeded.
-    spill_path: ?[]u8,
-    /// The command was killed for exceeding its timeout.
-    timed_out: bool,
-    /// Process exit code (255 for signal/unknown, 124 when `timed_out`).
-    code: u8,
-
-    pub fn deinit(self: *Capture, gpa: std.mem.Allocator) void {
-        gpa.free(self.tail);
-        if (self.spill_path) |path| gpa.free(path);
-        self.* = undefined;
-    }
-};
-
-const capture_read_reserve: usize = 64 * 1024;
+const capture_read_reserve = capture_sink.capture_read_reserve;
 
 /// Run `command` under PowerShell, merging stderr into the captured stream in
 /// the reader (stderr stays on its own stream; PowerShell has no session-wide
@@ -339,114 +258,22 @@ pub fn capture(gpa: std.mem.Allocator, io: std.Io, options: CaptureOptions) !Cap
     }
 
     if (!timed_out) try multi_reader.checkAnyError();
-    const code = if (timed_out) 124 else startProcessCode(try child.wait(io));
+    // `os.termCode`: the trailing exit-check normalizes in-shell failures to an
+    // explicit `exit 1`/`exit $LASTEXITCODE` (see `exitCheckedScript`), so
+    // `.exited` carries the real value; signal/unknown maps to 255.
+    const code = if (timed_out) 124 else os.termCode(try child.wait(io));
 
     return sink.finish(gpa, io, code, timed_out);
 }
 
-/// Streaming accumulator behind `capture`: keeps a bounded rolling tail and,
-/// once the inline budget is exceeded, spills the full output to a temp file.
-/// `copied from `bash_exec.zig`'s Sink (it is private there) with the spill
-/// prefix changed to `nova-pwsh-`.
-const Sink = struct {
-    limits: CaptureLimits,
-    tail: std.ArrayList(u8) = .empty,
-    total_bytes: u64 = 0,
-    newline_count: u32 = 0,
-    ended_with_newline: bool = false,
-    spill: ?Spill = null,
-    /// Bytes written to the spill file so far; capped by `limits.spill_bytes_max`.
-    spill_bytes: usize = 0,
-
-    const Spill = struct {
-        file: std.Io.File,
-        path: []u8,
-    };
-
-    fn ingest(self: *Sink, gpa: std.mem.Allocator, io: std.Io, chunk: []const u8) !void {
-        const chunk_ends_newline = chunk[chunk.len - 1] == '\n';
-        const new_total = self.total_bytes + chunk.len;
-        const new_lines = self.newline_count + countNewlines(chunk);
-        const new_total_lines = new_lines + @intFromBool(!chunk_ends_newline);
-
-        if (self.spill == null and (new_total > self.limits.bytes_max or new_total_lines > self.limits.lines_max)) {
-            self.spill = try openSpill(gpa, io);
-            try self.spill.?.file.writeStreamingAll(io, self.tail.items);
-            self.spill_bytes = self.tail.items.len;
-        }
-        if (self.spill) |spill| {
-            const room = self.limits.spill_bytes_max -| self.spill_bytes;
-            if (room > 0) {
-                const n = @min(chunk.len, room);
-                try spill.file.writeStreamingAll(io, chunk[0..n]);
-                self.spill_bytes += n;
-            }
-        }
-
-        try self.tail.appendSlice(gpa, chunk);
-        self.total_bytes = new_total;
-        self.newline_count = new_lines;
-        self.ended_with_newline = chunk_ends_newline;
-        self.trimTail();
-    }
-
-    fn trimTail(self: *Sink) void {
-        if (self.tail.items.len <= self.limits.tail_bytes_max * 2) return;
-        var start = self.tail.items.len - self.limits.tail_bytes_max;
-        while (start < self.tail.items.len and (self.tail.items[start] & 0xC0) == 0x80) start += 1;
-        std.mem.copyForwards(u8, self.tail.items[0 .. self.tail.items.len - start], self.tail.items[start..]);
-        self.tail.shrinkRetainingCapacity(self.tail.items.len - start);
-    }
-
-    fn finish(self: *Sink, gpa: std.mem.Allocator, io: std.Io, code: u8, timed_out: bool) !Capture {
-        const tail = try self.tail.toOwnedSlice(gpa);
-        if (self.spill) |spill| spill.file.close(io);
-        return .{
-            .tail = tail,
-            .total_bytes = self.total_bytes,
-            .total_lines = if (self.total_bytes == 0) 0 else self.newline_count + @intFromBool(!self.ended_with_newline),
-            .spill_path = if (self.spill) |spill| spill.path else null,
-            .timed_out = timed_out,
-            .code = code,
-        };
-    }
-
-    fn deinit(self: *Sink, gpa: std.mem.Allocator, io: std.Io) void {
-        self.tail.deinit(gpa);
-        if (self.spill) |spill| {
-            spill.file.close(io);
-            std.Io.Dir.deleteFile(.cwd(), io, spill.path) catch {};
-            gpa.free(spill.path);
-        }
-        self.* = undefined;
-    }
+/// Per-shell `capture_sink.Sink` instantiation: the spill log carries the pwsh
+/// prunable prefix (`nova-pwsh-`, pinned by temp_files tests) and spills into
+/// the same shared temp dir bash uses (`bash_exec.tempDir`).
+const PwshSinkConfig = struct {
+    pub const spill_prefix = temp_files.pwsh_prefix;
+    pub const spillDir = bash_exec.tempDir;
 };
-
-fn countNewlines(bytes: []const u8) u32 {
-    var count: u32 = 0;
-    for (bytes) |byte| {
-        if (byte == '\n') count += 1;
-    }
-    return count;
-}
-
-fn openSpill(gpa: std.mem.Allocator, io: std.Io) !Sink.Spill {
-    const path = try tempSpillPath(gpa, io);
-    errdefer gpa.free(path);
-    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
-    return .{ .file = file, .path = path };
-}
-
-fn tempSpillPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
-    var random: [16]u8 = undefined;
-    io.random(&random);
-    const hex = std.fmt.bytesToHex(random, .lower);
-    const name = try std.fmt.allocPrint(gpa, temp_files.pwsh_prefix ++ "{s}.log", .{hex[0..]});
-    defer gpa.free(name);
-    const dir = try bash_exec.tempDir(gpa);
-    defer gpa.free(dir);
-    return std.fs.path.join(gpa, &.{ dir, name });
-}
+const Sink = capture_sink.Sink(PwshSinkConfig);
 
 /// POSIX-only no-op: PowerShell needs no login-shell env snapshot (Windows
 /// command shells inherit the process environment directly). Mirrors
