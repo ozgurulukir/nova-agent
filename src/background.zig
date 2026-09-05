@@ -62,14 +62,22 @@ pub const BackgroundManager = struct {
         /// on Windows). Spawned with the argv shape implied by `command_mode`.
         shell_path: []const u8,
         /// How to pass `command` to the shell: `bash -c <merged>` vs
-        /// `pwsh -NoLogo -NonInteractive -Command -` (script fed on stdin).
+        /// `pwsh -File <temp .ps1>` (the merged, exit-checked script written to
+        /// the temp file — stdin `-Command -` drops multi-line constructs, see
+        /// `pwsh_exec.zig`'s module doc).
         command_mode: CommandMode,
-        /// Prefix/suffix wrapped around `command` to merge stderr into stdout and
-        /// normalize the exit code, so the reader can stay a `Buffer(1)` (stderr is
-        /// part of the command text, not a separate pipe) in every mode.
+        /// Prefix/suffix wrapped around `command` to normalize the exit code and
+        /// (for bash) merge stderr into stdout, so the log preserves
+        /// chronological order in both modes. The reader is always `Buffer(2)`
+        /// over both pipes: for bash the stderr pipe stays silent because
+        /// `exec 2>&1` redirects in-shell; for pwsh the pipe carries stderr and
+        /// the reader merges it.
         ///
         /// - bash: prefix `"exec 2>&1\n"`, suffix `""`.
-        /// - pwsh: prefix `"& {\n"`, suffix `"\n} 2>&1\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }"`.
+        /// - pwsh: prefix `""`, suffix `"\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }"`
+        ///   — the trailing check normalizes exit codes; there is NO `& { ... } 2>&1`
+        ///   wrap (that block is dropped under stdin-mode shapes, see
+        ///   `pwsh_exec.zig`).
         stderr_merge_prefix: []const u8,
         stderr_merge_suffix: []const u8,
     };
@@ -78,7 +86,9 @@ pub const BackgroundManager = struct {
     pub const CommandMode = enum {
         /// `bash -c <merged>` (single argv string; the classic bash shape).
         argv_dash_c,
-        /// `pwsh -NoLogo -NonInteractive -Command -` with `merged` fed on stdin.
+        /// `pwsh -NoLogo -NoProfile -NonInteractive -File <temp .ps1>` with the
+        /// merged script written to the temp file (the `.ps1` replaced the
+        /// original stdin `-Command -` design that dropped multi-line output).
         stdin_dash_command,
     };
 
