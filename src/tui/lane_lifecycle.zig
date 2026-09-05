@@ -22,6 +22,10 @@ const runtime_mod = @import("../runtime.zig");
 const command_router = @import("command_router.zig");
 const vcs = @import("../vcs.zig");
 const background_mod = @import("../background.zig");
+const bash = @import("../tools/bash_exec.zig");
+const pws = @import("../tools/pwsh_exec.zig");
+const os = @import("../os.zig");
+const platform = @import("platform");
 
 const App = tui.App;
 const Thread = tui.Thread;
@@ -3555,8 +3559,55 @@ test "cleanupLaneWorktreeAndBranch terminates background processes and removes w
     app.background = &bg;
     defer app.background = null;
 
-    // cleanupLaneWorktreeAndBranch runs safely with background manager attached
-    cleanupLaneWorktreeAndBranch(&app, ".", "nonexistent/worktree/path", "nova/fake-branch");
+    // Seed a real long-running job whose cwd is the "worktree" being torn
+    // down, so the termination claim is exercised instead of assumed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.process.currentPathAlloc(io, gpa);
+    defer gpa.free(root);
+    const wt_path = try std.fs.path.join(gpa, &.{ root, ".zig-cache", "tmp", &tmp.sub_path });
+    defer gpa.free(wt_path);
+
+    var env_map = try platform.getEnvMap(gpa);
+    defer env_map.deinit();
+
+    const is_win = os.is_windows;
+    var started = try bg.start(.{
+        .command = if (is_win) "Start-Sleep -Seconds 60" else "sleep 60",
+        .cwd = wt_path,
+        .env_map = &env_map,
+        .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
+        .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
+        .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
+        .stderr_merge_suffix = if (is_win) "\nif (-not $?) { exit 1 } else { exit $LASTEXITCODE }" else "",
+    });
+    defer started.deinit(gpa);
+    defer std.Io.Dir.deleteFile(.cwd(), io, started.log_path) catch {};
+    try std.testing.expect(started.pid > 0);
+
+    cleanupLaneWorktreeAndBranch(&app, ".", wt_path, "nova/fake-branch");
+
+    // terminateJobsInCwd flags the job killed and kills its process tree
+    // synchronously; the job's watcher thread then finalizes it, and
+    // takeFinished reaps it out of the manager's list.
+    var finished: []background_mod.BackgroundManager.Finished = &.{};
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        const pending = try bg.takeFinished(gpa);
+        if (pending.len > 0) {
+            finished = pending;
+            break;
+        }
+        gpa.free(pending);
+        io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    defer {
+        for (finished) |*f| f.deinit(gpa);
+        gpa.free(finished);
+    }
+    try std.testing.expectEqual(@as(usize, 1), finished.len);
+    try std.testing.expect(finished[0].killed);
+    try std.testing.expectEqual(@as(usize, 0), bg.jobs.items.len);
 }
 
 test "WorktreeJob start and completion lifecycle" {

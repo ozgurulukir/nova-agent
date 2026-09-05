@@ -1271,6 +1271,13 @@ test "initDefault creates directory and initializes database" {
     const expected_path = try session_migration.defaultPath(gpa, abs_home);
     defer gpa.free(expected_path);
     try std.Io.Dir.accessAbsolute(std.testing.io, expected_path, .{});
+
+    const sessions = try manager.list(gpa, null);
+    defer {
+        for (sessions) |*s| s.deinit(gpa);
+        gpa.free(sessions);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sessions.len);
 }
 
 test "create rejects session id with wrong length" {
