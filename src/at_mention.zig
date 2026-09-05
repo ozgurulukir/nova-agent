@@ -15,6 +15,7 @@ const std = @import("std");
 
 const ai = @import("ai.zig");
 const common = @import("tools/common.zig");
+const sigil_query = @import("sigil_query.zig");
 const skill_mod = @import("skill.zig");
 
 const assert = std.debug.assert;
@@ -33,13 +34,8 @@ pub const max_images_per_message: u32 = 4;
 /// Max bytes read for an image mention before we skip attaching it.
 const max_image_bytes: usize = 5 * 1024 * 1024;
 
-pub const Active = struct {
-    /// Byte offset of the `@` within the scanned text.
-    start: usize,
-    /// The path fragment after `@` (may be empty when the cursor sits right
-    /// after the `@`).
-    query: []const u8,
-};
+/// One `@`-mention token ending at the cursor (shared sigil scanner shape).
+pub const Active = sigil_query.Token;
 
 /// The active `@`-mention token ending at the cursor, given the text *before*
 /// the cursor. The token starts right after an `@` that sits at the start of
@@ -47,19 +43,7 @@ pub const Active = struct {
 /// intervening whitespace. Returns null when there is no such token (e.g. the
 /// cursor is mid-word, after a space, or the `@` is embedded like an email).
 pub fn activeQuery(before_cursor: []const u8) ?Active {
-    var i: usize = before_cursor.len;
-    while (i > 0) : (i -= 1) {
-        const c = before_cursor[i - 1];
-        if (isBoundary(c)) return null;
-        if (c == '@') {
-            const at = i - 1;
-            if (at == 0 or isBoundary(before_cursor[at - 1])) {
-                return .{ .start = at, .query = before_cursor[at + 1 ..] };
-            }
-            return null;
-        }
-    }
-    return null;
+    return sigil_query.activeQuery(before_cursor, '@');
 }
 
 /// Every distinct `@<path>` mention in `prompt`, in first-seen order. The
@@ -281,26 +265,15 @@ fn encodeBase64(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return buffer;
 }
 
-fn isBoundary(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
-}
-
-/// Drops trailing sentence punctuation so `@src/x.zig.` references `src/x.zig`.
-fn trimTrailingPunctuation(path: []const u8) []const u8 {
-    var end = path.len;
-    while (end > 0) : (end -= 1) {
-        switch (path[end - 1]) {
-            '.', ',', ';', ':', '!', '?' => {},
-            else => break,
-        }
-    }
-    return path[0..end];
-}
-
 fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
     if (suffix.len > value.len) return false;
     return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
+
+// Shared sigil-token boundary/punctuation rules (see sigil_query.zig) so the
+// autocomplete scan and collectMentions can never drift apart.
+const isBoundary = sigil_query.isBoundary;
+const trimTrailingPunctuation = sigil_query.trimTrailingPunctuation;
 
 test "activeQuery detects a mention at the cursor" {
     const active = activeQuery("explain @src/ag").?;
