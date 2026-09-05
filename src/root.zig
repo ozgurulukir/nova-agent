@@ -402,6 +402,10 @@ test {
     // extracted from bash_exec/pwsh_exec; referenced explicitly so its
     // inline tests run (silent-drop guard).
     _ = @import("tools/capture_sink.zig");
+    // Shared shell-tool implementation (shell.Impl over the bash/pwsh
+    // backends); referenced explicitly so its inline tests run
+    // (silent-drop guard).
+    _ = @import("tools/shell.zig");
     // Shared HTTP plumbing (buffers, media types, status predicates);
     // referenced explicitly so its inline tests run.
     _ = @import("http.zig");
