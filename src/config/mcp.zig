@@ -226,12 +226,22 @@ fn expandEnvVars(gpa: std.mem.Allocator, input: []const u8, env_map: *const std.
         if (env_map.get(name)) |value| {
             try out.writer.writeAll(value);
         } else {
-            log.warn("MCP config: environment variable '{s}' is not set; substituting empty string. Export it or remove the placeholder.", .{name});
+            log.warn("config: environment variable '{s}' is not set; substituting empty string. Export it or remove the placeholder.", .{name});
         }
         rest = rest[name_begin + close_rel + 1 ..];
     }
     try out.writer.writeAll(rest);
     return out.toOwnedSlice();
+}
+
+/// Expand `{env:VAR}` in one standalone config value (e.g. a provider
+/// header value) against the process environment. Caller frees. Used by
+/// the runtime at AI-client attach time — the same point in the lifecycle
+/// where `expandMcpServer` runs for MCP connects.
+pub fn expandEnvValue(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
+    var env_map = try loadEnvMap(gpa);
+    defer env_map.deinit();
+    return expandEnvVars(gpa, input, &env_map);
 }
 
 test "expandEnvVars leaves input without placeholders unchanged" {

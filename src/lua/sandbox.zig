@@ -23,12 +23,8 @@ pub const Permissions = struct {
     require_others: bool = true,
     /// Full access to all Lua standard libraries (embedded plugins only)
     full_access: bool = false,
-    /// Allow rawget/rawset (can be used for sandbox escape)
-    allow_rawget_rawset: bool = false,
     /// Allow os.execute
     allow_os_execute: bool = false,
-    /// Allow os.exit
-    allow_os_exit: bool = false,
     /// Allow os.remove/os.rename
     allow_os_remove: bool = false,
     /// Maximum Lua instructions before abort (0 = unlimited). This is a
@@ -238,12 +234,6 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
     copyGlobal(L, env_index, "xpcall");
     copyGlobal(L, env_index, "_VERSION");
 
-    // rawget/rawset — dangerous for sandbox escape, controlled by permission
-    if (permissions.allow_rawget_rawset) {
-        copyGlobal(L, env_index, "rawget");
-        copyGlobal(L, env_index, "rawset");
-    }
-
     // Copy safe library tables
     copyGlobal(L, env_index, "string");
     copyGlobal(L, env_index, "table");
@@ -268,12 +258,11 @@ fn createRestrictedEnvironment(L: *c.lua_State, permissions: Permissions) void {
         if (permissions.allow_os_execute) {
             copyOsFunction(L, os_index, "execute");
         }
-        if (permissions.allow_os_exit) {
-            copyOsFunction(L, os_index, "exit");
-        }
         if (permissions.allow_os_remove) {
-            copyOsFunction(L, os_index, "remove");
-            copyOsFunction(L, os_index, "rename");
+            c.lua_pushcfunction(L, plugin_api.deletePath);
+            c.lua_setfield(L, os_index, "remove");
+            c.lua_pushcfunction(L, plugin_api.movePath);
+            c.lua_setfield(L, os_index, "rename");
         }
     }
     c.lua_pop(L, 1); // pop real os
@@ -404,26 +393,26 @@ test "sandbox: full access exposes all libraries" {
     L.pop(1);
 }
 
-test "sandbox: blocks rawget by default" {
+test "sandbox: blocks rawget and rawset" {
     var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
     }
 
-    try std.testing.expect(L.doString("return rawget == nil"));
+    try std.testing.expect(L.doString("return rawget == nil and rawset == nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }
 
-test "sandbox: allows rawget when permitted" {
-    var L = try createSandboxedState(.{ .allow_rawget_rawset = true });
+test "sandbox: blocks os.exit" {
+    var L = try createSandboxedState(.{});
     defer {
         freeHookData(L.handle);
         L.deinit();
     }
 
-    try std.testing.expect(L.doString("return type(rawget) == 'function'"));
+    try std.testing.expect(L.doString("return os.exit == nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }
@@ -619,6 +608,82 @@ test "sandbox: plugin table visible in full-access states" {
     }
 
     try std.testing.expect(L.doString("return type(plugin.get_config) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: blocks os.remove and os.rename by default" {
+    var L = try createSandboxedState(.{});
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return os.remove == nil and os.rename == nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: allows path-sanitized os.remove and os.rename when permitted" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("return type(os.remove) == 'function' and type(os.rename) == 'function'"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    const test_dir = ".zig-cache/test_sandbox_os_remove";
+    std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, test_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+
+    const file_a = try std.fs.path.join(gpa, &.{ test_dir, "a.txt" });
+    defer gpa.free(file_a);
+    const file_b = try std.fs.path.join(gpa, &.{ test_dir, "b.txt" });
+    defer gpa.free(file_b);
+
+    var f = try std.Io.Dir.cwd().createFile(io, file_a, .{});
+    f.close(io);
+
+    const rename_script_raw = try std.fmt.allocPrint(gpa, "return os.rename(\"{s}\", \"{s}\")", .{ file_a, file_b });
+    defer gpa.free(rename_script_raw);
+    const rename_script = try gpa.dupeZ(u8, rename_script_raw);
+    defer gpa.free(rename_script);
+    try std.testing.expect(L.doString(rename_script));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    const remove_script_raw = try std.fmt.allocPrint(gpa, "return os.remove(\"{s}\")", .{file_b});
+    defer gpa.free(remove_script_raw);
+    const remove_script = try gpa.dupeZ(u8, remove_script_raw);
+    defer gpa.free(remove_script);
+    try std.testing.expect(L.doString(remove_script));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+}
+
+test "sandbox: os.remove and os.rename prevent path traversal outside workspace when permitted" {
+    const io = std.testing.io;
+    var L = try createSandboxedStateWithIo(.{ .allow_os_remove = true }, io);
+    defer {
+        freeHookData(L.handle);
+        L.deinit();
+    }
+
+    try std.testing.expect(L.doString("local res, err = os.remove('/etc/passwd'); return res == nil and err ~= nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    try std.testing.expect(L.doString("local res, err = os.rename('/etc/passwd', '/tmp/passwd'); return res == nil and err ~= nil"));
+    try std.testing.expect(L.toBoolean(-1));
+    L.pop(1);
+
+    try std.testing.expect(L.doString("local res, err = os.remove('../../../etc/passwd'); return res == nil and err ~= nil"));
     try std.testing.expect(L.toBoolean(-1));
     L.pop(1);
 }

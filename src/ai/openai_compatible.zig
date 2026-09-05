@@ -6,6 +6,7 @@ const os = @import("../os.zig");
 const http = @import("../http.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
+const provider_headers = @import("provider_headers.zig");
 const stream_parser = @import("stream_parser.zig");
 const tool_schema = @import("tool_schema.zig");
 const tools_common = @import("../tools/common.zig");
@@ -59,12 +60,12 @@ pub const Client = struct {
     /// gateways (OpenRouter/Ollama/vLLM).
     strict: bool = false,
     http_client: std.http.Client,
-    /// Optional OpenRouter app-attribution headers. Sent verbatim as
-    /// `X-Title` / `HTTP-Referer` when non-null — both are OpenRouter
-    /// conventions (ranking/discoverability + rate-limit priority). Owned;
-    /// freed in `deinit`. Null for non-OpenRouter dialects.
-    app_title: ?[]u8 = null,
-    app_referer: ?[]u8 = null,
+    /// Owned copy of `ai.Config.headers` (auto provider headers — OpenCode
+    /// Zen routing, OpenRouter attribution — merged with the user's
+    /// `providers.<name>.headers`, precedence already resolved at attach
+    /// time by `provider_headers.build`). Materialized per request in
+    /// `sendOnce`. Freed in `deinit`.
+    provider_headers_owned: []provider_headers.Header = &.{},
     /// Monotonic counter for synthesised tool_call ids when the inference
     /// server omits them. OpenAI's protocol requires stable ids linking
     /// assistant tool_calls to their `tool` result messages, so we mint
@@ -97,6 +98,10 @@ pub const Client = struct {
         var owned_config = config;
         owned_config.base_url = "";
         owned_config.api_key = "";
+        // Borrowed at init; the deep copy lives in provider_headers_owned.
+        // Blank it like base_url/api_key so no future read dangles after the
+        // attach frame (which owns the specs) returns.
+        owned_config.headers = &.{};
         owned_config.model = try gpa.dupe(u8, config.model);
         errdefer gpa.free(owned_config.model);
         owned_config.session_id = try gpa.dupe(u8, config.session_id);
@@ -104,6 +109,8 @@ pub const Client = struct {
 
         const tools_json = try tool_schema.buildAllToolsJson(gpa, config.tools, config.mcp_tools, null, config.strict, .completions);
         errdefer gpa.free(tools_json);
+        const provider_headers_owned = try provider_headers.cloneHeaders(gpa, config.headers);
+        errdefer provider_headers.freeHeaders(gpa, provider_headers_owned);
 
         target.* = .{
             .gpa = gpa,
@@ -114,8 +121,7 @@ pub const Client = struct {
             .tools_json = tools_json,
             .strict = config.strict,
             .http_client = .{ .allocator = gpa, .io = io },
-            .app_title = null,
-            .app_referer = null,
+            .provider_headers_owned = provider_headers_owned,
         };
     }
 
@@ -126,8 +132,7 @@ pub const Client = struct {
         self.gpa.free(self.tools_json);
         if (self.authorization) |a| self.gpa.free(a);
         self.gpa.free(self.url);
-        if (self.app_title) |t| self.gpa.free(t);
-        if (self.app_referer) |r| self.gpa.free(r);
+        provider_headers.freeHeaders(self.gpa, self.provider_headers_owned);
         if (self.last_error_detail) |d| self.gpa.free(d);
         self.* = undefined;
     }
@@ -306,25 +311,22 @@ pub const Client = struct {
         // may retry the same payload verbatim. Connection/read drops here
         // are mapped to `error.ConnectionFailed` (retryable); protocol-level
         // rejects pass through unchanged (permanent).
-        // OpenRouter app-attribution headers (X-Title / HTTP-Referer). These
-        // live on this frame's stack and must outlive the request — `req` is
-        // fully consumed (`receiveHead` + stream) before this function returns.
-        var extra_headers: [2]std.http.Header = undefined;
-        var extra_count: usize = 0;
-        if (self.app_title) |title| {
-            extra_headers[extra_count] = .{ .name = "X-Title", .value = title };
-            extra_count += 1;
-        }
-        if (self.app_referer) |referer| {
-            extra_headers[extra_count] = .{ .name = "HTTP-Referer", .value = referer };
-            extra_count += 1;
-        }
+        // Provider headers (user + auto, merged at attach time). The buffer
+        // lives on this frame's stack and must outlive the request — `req`
+        // is fully consumed (`receiveHead` + stream) before this function
+        // returns.
+        var extra_headers: [provider_headers.max_outbound_headers]std.http.Header = undefined;
+        const extra = blk: {
+            var set = provider_headers.HeaderSet.init(&extra_headers);
+            set.append(self.provider_headers_owned, .{ .session_id = self.config.session_id });
+            break :blk set.slice();
+        };
         var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = if (self.authorization) |a| .{ .override = a } else .omit,
                 .content_type = .{ .override = http.content_type_json },
             },
-            .extra_headers = extra_headers[0..extra_count],
+            .extra_headers = extra,
         }) catch |err| return self.headPhaseFailure(err);
         defer req.deinit();
 
@@ -337,12 +339,16 @@ pub const Client = struct {
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = req.receiveHead(&redirect_buffer) catch |err| {
-            // `receiveHead` fails with `error.ReadFailed` when the connection
-            // drops; capture the underlying socket error so the UI shows what
-            // actually went wrong instead of the opaque `ReadFailed`.
-            if (err == error.ReadFailed) {
+            // `receiveHead` fails with `error.ReadFailed`/`error.WriteFailed`
+            // when the connection drops; capture the underlying socket error
+            // so the UI shows what actually went wrong instead of the opaque
+            // error name. Read the stream error fields directly —
+            // `Connection.getReadError` unwraps `.?` internally and panics
+            // when std synthesized the ReadFailed without a socket error.
+            if (err == error.ReadFailed or err == error.WriteFailed) {
                 if (req.connection) |conn| {
-                    if (conn.getReadError()) |read_err| self.recordReadFailure(read_err);
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
+                    self.recordReadFailure(reason);
                 }
             }
             return self.headPhaseFailure(err);
@@ -381,20 +387,24 @@ pub const Client = struct {
         // Socket-level read timeout: prevents indefinite hangs when the
         // server stops mid-stream. Applied after the head is received so
         // the (fast) head exchange is not affected.
-        if (req.connection) |conn| {
-            if (!os.is_windows) {
+        // Windows: `Io.Threaded` opens sockets through the AFD driver, so
+        // socket handles are not ws2_32 SOCKETs and setsockopt always fails
+        // (WSAENOTSOCK) — skip it rather than warn on every request.
+        if (!os.is_windows) {
+            if (req.connection) |conn| {
                 const tv: std.posix.timeval = .{
                     .sec = @intCast(self.config.request_timeout_seconds),
                     .usec = 0,
                 };
-                std.posix.setsockopt(
+                if (std.c.setsockopt(
                     conn.stream_reader.stream.socket.handle,
                     std.posix.SOL.SOCKET,
                     std.posix.SO.RCVTIMEO,
-                    std.mem.asBytes(&tv),
-                ) catch |err| {
-                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed: {}", .{err});
-                };
+                    @ptrCast(std.mem.asBytes(&tv)),
+                    @intCast(@sizeOf(std.posix.timeval)),
+                ) != 0) {
+                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed", .{});
+                }
             }
         }
 
@@ -402,7 +412,20 @@ pub const Client = struct {
         var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = http_response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-        return try stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model);
+        return stream_parser.readStream(self.gpa, reader, observer, &self.tool_call_seq, self.config.max_parallel_tool_calls, self.config.model) catch |err| {
+            if (err == error.ReadFailed) {
+                if (req.connection) |conn| {
+                    // Prefer the socket error; std also synthesizes
+                    // `error.ReadFailed` for a truncated or invalid chunked
+                    // body (recorded as `body_err`), and
+                    // `Connection.getReadError` would panic on `.?` there —
+                    // see the head-phase note above.
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (http_response.bodyErr()) |e| e else err;
+                    self.recordReadFailure(reason);
+                }
+            }
+            return err;
+        };
     }
 
     /// Map a failure that occurred before any response bytes (connect, body
@@ -1977,4 +2000,90 @@ test "prompt decompresses a Content-Encoding: gzip error body into the UI detail
     try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail");
     try std.testing.expectEqualStrings("HTTP 403: invalid api key", detail);
+}
+
+/// Mock server that sends a valid HTTP 200 head with chunked transfer-encoding,
+/// sends partial SSE data, then closes abruptly without [DONE]. Used to test
+/// stream-phase ReadFailed capture.
+const MockAbortServer = struct {
+    srv_io: std.Io,
+    server: std.Io.net.Server,
+
+    fn init(srv_io: std.Io) !MockAbortServer {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const srv = try addr.listen(srv_io, .{ .reuse_address = true });
+        return .{ .srv_io = srv_io, .server = srv };
+    }
+
+    fn deinit(self: *MockAbortServer) void {
+        self.server.deinit(self.srv_io);
+    }
+
+    fn port(self: *const MockAbortServer) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn serve(self: *MockAbortServer) void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        var stream = self.server.accept(self.srv_io) catch return;
+        defer stream.close(self.srv_io);
+        var reader = stream.reader(self.srv_io, &read_buf);
+        var writer = stream.writer(self.srv_io, &write_buf);
+        // Drain the FULL request (headers + chunked body through the terminal
+        // `0\r\n\r\n`). `readSliceShort` blocks until its destination is
+        // FULL — and this request is smaller than any fixed buffer we could
+        // pick — so it must never be handed a larger destination here.
+        // `fillMore` performs exactly one blocking read, then an
+        // exactly-sized `readSliceShort` copies the buffered bytes out
+        // without waiting for more. The client sends nothing after the
+        // terminator (it blocks reading the response), so the loop ends
+        // there and never hangs.
+        var req_buf: [4096]u8 = undefined;
+        var req_len: usize = 0;
+        while (req_len < req_buf.len) {
+            reader.interface.fillMore() catch break;
+            const take = @min(reader.interface.bufferedLen(), req_buf.len - req_len);
+            req_len += reader.interface.readSliceShort(req_buf[req_len..][0..take]) catch break;
+            if (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") != null and
+                std.mem.endsWith(u8, req_buf[0..req_len], "0\r\n\r\n")) break;
+        }
+        // Send a 200 OK response with chunked transfer-encoding.
+        writer.interface.writeAll("HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n") catch return;
+        // Send one chunk of SSE data.
+        const chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
+        var hex_buf: [16]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}\r\n", .{chunk.len}) catch return;
+        writer.interface.writeAll(hex) catch return;
+        writer.interface.writeAll(chunk) catch return;
+        writer.interface.writeAll("\r\n") catch return;
+        // A malformed chunk header breaks the client's chunked decoder
+        // mid-body — std maps that to a stream-phase `error.ReadFailed` with
+        // `body_err` set. An abortive RST would mimic a real-world drop more
+        // closely, but `Io.Threaded` hands out AFD handles on Windows, which
+        // `setsockopt`(SO_LINGER) rejects — a protocol-level abort is the
+        // portable way to exercise the same client capture path.
+        writer.interface.writeAll("ZZ\r\n") catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
+test "prompt records last_error_detail on stream-phase ReadFailed" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockAbortServer.init(io);
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockAbortServer.serve, .{&server});
+    defer thread.join();
+
+    var client = try retryTestClient(gpa, io, server.port());
+    defer client.deinit();
+
+    try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream ReadFailed");
+    try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
 }

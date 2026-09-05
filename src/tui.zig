@@ -175,6 +175,11 @@ pub const App = struct {
     /// True once a snapshot has failed and we've told the user. Stops the
     /// per-turn failure notice from repeating every turn while git is wedged.
     checkpoint_warned: bool = false,
+    /// True while a terminal bracketed paste is in flight (between `paste_start`
+    /// and `paste_end`). While set, routeKey must not submit on the paste's own
+    /// Enter/CR bytes — each newline in a multiline paste inserts a newline
+    /// into the prompt instead (see event_router.zig).
+    pasting: bool = false,
     mode: Mode = .normal,
     resume_summaries: std.ArrayList(session_mod.SessionSummary) = .empty,
     resume_folded_projects: std.ArrayList([]u8) = .empty,
@@ -269,6 +274,7 @@ pub const App = struct {
         // The primary lane is generation 1; every later lane gets the next
         // counter value at its creation site.
         primary.generation = 1;
+        agent.lane_generation = primary.generation;
         // Seed the theme registry's builtins (gpa only, no io/paths) so
         // `app.theme_registry.slice()` is non-empty for every App — including
         // the headless/test path. Custom themes load later in `initRuntime`.
@@ -403,6 +409,14 @@ pub const App = struct {
 
     pub fn inputRealLength(self: *const App) usize {
         return self.inputs.input.buf.realLength();
+    }
+
+    pub fn isPasting(self: *const App) bool {
+        return self.pasting;
+    }
+
+    pub fn setPasting(self: *App, pasting: bool) void {
+        self.pasting = pasting;
     }
 
     pub fn isNormalMode(self: *const App) bool {
@@ -673,6 +687,15 @@ pub const App = struct {
     pub fn nextLaneGeneration(self: *App) u64 {
         self.lane_generation_counter += 1;
         return self.lane_generation_counter;
+    }
+
+    /// Assign one stable identity to both the lane and its live agent.
+    /// Background completions use the agent copy, while UI routing uses the lane.
+    pub fn assignLaneGeneration(self: *App, lane: *Thread) u64 {
+        const generation = self.nextLaneGeneration();
+        lane.generation = generation;
+        if (lane.agent) |agent| agent.lane_generation = generation;
+        return generation;
     }
 
     /// The open lane whose `generation` matches `g`, or null. Used to route a

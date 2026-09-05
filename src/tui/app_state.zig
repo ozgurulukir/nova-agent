@@ -209,15 +209,12 @@ pub const NavState = struct {
 
 /// State for the Ctrl+O background-jobs modal: the open flag, the
 /// selected row, the cancel-button focus hint, and the pending-delivery
-/// queue of background results to surface. The `owner` is the typed
-/// `*Agent` that owns the job (so the delivery site can look up the
-/// lane without an `@ptrCast`); the layer crossing from
-/// `background_mod.BackgroundManager.Finished.owner: *anyopaque` to
-/// this typed pointer happens in `pollBackgroundJobs` (one explicit
-/// cast at the TUI boundary, where agents are known).
+/// queue of background results to surface. The `owner_generation` is the stable
+/// lane generation that owns the job (so the delivery site resolves the
+/// lane via `laneByGeneration` without holding raw pointers or risking use-after-free).
 pub const BackgroundModalState = struct {
     pub const BackgroundDelivery = struct {
-        owner: *agent_mod.Agent,
+        owner_generation: u64,
         notice: []u8,
         message: ?[]u8,
     };

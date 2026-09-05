@@ -78,6 +78,9 @@ pub const Agent = struct {
     /// The driver/primary agents keep this false — they legitimately `cd` to
     /// lane worktrees to inspect them.
     contained: bool = false,
+    /// Monotonic lane generation identity for routing background job completions
+    /// safely without holding raw agent pointers.
+    lane_generation: u64 = 1,
     /// The App-owned `LaneBridge` the `lane` tool posts across. Borrowed
     /// (owned by the App); null disables the lane tool (headless/tests).
     lane_bridge: ?*lane_bridge.LaneBridge = null,
@@ -652,7 +655,7 @@ pub const Agent = struct {
             .contained = self.contained,
             .bash_classifier_url = self.bash_classifier_url,
             .background = if (self.background_manager) |manager|
-                .{ .manager = manager, .owner = self }
+                .{ .manager = manager, .owner_generation = self.lane_generation }
             else
                 null,
             .mcp_manager = self.mcp_manager,
@@ -1212,7 +1215,7 @@ pub const Agent = struct {
         if (self.compactionBreakerTripped()) {
             if (!self.compaction_breaker_notified) {
                 self.compaction_breaker_notified = true;
-                self.emitCompactionNotice(listener, .breaker_tripped);
+                emitCompactionNotice(listener, .breaker_tripped);
             }
             return;
         }
@@ -1237,7 +1240,7 @@ pub const Agent = struct {
                 error.NothingToCompact => if (compaction.shouldSwap(used, self.context_window_tokens, threshold)) {
                     if (!self.compaction_stuck_notified) {
                         self.compaction_stuck_notified = true;
-                        self.emitCompactionNotice(listener, .stuck);
+                        emitCompactionNotice(listener, .stuck);
                     }
                 },
                 else => log.warn("compaction start failed: {s}", .{@errorName(err)}),
@@ -1251,7 +1254,7 @@ pub const Agent = struct {
         if (compaction.shouldSwap(self.currentContextTokens(), self.context_window_tokens, threshold) and
             self.compactor.stateIs(.running))
         {
-            self.emitCompactionNotice(listener, .waiting);
+            emitCompactionNotice(listener, .waiting);
             self.joinCompactor();
             Agent.applyReadyCompaction(@TypeOf(listener), self, listener) catch |err| log.warn("compaction apply failed: {s}", .{@errorName(err)});
         }
@@ -1464,8 +1467,7 @@ pub const Agent = struct {
     /// Emit a one-shot compaction notice through the agent's event stream. The
     /// notice is a bare enum — no allocation — so the renderer owns the text
     /// and a dropped event (noop listener, full queue) leaks nothing.
-    fn emitCompactionNotice(self: *Agent, listener: anytype, notice: Event.CompactionNotice) void {
-        _ = self;
+    fn emitCompactionNotice(listener: anytype, notice: Event.CompactionNotice) void {
         const Ctx = @typeInfo(@TypeOf(listener.ctx)).pointer.child;
         const L = Listener(Ctx);
         const l: L = listener;

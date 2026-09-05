@@ -71,8 +71,10 @@ fn renameLaneBranch(app: *App, lane: *Thread, slug: []const u8) !bool {
         .primary => return false,
     };
 
-    const branch = try std.fmt.allocPrint(app.gpa, "nova/{s}", .{slug});
+    const branch = try app.gpa.alloc(u8, "nova/".len + slug.len);
     errdefer app.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], slug);
     const title = try app.gpa.dupe(u8, branch);
     errdefer app.gpa.free(title);
 
@@ -399,8 +401,11 @@ pub fn reportLaneError(app: *App, err: anyerror) !void {
     app.mode = .normal;
     app.clearInput();
     clearLanesState(app);
-    const message = try std.fmt.allocPrint(app.gpa, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
-    defer app.gpa.free(message);
+    var buf: [256]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)}) catch blk: {
+        break :blk try std.fmt.allocPrint(app.gpa, "Lane operation failed: {s}", .{lanes_util.laneErrorText(err)});
+    };
+    defer if (message.ptr != &buf) app.gpa.free(message);
     _ = try app.thread.transcript.append(app.gpa, .agent, "agent", message);
 }
 
@@ -1024,8 +1029,10 @@ fn createLaneWorktree(app: *App, repo: []const u8, home: []const u8) !struct { b
     app.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]});
+    const branch = try app.gpa.alloc(u8, "nova/".len + id.len);
     errdefer app.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], &id);
     const parent = try vcs.globalWorktreesDir(app.gpa, home);
     defer app.gpa.free(parent);
     std.Io.Dir.cwd().createDirPath(app.io, parent) catch {};
@@ -1078,7 +1085,7 @@ fn createLane(app: *App, req: *const lane_bridge.Request) ?Resp {
         return failResp(app.gpa, "lane: out of memory\n", .{});
     };
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     // An idle lane has no runtime to name itself — `purpose` becomes its
     // visible title instead, so the split grid reads as the task, not
     // "untitled".
@@ -1328,11 +1335,13 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         app.io.random(&raw);
         const id = std.fmt.bytesToHex(raw, .lower);
 
-        const branch = std.fmt.allocPrint(app.gpa, "nova/{s}", .{id[0..]}) catch {
+        const branch = app.gpa.alloc(u8, "nova/".len + id.len) catch {
             freeLaneContext(app.gpa, context);
             return failResp(app.gpa, "lane: out of memory\n", .{});
         };
         errdefer app.gpa.free(branch);
+        @memcpy(branch[0.."nova/".len], "nova/");
+        @memcpy(branch["nova/".len..], &id);
         const parent = vcs.globalWorktreesDir(app.gpa, home) catch {
             app.gpa.free(branch);
             freeLaneContext(app.gpa, context);
@@ -1401,7 +1410,7 @@ fn spawnLane(app: *App, req: *const lane_bridge.Request, requester_lane: ?*Threa
         wt_dest, // adopted by the lane
         runtime,
     );
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     lane.spawned_by_generation = spawner.generation;
     app.threads.append(lane) catch {
         // The lane adopted wt_branch/wt_dest via initLive. Remove the worktree
@@ -1502,6 +1511,7 @@ fn wakeIdleLane(app: *App, lane: *Thread, repo: []const u8, context: [][]u8) !vo
     lane.parent_context = context;
 
     lane.agent = &runtime.agent;
+    runtime.agent.lane_generation = lane.generation;
     lane.worker_context = .{ .io = app.io, .gpa = runtime.gpa };
     lane.engine = .{ .live = .{
         .lane = .{ .working = working },
@@ -1831,8 +1841,14 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         const title = lane.title orelse id;
         // Acknowledged (await/read/merge consumed the result): notice only.
         if (lane.acknowledged) {
-            const note = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id });
-            defer app.gpa.free(note);
+            var note_buf: [1024]u8 = undefined;
+            var allocated_note: ?[]u8 = null;
+            defer if (allocated_note) |n| app.gpa.free(n);
+            const note = std.fmt.bufPrint(&note_buf, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id }) catch blk: {
+                const heap_note = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — result consumed. Fold back with `lane merge {s}` or delete with /lanes.", .{ title, id, id });
+                allocated_note = heap_note;
+                break :blk heap_note;
+            };
             _ = spawner.transcript.append(app.gpa, .notice, "lane", note) catch {};
             if (spawner == active) changed = true;
             lane.completion_delivered = true;
@@ -1848,11 +1864,21 @@ pub fn deliverPendingLaneCompletions(app: *App) !bool {
         // then has no reason to read the lane or clean it up. The reason also
         // sits in the lane's transcript as a notice, so `lane read` shows the
         // full detail.
+        var msg_buf: [1024]u8 = undefined;
+        var allocated_msg: ?[]u8 = null;
+        defer if (allocated_msg) |m| app.gpa.free(m);
         const message = if (lane.turn_failed) |reason|
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id })
+            std.fmt.bufPrint(&msg_buf, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id }) catch blk: {
+                const heap_msg = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) FAILED after {d} tool calls: {s}. Read with `lane read {s}`; the worker did not complete — fold what's salvageable with `lane merge {s}` or /close it.", .{ title, id, tool_count, reason, id, id });
+                allocated_msg = heap_msg;
+                break :blk heap_msg;
+            }
         else
-            try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
-        defer app.gpa.free(message);
+            std.fmt.bufPrint(&msg_buf, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id }) catch blk: {
+                const heap_msg = try std.fmt.allocPrint(app.gpa, "Lane {s} ({s}) finished — {d} tool calls, final state: done. Read with `lane read {s}`; fold back with `lane merge {s}`.", .{ title, id, tool_count, id, id });
+                allocated_msg = heap_msg;
+                break :blk heap_msg;
+            };
         // Enqueue FIRST, then notice, then mark delivered: if the spawner's
         // queue is full, nothing has been written yet (agent queue and mirror
         // alike) and the next tick retries — the worker's result is never
@@ -3140,7 +3166,7 @@ test "B1: wakeIdleLane frees the prior parent_context before overwriting it" {
     const wt = try createLaneWorktree(app, repo, fx.home_dir);
     const lane = try gpa.create(Thread);
     lane.* = .{ .engine = .{ .idle = .{ .working = .{ .branch = wt.branch, .path = wt.dest } } } };
-    lane.generation = app.nextLaneGeneration();
+    _ = app.assignLaneGeneration(lane);
     try app.threads.append(lane);
 
     // First re-task: adopt a non-empty parent_context, then park back to idle

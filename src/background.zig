@@ -55,9 +55,9 @@ pub const BackgroundManager = struct {
         command: []const u8,
         cwd: []const u8,
         env_map: *const std.process.Environ.Map,
-        /// Opaque token (the owning `*Agent`) handed back at completion so the UI
-        /// routes the delivery to the right lane. The manager never derefs it.
-        owner: *anyopaque,
+        /// Stable lane generation identifier handed back at completion so the UI
+        /// routes the delivery to the right lane safely without holding raw agent pointers.
+        owner_generation: u64 = 1,
         /// The resolved shell executable (bash path on POSIX, pwsh.exe/powershell.exe
         /// on Windows). Spawned with the argv shape implied by `command_mode`.
         shell_path: []const u8,
@@ -105,6 +105,7 @@ pub const BackgroundManager = struct {
         command: []u8,
         log_path: []u8,
         elapsed_seconds: u64,
+        terminating: bool,
     };
 
     /// A finished job handed to the UI. `completion_message` is the model-facing
@@ -118,7 +119,7 @@ pub const BackgroundManager = struct {
         exit_code: u8,
         killed: bool,
         completion_message: ?[]u8,
-        owner: *anyopaque,
+        owner_generation: u64,
 
         pub fn deinit(self: *Finished, gpa: std.mem.Allocator) void {
             gpa.free(self.label);
@@ -128,7 +129,7 @@ pub const BackgroundManager = struct {
         }
     };
 
-    const State = enum(u8) { running, finished };
+    pub const State = enum(u8) { running, termination_requested, finished };
 
     const Job = struct {
         manager: *BackgroundManager,
@@ -138,13 +139,14 @@ pub const BackgroundManager = struct {
         cwd: []u8,
         log_path: []u8,
         pid: i64,
-        owner: *anyopaque,
+        owner_generation: u64 = 1,
         started: std.Io.Timestamp,
         child: std.process.Child,
         log_file: std.Io.File,
         /// Temp `.ps1` script file for a pwsh background job (null for bash
         /// `-c` jobs). Owned by the job; deleted in `destroyJob`.
         script_path: ?[]u8 = null,
+        win32_job_object: ?windows.HANDLE = null,
         tail: std.ArrayList(u8) = .empty,
         thread: ?std.Thread = null,
         state: std.atomic.Value(State) = .init(.running),
@@ -227,6 +229,7 @@ pub const BackgroundManager = struct {
                 .stdin = .ignore,
                 .stdout = .pipe,
                 .stderr = .pipe,
+                .pgid = if (os.is_windows) null else 0,
             }),
             .stdin_dash_command => blk: {
                 const path = try writeBackgroundScript(gpa, io, merged);
@@ -238,11 +241,21 @@ pub const BackgroundManager = struct {
                     .stdin = .ignore,
                     .stdout = .pipe,
                     .stderr = .pipe,
+                    .pgid = if (os.is_windows) null else 0,
                 });
             },
         };
 
         const pid = processId(child.?);
+
+        var win32_job_obj: ?windows.HANDLE = null;
+        errdefer if (win32_job_obj) |h| {
+            _ = windows.CloseHandle(h);
+            win32_job_obj = null;
+        };
+        if (os.is_windows) {
+            win32_job_obj = createWin32JobObject(child.?.id.?);
+        }
 
         var command_owned: ?[]u8 = null;
         defer if (command_owned) |p| gpa.free(p);
@@ -261,7 +274,6 @@ pub const BackgroundManager = struct {
         result_log_path = try gpa.dupe(u8, log_path.?);
 
         const job = try gpa.create(Job);
-        errdefer gpa.destroy(job);
 
         job.* = .{
             .manager = self,
@@ -271,11 +283,12 @@ pub const BackgroundManager = struct {
             .cwd = cwd_owned.?,
             .log_path = log_path.?,
             .pid = pid,
-            .owner = opts.owner,
+            .owner_generation = opts.owner_generation,
             .started = std.Io.Timestamp.now(io, .awake),
             .child = child.?,
             .log_file = log_file.?,
             .script_path = script_path,
+            .win32_job_object = win32_job_obj,
         };
 
         // Ownership of fields transferred to Job; disarm individual defers.
@@ -286,8 +299,9 @@ pub const BackgroundManager = struct {
         child = null;
         log_file = null;
         script_path = null;
+        win32_job_obj = null;
 
-        // 1. Spawn reader thread first. On failure, cleanup child, files, and job.
+        // 1. Spawn reader thread first. On failure, cleanup child, files, and job (no double free).
         const thread = std.Thread.spawn(.{}, runReader, .{job}) catch |err| {
             cleanupFailedJob(gpa, io, job);
             return err;
@@ -296,18 +310,12 @@ pub const BackgroundManager = struct {
 
         // 2. Lock mutex and publish atomically to self.jobs.
         self.mutex.lock(io) catch |err| {
-            job.killed.store(true, .release);
-            terminateTree(io, gpa, pid);
-            thread.join();
-            destroyJob(gpa, io, job);
+            cleanupFailedStartedJob(gpa, io, job, thread);
             return err;
         };
         self.jobs.append(gpa, job) catch |err| {
             self.mutex.unlock(io);
-            job.killed.store(true, .release);
-            terminateTree(io, gpa, pid);
-            thread.join();
-            destroyJob(gpa, io, job);
+            cleanupFailedStartedJob(gpa, io, job, thread);
             return err;
         };
         self.mutex.unlock(io);
@@ -433,48 +441,49 @@ pub const BackgroundManager = struct {
         );
     }
 
-    /// Snapshot the running jobs for the TUI modal (oldest first). Free with
-    /// `freeViews`.
+    /// Read-only snapshot of every active job for the TUI background-jobs modal.
+    /// The caller owns the returned slice; free it with `freeViews`.
     pub fn snapshot(self: *BackgroundManager, gpa: std.mem.Allocator) ![]JobView {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
+
+        var list: std.ArrayList(JobView) = .empty;
+        errdefer freeViews(gpa, list.items);
+
         const now = std.Io.Timestamp.now(self.io, .awake);
-        var out: std.ArrayList(JobView) = .empty;
-        errdefer freeViewsList(&out, gpa);
         for (self.jobs.items) |job| {
-            if (job.state.load(.acquire) != .running) continue;
-            const elapsed_ns: i128 = job.started.durationTo(now).nanoseconds;
-            try out.append(gpa, .{
+            const state = job.state.load(.acquire);
+            if (state != .running and state != .termination_requested) continue;
+            const elapsed = @as(u64, @intCast(@max(0, now.durationTo(job.started).toSeconds())));
+            const label = try gpa.dupe(u8, job.label);
+            errdefer gpa.free(label);
+            const command = try gpa.dupe(u8, job.command);
+            errdefer gpa.free(command);
+            const log_path = try gpa.dupe(u8, job.log_path);
+            errdefer gpa.free(log_path);
+
+            try list.append(gpa, .{
                 .id = job.id,
-                .label = try gpa.dupe(u8, job.label),
-                .command = try gpa.dupe(u8, job.command),
-                .log_path = try gpa.dupe(u8, job.log_path),
-                .elapsed_seconds = @intCast(@max(elapsed_ns, 0) / std.time.ns_per_s),
+                .label = label,
+                .command = command,
+                .log_path = log_path,
+                .elapsed_seconds = elapsed,
+                .terminating = state == .termination_requested,
             });
         }
-        return out.toOwnedSlice(gpa);
+        return list.toOwnedSlice(gpa);
     }
 
-    pub fn freeViews(gpa: std.mem.Allocator, views: []JobView) void {
-        for (views) |*view| {
-            gpa.free(view.label);
-            gpa.free(view.command);
-            gpa.free(view.log_path);
+    pub fn freeViews(gpa: std.mem.Allocator, views: []const JobView) void {
+        for (views) |v| {
+            gpa.free(v.label);
+            gpa.free(v.command);
+            gpa.free(v.log_path);
         }
         gpa.free(views);
     }
 
-    fn freeViewsList(list: *std.ArrayList(JobView), gpa: std.mem.Allocator) void {
-        for (list.items) |*view| {
-            gpa.free(view.label);
-            gpa.free(view.command);
-            gpa.free(view.log_path);
-        }
-        list.deinit(gpa);
-    }
-
-    /// How many jobs the manager is tracking (running plus finished-but-not-yet-
-    /// reported). The UI keeps its drain tick alive while this is non-zero.
+    /// Number of jobs currently active in the manager.
     pub fn activeCount(self: *BackgroundManager) usize {
         if (self.mutex.lock(self.io)) |_| {
             defer self.mutex.unlock(self.io);
@@ -484,13 +493,14 @@ pub const BackgroundManager = struct {
         }
     }
 
-    /// How many jobs are still running — the count shown in the footer.
+    /// Number of jobs visible as active, including termination requests still being reaped.
     pub fn runningCount(self: *BackgroundManager) usize {
         if (self.mutex.lock(self.io)) |_| {
             defer self.mutex.unlock(self.io);
             var count: usize = 0;
             for (self.jobs.items) |job| {
-                if (job.state.load(.acquire) == .running) count += 1;
+                const state = job.state.load(.acquire);
+                if (state == .running or state == .termination_requested) count += 1;
             }
             return count;
         } else |_| {
@@ -502,13 +512,14 @@ pub const BackgroundManager = struct {
     /// reader then reaps it and marks it finished+killed. Returns true if a
     /// running job matched. The actual kill runs outside the lock so it never stalls the UI's draw/poll path.
     pub fn cancel(self: *BackgroundManager, id: u32) bool {
-        var pid: ?i64 = null;
+        var target_job: ?*Job = null;
         if (self.mutex.lock(self.io)) |_| {
             for (self.jobs.items) |job| {
                 if (job.id != id) continue;
                 if (job.state.load(.acquire) == .running) {
                     job.killed.store(true, .release);
-                    pid = job.pid;
+                    job.state.store(.termination_requested, .release);
+                    target_job = job;
                 }
                 break;
             }
@@ -517,8 +528,8 @@ pub const BackgroundManager = struct {
             return false;
         }
 
-        if (pid) |p| {
-            terminateTree(self.io, self.gpa, p);
+        if (target_job) |job| {
+            terminateTree(self.io, self.gpa, job.pid, job);
             return true;
         }
         return false;
@@ -527,23 +538,25 @@ pub const BackgroundManager = struct {
     /// Terminate all running background jobs whose CWD is within `target_cwd`.
     /// Synchronously kills child processes to release file locks before directory deletion.
     pub fn terminateJobsInCwd(self: *BackgroundManager, target_cwd: []const u8) void {
-        var pids_to_kill: std.ArrayList(i64) = .empty;
-        defer pids_to_kill.deinit(self.gpa);
+        var jobs_to_kill: std.ArrayList(*Job) = .empty;
+        defer jobs_to_kill.deinit(self.gpa);
 
         if (self.mutex.lock(self.io)) |_| {
             for (self.jobs.items) |job| {
-                if (job.state.load(.acquire) == .running) {
+                const s = job.state.load(.acquire);
+                if (s == .running or s == .termination_requested) {
                     if (isSubpathOrEqual(job.cwd, target_cwd)) {
                         job.killed.store(true, .release);
-                        pids_to_kill.append(self.gpa, job.pid) catch {};
+                        job.state.store(.termination_requested, .release);
+                        jobs_to_kill.append(self.gpa, job) catch {};
                     }
                 }
             }
             self.mutex.unlock(self.io);
         } else |_| return;
 
-        for (pids_to_kill.items) |pid| {
-            terminateTreeSync(self.io, self.gpa, pid);
+        for (jobs_to_kill.items) |job| {
+            terminateTreeSync(self.io, self.gpa, job.pid, job);
         }
     }
 
@@ -597,7 +610,7 @@ pub const BackgroundManager = struct {
             .exit_code = job.exit_code,
             .killed = job.killed.load(.acquire),
             .completion_message = message,
-            .owner = job.owner,
+            .owner_generation = job.owner_generation,
         };
     }
 
@@ -608,9 +621,10 @@ pub const BackgroundManager = struct {
         self.jobs = .empty;
         self.mutex.unlock(self.io);
         for (list.items) |job| {
-            if (job.state.load(.acquire) == .running) {
+            const s = job.state.load(.acquire);
+            if (s == .running or s == .termination_requested) {
                 job.killed.store(true, .release);
-                terminateTree(self.io, self.gpa, job.pid);
+                terminateTreeSync(self.io, self.gpa, job.pid, job);
             }
             if (job.thread) |thread| {
                 thread.join();
@@ -633,6 +647,13 @@ pub const BackgroundManager = struct {
         destroyJob(gpa, io, job);
     }
 
+    fn cleanupFailedStartedJob(gpa: std.mem.Allocator, io: std.Io, job: *Job, thread: std.Thread) void {
+        job.killed.store(true, .release);
+        terminateTreeSync(io, gpa, job.pid, job);
+        thread.join();
+        destroyJob(gpa, io, job);
+    }
+
     fn destroyJob(gpa: std.mem.Allocator, io: std.Io, job: *Job) void {
         gpa.free(job.label);
         gpa.free(job.command);
@@ -641,6 +662,12 @@ pub const BackgroundManager = struct {
         if (job.script_path) |path| {
             std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
             gpa.free(path);
+        }
+        if (os.is_windows) {
+            if (job.win32_job_object) |h| {
+                _ = windows.CloseHandle(h);
+                job.win32_job_object = null;
+            }
         }
         job.tail.deinit(gpa);
         if (job.completion_message) |m| gpa.free(m);
@@ -683,31 +710,64 @@ fn writeBackgroundScript(gpa: std.mem.Allocator, io: std.Io, script: []const u8)
     // this cleanup silently.
     errdefer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
     defer file.close(io);
+    // Write UTF-8 BOM so Windows PowerShell 5.1 interprets UTF-8 properly:
+    try file.writeStreamingAll(io, "\xEF\xBB\xBF");
     try file.writeStreamingAll(io, script);
     return path;
 }
 
 /// Worker function to execute taskkill.exe synchronously.
-fn runTaskkillWorker(io: std.Io, pid: i64) void {
+fn runTaskkillWorker(io: std.Io, pid: i64) bool {
     const alloc = std.heap.page_allocator;
     var pid_buf: [32]u8 = undefined;
-    const pid_arg = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return;
+    const pid_arg = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch return false;
 
     const result = std.process.run(alloc, io, .{
         .argv = &.{ "taskkill.exe", "/F", "/T", "/PID", pid_arg },
         .stdout_limit = .limited(taskkill_output_limit),
         .stderr_limit = .limited(taskkill_output_limit),
         .timeout = bash.timeoutFromSeconds(5),
-    }) catch return;
+    }) catch return false;
     alloc.free(result.stdout);
     alloc.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
-/// Synchronously kill a job's whole process tree by pid.
-pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
+fn createWin32JobObject(process_handle: windows.HANDLE) ?windows.HANDLE {
+    if (!os.is_windows) return null;
+    const h = windows.CreateJobObjectW(null, null) orelse return null;
+    var info: windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (windows.SetInformationJobObject(
+        h,
+        windows.JobObjectExtendedLimitInformation,
+        &info,
+        @sizeOf(windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    if (windows.AssignProcessToJobObject(h, process_handle) == 0) {
+        _ = windows.CloseHandle(h);
+        return null;
+    }
+    return h;
+}
+
+/// Synchronously kill a job's whole process tree by pid or Job Object.
+pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: ?*BackgroundManager.Job) void {
     _ = gpa;
     if (os.is_windows) {
-        runTaskkillWorker(io, pid);
+        if (job_opt) |job| {
+            if (job.win32_job_object) |h| {
+                if (windows.TerminateJobObject(h, 1) != 0) return;
+            }
+        }
+        if (runTaskkillWorker(io, pid)) return;
+        if (job_opt) |job| job.child.kill(io);
         return;
     }
     if (!os.is_windows) {
@@ -719,33 +779,136 @@ pub fn terminateTreeSync(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
     }
 }
 
-/// Kill a job's whole process tree by pid. On Windows, offloads taskkill to a
-/// background worker thread so the TUI render loop is never blocked.
-/// Best-effort and side-effect free on the caller's data — runs outside the manager lock.
-fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64) void {
-    if (os.is_windows) {
-        if (std.Thread.spawn(.{}, runTaskkillWorker, .{ io, pid })) |thread| {
-            thread.detach();
-        } else |_| {
-            runTaskkillWorker(io, pid);
-        }
-        return;
-    }
-    terminateTreeSync(io, gpa, pid);
+/// Kill a job's whole process tree. On Windows, if a Job Object is attached,
+/// it terminates immediately in the kernel; otherwise runs synchronous/fallback taskkill.
+fn terminateTree(io: std.Io, gpa: std.mem.Allocator, pid: i64, job_opt: ?*BackgroundManager.Job) void {
+    terminateTreeSync(io, gpa, pid, job_opt);
 }
 
 fn processId(child: std.process.Child) i64 {
-    if (os.is_windows) return @intCast(windows.GetProcessId(child.id.?));
-    return @intCast(child.id.?);
+    if (comptime os.is_windows) {
+        return @intCast(windows.GetProcessId(child.id.?));
+    } else {
+        return @intCast(child.id.?);
+    }
 }
 
-/// Minimal Win32 surface — just the pid query, so the displayed/taskkill pid
-/// matches the real OS process. No Job Object or handle duplication: those
-/// disturb cygwin (see `terminateTree`).
-const windows = struct {
+/// Win32 surface for process ID and Job Object management (kill-on-close limits).
+const windows = if (os.is_windows) struct {
     const HANDLE = std.os.windows.HANDLE;
     const DWORD = std.os.windows.DWORD;
+    const BOOL = i32;
+    const LPVOID = ?*anyopaque;
+    const LPCWSTR = [*:0]const u16;
+    const SIZE_T = usize;
+    const ULONG_PTR = usize;
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: SIZE_T,
+        MaximumWorkingSetSize: SIZE_T,
+        ActiveProcessLimit: DWORD,
+        Affinity: ULONG_PTR,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: SIZE_T,
+        JobMemoryLimit: SIZE_T,
+        PeakProcessMemoryLimit: SIZE_T,
+        PeakJobMemoryLimit: SIZE_T,
+    };
+
     extern "kernel32" fn GetProcessId(Process: HANDLE) callconv(.winapi) DWORD;
+    extern "kernel32" fn CreateJobObjectW(lpJobAttributes: ?*anyopaque, lpName: ?LPCWSTR) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: DWORD,
+        lpJobObjectInformation: LPVOID,
+        cbJobObjectInformationLength: DWORD,
+    ) callconv(.winapi) BOOL;
+    extern "kernel32" fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn TerminateJobObject(hJob: HANDLE, uExitCode: DWORD) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+} else struct {
+    // Stub types for non-Windows (same type aliases, available on all platforms)
+    pub const HANDLE = std.os.windows.HANDLE;
+    pub const DWORD = std.os.windows.DWORD;
+    pub const BOOL = i32;
+    pub const LPVOID = ?*anyopaque;
+    pub const LPCWSTR = [*:0]const u16;
+    pub const SIZE_T = usize;
+    pub const ULONG_PTR = usize;
+
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x00002000;
+    pub const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    pub const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+
+    pub const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: SIZE_T,
+        MaximumWorkingSetSize: SIZE_T,
+        ActiveProcessLimit: DWORD,
+        Affinity: ULONG_PTR,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+
+    pub const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: SIZE_T,
+        JobMemoryLimit: SIZE_T,
+        PeakProcessMemoryLimit: SIZE_T,
+        PeakJobMemoryLimit: SIZE_T,
+    };
+
+    // Stub functions - never called on non-Windows (call sites guarded by comptime)
+    pub fn GetProcessId(_: HANDLE) DWORD {
+        unreachable;
+    }
+    pub fn CreateJobObjectW(_: ?*anyopaque, _: ?LPCWSTR) ?HANDLE {
+        unreachable;
+    }
+    pub fn SetInformationJobObject(_: HANDLE, _: DWORD, _: LPVOID, _: DWORD) BOOL {
+        unreachable;
+    }
+    pub fn AssignProcessToJobObject(_: HANDLE, _: HANDLE) BOOL {
+        unreachable;
+    }
+    pub fn TerminateJobObject(_: HANDLE, _: DWORD) BOOL {
+        unreachable;
+    }
+    pub fn CloseHandle(_: HANDLE) void {
+        unreachable;
+    }
 };
 
 pub fn isSubpathOrEqual(child: []const u8, parent: []const u8) bool {
@@ -823,7 +986,7 @@ test "BackgroundManager.start returns and the job completes" {
         .command = "true",
         .cwd = cwd,
         .env_map = &env_map,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         // Explicit bash options regardless of host, so this stays a pure
         // BackgroundManager test (shell-agnostic spawn plumbing is exercised
         // separately by the pwsh path guarded to Windows).
@@ -855,6 +1018,7 @@ test "BackgroundManager.start returns and the job completes" {
     try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
     try std.testing.expect(!finished[0].killed);
     try std.testing.expectEqual(@as(u32, 1), finished[0].id);
+    try std.testing.expectEqual(@as(u64, 1), finished[0].owner_generation);
 }
 
 test "BackgroundManager.start executes pwsh on Windows" {
@@ -874,7 +1038,7 @@ test "BackgroundManager.start executes pwsh on Windows" {
         .command = "Write-Output 'pwsh-bg-ok'",
         .cwd = cwd,
         .env_map = &env_map,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .shell_path = pws.shellPath(io),
         .command_mode = .stdin_dash_command,
         .stderr_merge_prefix = "",
@@ -903,6 +1067,7 @@ test "BackgroundManager.start executes pwsh on Windows" {
     try std.testing.expectEqual(@as(u8, 0), finished[0].exit_code);
     try std.testing.expect(!finished[0].killed);
     try std.testing.expectEqual(@as(u32, 1), finished[0].id);
+    try std.testing.expectEqual(@as(u64, 1), finished[0].owner_generation);
 
     // Verify log file output contains pwsh-bg-ok
     var log_file = try std.Io.Dir.openFileAbsolute(io, started.log_path, .{});
@@ -931,7 +1096,7 @@ test "BackgroundManager.cancel terminates long-running job" {
         .command = if (is_win) "Start-Sleep -Seconds 60" else "sleep 60",
         .cwd = cwd,
         .env_map = &env_map,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
         .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
         .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
@@ -981,7 +1146,7 @@ test "BackgroundManager handles instant command exit cleanly" {
         .command = if (is_win) "exit 0" else "true",
         .cwd = cwd,
         .env_map = &env_map,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .shell_path = if (is_win) pws.shellPath(io) else bash.shellPath(io),
         .command_mode = if (is_win) .stdin_dash_command else .argv_dash_c,
         .stderr_merge_prefix = if (is_win) "" else "exec 2>&1\n",
@@ -1053,7 +1218,7 @@ test "takeFinished compacts jobs list in-place and preserves unready jobs" {
         .cwd = try gpa.dupe(u8, "."),
         .log_path = try gpa.dupe(u8, "log1"),
         .pid = 101,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .started = std.Io.Timestamp.now(io, .awake),
         .child = undefined,
         .log_file = undefined,
@@ -1070,7 +1235,7 @@ test "takeFinished compacts jobs list in-place and preserves unready jobs" {
         .cwd = try gpa.dupe(u8, "."),
         .log_path = try gpa.dupe(u8, "log2"),
         .pid = 102,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .started = std.Io.Timestamp.now(io, .awake),
         .child = undefined,
         .log_file = undefined,
@@ -1087,7 +1252,7 @@ test "takeFinished compacts jobs list in-place and preserves unready jobs" {
         .cwd = try gpa.dupe(u8, "."),
         .log_path = try gpa.dupe(u8, "log3"),
         .pid = 103,
-        .owner = @as(*anyopaque, @ptrFromInt(1)),
+        .owner_generation = 1,
         .started = std.Io.Timestamp.now(io, .awake),
         .child = undefined,
         .log_file = undefined,
@@ -1116,9 +1281,27 @@ test "terminateTreeSync safely handles invalid and guarded pids" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     // Guarded PIDs (0, 1, negative) must be immediate no-ops and never panic or error.
-    terminateTreeSync(io, gpa, 0);
-    terminateTreeSync(io, gpa, 1);
-    terminateTreeSync(io, gpa, -1);
+    terminateTreeSync(io, gpa, 0, null);
+    terminateTreeSync(io, gpa, 1, null);
+    terminateTreeSync(io, gpa, -1, null);
+}
+
+test "writeBackgroundScript writes UTF-8 BOM" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = try writeBackgroundScript(gpa, io, "Write-Host 'test-bom'");
+    defer {
+        std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+        gpa.free(path);
+    }
+
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var buf: [3]u8 = undefined;
+    var reader_buf: [16]u8 = undefined;
+    var r = file.reader(io, &reader_buf);
+    _ = try r.interface.readSliceAll(&buf);
+    try std.testing.expectEqualSlices(u8, "\xEF\xBB\xBF", &buf);
 }
 
 test "writeLogChunk caps at quota and writes truncation notice" {
@@ -1139,7 +1322,7 @@ test "writeLogChunk caps at quota and writes truncation notice" {
         .cwd = undefined,
         .log_path = undefined,
         .pid = 0,
-        .owner = undefined,
+        .owner_generation = 1,
         .started = undefined,
         .child = undefined,
         .log_file = file,

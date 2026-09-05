@@ -6,6 +6,7 @@ pub const codex_responses = @import("ai/codex_responses.zig");
 pub const websocket = @import("websocket");
 pub const openai_compatible = @import("ai/openai_compatible.zig");
 pub const openai_responses = @import("ai/openai_responses.zig");
+pub const provider_headers = @import("ai/provider_headers.zig");
 pub const text_tool_call = @import("ai/text_tool_call.zig");
 
 pub const Tool = tools_common.Tool;
@@ -96,6 +97,7 @@ pub const WireDialect = enum {
             return switch (p) {
                 .openai => .openai,
                 .openrouter => .openrouter,
+                .alibaba => .dashscope,
                 else => .minimal,
             };
         }
@@ -105,7 +107,8 @@ pub const WireDialect = enum {
         if (std.mem.eql(u8, id_lower, "openai")) return .openai;
         if (std.mem.eql(u8, id_lower, "dashscope") or
             std.mem.eql(u8, id_lower, "qwen") or
-            std.mem.eql(u8, id_lower, "tongyi")) return .dashscope;
+            std.mem.eql(u8, id_lower, "tongyi") or
+            std.mem.eql(u8, id_lower, "alibaba")) return .dashscope;
         // 3. Base URL heuristic (covers user-defined providers).
         if (std.mem.indexOf(u8, base_url, "openrouter.ai") != null) return .openrouter;
         if (std.mem.indexOf(u8, base_url, "api.openai.com") != null) return .openai;
@@ -210,6 +213,14 @@ pub const Config = struct {
     retry_base_delay_ms: u64 = 500,
     account_id: []const u8 = "",
     session_id: []const u8 = "",
+    /// Resolved provider headers for this client: provider-required auto
+    /// headers (OpenCode Zen routing, OpenRouter attribution) merged with
+    /// the user's `providers.<name>.headers`, user winning on name
+    /// collision (`provider_headers.build`, called once at attach time —
+    /// `{env:VAR}` placeholders are already expanded by then). BORROWED at
+    /// init: each client deep-dupes what it keeps via
+    /// `provider_headers.cloneHeaders`.
+    headers: []const provider_headers.Header = &.{},
     system_prompt: []const u8 = "You are a helpful assistant.",
 };
 
@@ -683,8 +694,10 @@ pub const LanguageModel = union(enum) {
 
     pub fn lastErrorDetail(self: LanguageModel) ?[]const u8 {
         return switch (self) {
+            .none => null,
             .openai_compatible => |c| c.last_error_detail,
-            else => null,
+            .codex_responses => |c| c.core_client.last_error_detail,
+            .openai_responses => |c| c.core_client.last_error_detail,
         };
     }
 
@@ -745,6 +758,7 @@ test "WireDialect.resolve maps builtin providers correctly" {
     // Builtin enum takes priority.
     try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(.openai, "", ""));
     try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(.openrouter, "", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(.alibaba, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.ollama_cloud, "", ""));
     try std.testing.expectEqual(WireDialect.minimal, WireDialect.resolve(.cerebras, "", ""));
@@ -757,6 +771,7 @@ test "WireDialect.resolve maps dynamic provider ids" {
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "dashscope", ""));
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "qwen", ""));
     try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "tongyi", ""));
+    try std.testing.expectEqual(WireDialect.dashscope, WireDialect.resolve(null, "alibaba", ""));
     try std.testing.expectEqual(WireDialect.openrouter, WireDialect.resolve(null, "openrouter", ""));
     try std.testing.expectEqual(WireDialect.openai, WireDialect.resolve(null, "openai", ""));
     // DeepSeek and unknown → minimal.

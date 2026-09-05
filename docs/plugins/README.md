@@ -257,9 +257,7 @@ at load time and cannot be changed at runtime.
 | `file_access` | Allow file read/write via `io.*` | `false` |
 | `network_access` | Allow network access | `false` |
 | `require_others` | Allow requiring other plugins | `true` |
-| `allow_rawget_rawset` | Allow `rawget`/`rawset` (sandbox escape risk) | `false` |
 | `allow_os_execute` | Allow `os.execute` | `false` |
-| `allow_os_exit` | Allow `os.exit` | `false` |
 | `allow_os_remove` | Allow `os.remove`/`os.rename` | `false` |
 
 Embedded plugins (shipped with Nova) always get full access.
@@ -293,7 +291,7 @@ Plugins run in a restricted Lua environment. The following are available:
 - **Safe os subset**: `os.clock()`, `os.date()`, `os.time()`, `os.difftime()`
 
 The following are **blocked** by default: `io`, `debug`, `package`, `loadfile`,
-`dofile`, `rawget`, `rawset`, `os.execute`, `os.exit`, `os.remove`, `os.rename`.
+`dofile`, `os.execute`, `os.remove`, `os.rename`.
 
 Instead of blocked functions, use `nova.*` bridge functions:
 - Use `nova.read_file()` instead of `io.open()`

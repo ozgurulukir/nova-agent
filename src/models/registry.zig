@@ -19,6 +19,7 @@
 const std = @import("std");
 const http = @import("../http.zig");
 const log = std.log.scoped(.models);
+const config_provider = @import("../config/provider.zig");
 
 const cache_subdir = "models.dev";
 const cache_filename = "api.json";
@@ -33,26 +34,10 @@ const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const response_bytes_max: u32 = 4 * 1024 * 1024;
 
-pub const Adapter = enum {
-    codex_responses,
-    openai_compatible,
-};
+pub const Adapter = config_provider.AdapterKind;
 
-/// A single provider entry — either from builtins or models.dev.
-/// All string fields are borrowed from the registry's backing store;
-/// callers must not free them individually.
-pub const Provider = struct {
-    id: []const u8,
-    name: []const u8,
-    description: []const u8,
-    base_url: []const u8,
-    adapter: Adapter,
-    requires_api_key: bool,
-    /// OAuth flow (OpenAI Codex) instead of an API-key form.
-    oauth: bool = false,
-    /// Anonymous free-tier sentinel key (e.g. OpenCode Zen "public").
-    anonymous_key: ?[]const u8 = null,
-};
+/// Canonical provider entry — unified with config_mod.ProviderDef.
+pub const Provider = config_provider.ProviderDef;
 
 /// Per-model capability data extracted from the models.dev `api.json`.
 /// All string fields are borrowed from the registry's backing store.
@@ -127,152 +112,8 @@ fn segmentBoundary(model_id: []const u8, prefix_len: usize) bool {
 
 /// Builtin providers shipped with the binary. These always take precedence
 /// over models.dev entries with the same id.
-const builtin_defs = [_]struct {
-    id: []const u8,
-    name: []const u8,
-    description: []const u8,
-    base_url: []const u8,
-    adapter: Adapter,
-    requires_api_key: bool,
-    oauth: bool = false,
-    anonymous_key: ?[]const u8 = null,
-}{
-    .{
-        .id = "openai",
-        .name = "OpenAI Codex",
-        .description = "OpenAI ChatGPT & Codex OAuth authentication",
-        .base_url = "https://chatgpt.com/backend-api",
-        .adapter = .codex_responses,
-        .requires_api_key = false,
-        .oauth = true,
-    },
-    .{
-        .id = "openrouter",
-        .name = "OpenRouter",
-        .description = "Unified router for 200+ AI models",
-        .base_url = "https://openrouter.ai/api/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "cerebras",
-        .name = "Cerebras",
-        .description = "Ultra-fast Cerebras WSE-3 wafer inference",
-        .base_url = "https://api.cerebras.ai/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "ollama_cloud",
-        .name = "Ollama Cloud",
-        .description = "Hosted Ollama cloud model infrastructure",
-        .base_url = "https://ollama.com/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "huggingface",
-        .name = "HuggingFace",
-        .description = "HuggingFace Serverless Inference API",
-        .base_url = "https://router.huggingface.co/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "nvidia_nim",
-        .name = "Nvidia Nim",
-        .description = "NVIDIA NIM microservices & GPU platform",
-        .base_url = "https://integrate.api.nvidia.com/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "opencode_zen",
-        .name = "OpenCode Zen",
-        .description = "Free public OpenCode Zen endpoint",
-        .base_url = "https://opencode.ai/zen/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = false,
-        .anonymous_key = "public",
-    },
-    .{
-        .id = "deepseek",
-        .name = "DeepSeek",
-        .description = "DeepSeek AI models (DeepSeek-V3, DeepSeek-R1)",
-        .base_url = "https://api.deepseek.com",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "google",
-        .name = "Google Gemini",
-        .description = "Google Gemini models via OpenAI-compatible endpoint",
-        .base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "mistral",
-        .name = "Mistral AI",
-        .description = "Mistral AI models (Mistral Large, Codestral, Pixtral)",
-        .base_url = "https://api.mistral.ai/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "xai",
-        .name = "xAI Grok",
-        .description = "xAI Grok models (Grok-4, Grok-4.3)",
-        .base_url = "https://api.x.ai/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "perplexity",
-        .name = "Perplexity",
-        .description = "Perplexity AI models (Sonar, Sonar Pro)",
-        .base_url = "https://api.perplexity.ai",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "cohere",
-        .name = "Cohere",
-        .description = "Cohere Command models (Command R+, Command R7B)",
-        .base_url = "https://api.cohere.com/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-    .{
-        .id = "alibaba",
-        .name = "Alibaba Qwen",
-        .description = "Alibaba Cloud Qwen models (Qwen3, Qwen2.5)",
-        .base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        .adapter = .openai_compatible,
-        .requires_api_key = true,
-    },
-};
-
-/// Load the builtin providers. The returned slice borrows from a comptime
-/// constant — no allocation, no deinit needed.
 pub fn loadBuiltins() []const Provider {
-    const out = comptime blk: {
-        var buf: [builtin_defs.len]Provider = undefined;
-        for (&builtin_defs, 0..) |def, i| {
-            buf[i] = .{
-                .id = def.id,
-                .name = def.name,
-                .description = def.description,
-                .base_url = def.base_url,
-                .adapter = def.adapter,
-                .requires_api_key = def.requires_api_key,
-                .oauth = def.oauth,
-                .anonymous_key = def.anonymous_key,
-            };
-        }
-        break :blk buf;
-    };
-    return &out;
+    return &config_provider.builtin_providers;
 }
 
 /// Load the cached models.dev api.json if it exists and is younger than
@@ -429,17 +270,20 @@ fn appendString(gpa: std.mem.Allocator, strings: *std.ArrayList(u8), s: []const 
 }
 
 const UnresolvedProvider = struct {
+    provider: config_provider.Provider = .openai_compatible,
     id: StringRef,
     name: StringRef,
     description: StringRef,
     base_url: StringRef,
-    adapter: Adapter,
+    adapter: ?Adapter = .openai_compatible,
     requires_api_key: bool,
     oauth: bool = false,
     anonymous_key: ?StringRef = null,
+    catalogue: bool = false,
 
     fn resolve(self: UnresolvedProvider, buf: []const u8) Provider {
         return .{
+            .provider = self.provider,
             .id = self.id.slice(buf),
             .name = self.name.slice(buf),
             .description = self.description.slice(buf),
@@ -448,6 +292,7 @@ const UnresolvedProvider = struct {
             .requires_api_key = self.requires_api_key,
             .oauth = self.oauth,
             .anonymous_key = if (self.anonymous_key) |k| k.slice(buf) else null,
+            .catalogue = self.catalogue,
         };
     }
 };
@@ -478,6 +323,7 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
     // Builtins always come first and take precedence.
     for (builtins) |p| {
         try unresolved.append(gpa, .{
+            .provider = p.provider,
             .id = try appendString(gpa, &strings, p.id),
             .name = try appendString(gpa, &strings, p.name),
             .description = try appendString(gpa, &strings, p.description),
@@ -486,6 +332,7 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
             .requires_api_key = p.requires_api_key,
             .oauth = p.oauth,
             .anonymous_key = if (p.anonymous_key) |k| try appendString(gpa, &strings, k) else null,
+            .catalogue = p.catalogue,
         });
     }
 
@@ -493,6 +340,7 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
     for (remote_registry.providers) |p| {
         if (lookupBuiltin(builtins, p.id) != null) continue;
         try unresolved.append(gpa, .{
+            .provider = .openai_compatible,
             .id = try appendString(gpa, &strings, p.id),
             .name = try appendString(gpa, &strings, p.name),
             .description = try appendString(gpa, &strings, p.description),
@@ -501,6 +349,7 @@ pub fn buildRegistry(gpa: std.mem.Allocator, builtins: []const Provider, remote_
             .requires_api_key = p.requires_api_key,
             .oauth = p.oauth,
             .anonymous_key = if (p.anonymous_key) |k| try appendString(gpa, &strings, k) else null,
+            .catalogue = false,
         });
     }
 
@@ -779,7 +628,7 @@ test "loadBuiltins returns all providers" {
     try std.testing.expect(providers.len >= 14);
     try std.testing.expectEqualStrings("openai", providers[0].id);
     try std.testing.expectEqualStrings("OpenAI Codex", providers[0].name);
-    try std.testing.expectEqual(Adapter.codex_responses, providers[0].adapter);
+    try std.testing.expectEqual(Adapter.codex_responses, providers[0].adapter.?);
     try std.testing.expect(providers[0].oauth);
     try std.testing.expect(!providers[0].requires_api_key);
 }

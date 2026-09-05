@@ -134,11 +134,11 @@ pub fn validateArgs(
 /// properties, returning an owned re-serialized arguments JSON when any value
 /// changed (null when nothing did or the args aren't a parseable object).
 ///
-/// Some models emit numbers as strings despite the schema (`"offset":"130"`).
-/// Real tool-calling frameworks coerce these; without it such a call fails
-/// validation and the model loops retrying the same quoted value. Coercing
-/// before dispatch lets the tool actually run on inputs it can already handle
-/// (plugin handlers `math.floor` a string just fine). Non-numeric strings are
+/// Some models emit scalar values as strings despite the schema
+/// (`"timeout":"130"`, `"run_in_background":"true"`). Real tool-calling
+/// frameworks coerce these; without it such a call fails validation and the
+/// model loops retrying the same quoted value. Coercing before dispatch lets the
+/// tool actually run on inputs it can already handle. Unsupported strings are
 /// left untouched so validation still reports them clearly.
 pub fn coerceNumericStrings(
     gpa: std.mem.Allocator,
@@ -153,12 +153,19 @@ pub fn coerceNumericStrings(
 
     var changed = false;
     for (schema.properties) |prop| {
-        if (prop.kind != .integer and prop.kind != .number) continue;
         const v = parsed.value.object.getPtr(prop.name) orelse continue;
         if (v.* != .string) continue;
-        const num = coerceNumericString(v.string) orelse continue;
-        v.* = num;
-        changed = true;
+        if (prop.kind == .integer or prop.kind == .number) {
+            const num = coerceNumericString(v.string) orelse continue;
+            v.* = num;
+            changed = true;
+            continue;
+        }
+        if (prop.kind == .boolean) {
+            const boolean = coerceBooleanString(v.string) orelse continue;
+            v.* = .{ .bool = boolean };
+            changed = true;
+        }
     }
     if (!changed) return null;
 
@@ -179,6 +186,13 @@ fn coerceNumericString(s: []const u8) ?std.json.Value {
     if (std.fmt.parseFloat(f64, trimmed)) |f| {
         return .{ .float = f };
     } else |_| {}
+    return null;
+}
+
+fn coerceBooleanString(s: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, s, " \t");
+    if (std.mem.eql(u8, trimmed, "true")) return true;
+    if (std.mem.eql(u8, trimmed, "false")) return false;
     return null;
 }
 
@@ -544,4 +558,25 @@ test "coerceNumericStrings handles floats and string-typed fields" {
     const b = try coerceNumericStrings(gpa, number_schema, "{\"n\":1,\"s\":\"42\"}");
     defer if (b) |c| gpa.free(c);
     try std.testing.expect(b == null);
+}
+
+test "coerceNumericStrings converts quoted booleans for boolean props" {
+    const gpa = std.testing.allocator;
+    const boolean_schema: tools_common.Schema = .{
+        .properties = &.{
+            .{ .name = "run_in_background", .kind = .boolean, .description = "", .required = false },
+        },
+    };
+
+    const enabled = try coerceNumericStrings(gpa, boolean_schema, "{\"run_in_background\":\"true\"}");
+    defer if (enabled) |c| gpa.free(c);
+    try std.testing.expectEqualStrings("{\"run_in_background\":true}", enabled.?);
+
+    const disabled = try coerceNumericStrings(gpa, boolean_schema, "{\"run_in_background\":\"false\"}");
+    defer if (disabled) |c| gpa.free(c);
+    try std.testing.expectEqualStrings("{\"run_in_background\":false}", disabled.?);
+
+    const invalid = try coerceNumericStrings(gpa, boolean_schema, "{\"run_in_background\":\"yes\"}");
+    defer if (invalid) |c| gpa.free(c);
+    try std.testing.expect(invalid == null);
 }

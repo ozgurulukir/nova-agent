@@ -410,6 +410,10 @@ pub fn handleTextEditKey(app: *App, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
+        if (state.edit_target == .system_prompt) {
+            try app.input_buffers.settings_text.append(app.gpa, '\n');
+            return true;
+        }
         // Enter commits the text edit without saving to disk (user must
         // press Ctrl+S to persist). This gives a chance to edit multiple
         // fields before saving.
@@ -444,4 +448,54 @@ fn popSettingsTextInput(app: *App) void {
     var cut = items.len - 1;
     while (cut > 0 and (items[cut] & 0xC0) == 0x80) cut -= 1;
     app.input_buffers.settings_text.shrinkRetainingCapacity(cut);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const agent_mod = @import("../agent.zig");
+
+test "handleTextEditKey Enter inserts newline for system_prompt" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Set up text editing mode for system prompt
+    app.mode = .settings;
+    app.pickers.settings.edit_target = .system_prompt;
+
+    // Simulate Enter key
+    const handled = try handleTextEditKey(&app, .{ .codepoint = vaxis.Key.enter, .mods = .{} });
+
+    // It should have handled the key, the mode should still be system_prompt, and the buffer should have a newline
+    try std.testing.expect(handled);
+    try std.testing.expect(app.pickers.settings.edit_target == .system_prompt);
+    try std.testing.expectEqualStrings("\n", app.input_buffers.settings_text.items);
+}
+
+test "handleTextEditKey Enter commits for bash_classifier_url" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    // Set up text editing mode for bash_classifier_url
+    app.mode = .settings;
+    app.pickers.settings.edit_target = .bash_classifier_url;
+    try app.input_buffers.settings_text.appendSlice(gpa, "https://example.com");
+
+    // Simulate Enter key
+    const handled = try handleTextEditKey(&app, .{ .codepoint = vaxis.Key.enter, .mods = .{} });
+
+    // It should have handled the key, committed the text, and cleared the edit target
+    try std.testing.expect(handled);
+    try std.testing.expect(app.pickers.settings.edit_target == .none);
+    try std.testing.expectEqualStrings("https://example.com", app.pickers.settings.pending_bash_classifier_url.?);
+
+    // Free the committed allocated memory since we don't save to disk in this test
+    gpa.free(app.pickers.settings.pending_bash_classifier_url.?);
 }

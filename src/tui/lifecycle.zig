@@ -67,8 +67,8 @@ fn deinitWorkersTop(self: *App) void {
 /// bridge / request limiter.  Workers are already joined, so nothing here can
 /// be blocked on a permit or a bridge response.
 fn deinitSharedServices(self: *App) void {
-    // Jobs hold an opaque owner token that is never dereferenced, so this is
-    // independent of lane/agent teardown order.
+    // Jobs hold a stable lane generation, so this is independent of
+    // lane/agent teardown order.
     if (self.background) |manager| {
         manager.deinit();
         self.gpa.destroy(manager);
@@ -458,8 +458,10 @@ pub fn createParallelLane(self: *App) !void {
     self.io.random(&raw);
     const id = std.fmt.bytesToHex(raw, .lower);
 
-    const branch = try std.fmt.allocPrint(self.gpa, "nova/{s}", .{id[0..]});
+    const branch = try self.gpa.alloc(u8, "nova/".len + id.len);
     errdefer self.gpa.free(branch);
+    @memcpy(branch[0.."nova/".len], "nova/");
+    @memcpy(branch["nova/".len..], &id);
 
     // Worktrees live under the global `<home>/.config/nova/worktrees`, OUTSIDE the
     // repo, so `git add -A`/snapshots/`/save` never see them.
@@ -497,7 +499,7 @@ pub fn createParallelLane(self: *App) !void {
         dest,
         runtime,
     );
-    lane.generation = self.nextLaneGeneration();
+    _ = self.assignLaneGeneration(lane);
     try self.threads.append(lane);
     std.debug.assert(self.threads.len() <= max_threads);
 

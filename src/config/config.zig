@@ -31,6 +31,9 @@ pub const Model = provider_types.Model;
 pub const BaseUrl = provider_types.BaseUrl;
 pub const ReasoningSetting = provider_types.ReasoningSetting;
 pub const ProviderModel = provider_types.ProviderModel;
+pub const ProviderHeader = provider_types.ProviderHeader;
+pub const max_provider_headers = provider_types.max_provider_headers;
+pub const expandProviderHeaders = provider_types.expandProviderHeaders;
 pub const ProviderConfig = provider_types.ProviderConfig;
 pub const ModelSelectionRef = provider_types.ModelSelectionRef;
 pub const ModelSelection = provider_types.ModelSelection;
@@ -46,6 +49,7 @@ pub const cloneHeaders = mcp_types.cloneHeaders;
 pub const freeHeaders = mcp_types.freeHeaders;
 pub const mcpServerFromUrl = mcp_types.mcpServerFromUrl;
 pub const expandMcpServer = mcp_types.expandMcpServer;
+pub const expandEnvValue = mcp_types.expandEnvValue;
 
 // --- Plugin config re-exports ---
 
@@ -266,6 +270,16 @@ pub const Config = struct {
         return providers_by_name.get(name) orelse .openai_compatible;
     }
 
+    /// Raw (unexpanded, `{env:VAR}`-preserving) user headers configured under
+    /// `providers.<name>.headers`. Empty when the provider has none. Borrowed
+    /// from the config tree — expansion happens at AI-client attach time.
+    pub fn providerHeadersByName(self: *const Config, name: []const u8) []const ProviderHeader {
+        for (self.providers) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.headers;
+        }
+        return &.{};
+    }
+
     pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         if (self.version) |s| gpa.free(s);
         if (self.provider_name) |s| gpa.free(s);
@@ -329,14 +343,14 @@ pub const Config = struct {
             const major = parse_mod.parseSemverMajor(v) orelse {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "version"),
-                    .reason = try std.fmt.allocPrint(gpa, "invalid semver '{s}'", .{v}),
+                    .reason = try formatReason(gpa, "invalid semver '{s}'", .{v}),
                 } });
                 return try list.toOwnedSlice(gpa);
             };
             if (major > 2) {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "version"),
-                    .reason = try std.fmt.allocPrint(gpa, "unsupported schema version {s}", .{v}),
+                    .reason = try formatReason(gpa, "unsupported schema version {s}", .{v}),
                 } });
             }
         }
@@ -344,11 +358,20 @@ pub const Config = struct {
             if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
                 try list.append(gpa, .{ .config_parse_error = .{
                     .path = try gpa.dupe(u8, "base_url"),
-                    .reason = try std.fmt.allocPrint(gpa, "invalid URL scheme in '{s}'", .{url}),
+                    .reason = try formatReason(gpa, "invalid URL scheme in '{s}'", .{url}),
                 } });
             }
         }
         return try list.toOwnedSlice(gpa);
+    }
+
+    fn formatReason(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]u8 {
+        var buf: [256]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, fmt, args)) |formatted| {
+            return gpa.dupe(u8, formatted);
+        } else |_| {
+            return std.fmt.allocPrint(gpa, fmt, args);
+        }
     }
 
     /// Alias for `clone`, used by `nova.run` to hand the TUI an owned

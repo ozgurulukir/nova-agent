@@ -152,6 +152,9 @@ fn writeScriptTemp(gpa: std.mem.Allocator, io: std.Io, script: []const u8) ![]u8
     errdefer gpa.free(path);
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
+    // Prefix UTF-8 BOM (\xEF\xBB\xBF) so Windows PowerShell 5.1 interprets the
+    // script as UTF-8 rather than ANSI/Windows-1252, while PowerShell 7+ handles it seamlessly.
+    try file.writeStreamingAll(io, "\xEF\xBB\xBF");
     try file.writeStreamingAll(io, script);
     return path;
 }
@@ -456,16 +459,22 @@ pub fn loginEnvBlock(io: std.Io) ?[]const u8 {
 /// POSIX-only no-op: there is no MSYS2/Cygwin pseudo-console to disable.
 pub fn disablePseudoConsole() void {}
 
+var pwsh_mutex: std.Io.Mutex = .init;
 var pwsh_path_value: ?[]const u8 = null;
 
 /// The resolved PowerShell executable path (`pwsh.exe` → `powershell.exe` on
 /// Windows, `"pwsh"` elsewhere as a harmless never-called fallback). Exposed so
 /// the `BackgroundManager` spawns the same shell as foreground runs.
 pub fn shellPath(io: std.Io) []const u8 {
-    if (pwsh_path_value) |p| return p;
-    const resolved = resolvePwshPath(io);
-    pwsh_path_value = resolved;
-    return resolved;
+    if (pwsh_mutex.lock(io)) |_| {
+        defer pwsh_mutex.unlock(io);
+        if (pwsh_path_value) |p| return p;
+        const resolved = resolvePwshPath(io);
+        pwsh_path_value = resolved;
+        return resolved;
+    } else |_| {
+        return if (pwsh_path_value) |p| p else "pwsh.exe";
+    }
 }
 
 fn resolvePwshPath(io: std.Io) []const u8 {

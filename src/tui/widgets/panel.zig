@@ -388,7 +388,7 @@ fn testSurface(arena: std.mem.Allocator, width: u16, height: u16) !vxfw.Surface 
 
 /// Reconstruct a row's written graphemes, skipping default (never-written)
 /// cells, so tests can assert on the rendered text without inspecting styles.
-fn readRow(surface: *const vxfw.Surface, row: u16, out: []u8) []const u8 {
+pub fn readRow(surface: *const vxfw.Surface, row: u16, out: []u8) []const u8 {
     var len: usize = 0;
     var col: u16 = 0;
     while (col < surface.size.width) : (col += 1) {
