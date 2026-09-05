@@ -658,20 +658,35 @@ pub fn StreamObserver(comptime Ctx: type) type {
 
 var noop_ctx: NoopCtx = .{};
 
-/// Noop stream observer for fire-and-forget prompts. Use `streamNoop()`.
-pub fn streamNoop() StreamObserver(NoopCtx) {
-    return .{
-        .ctx = &noop_ctx,
-        .on_content = noopBytes,
-        .on_reasoning = noopBytes,
-        .on_tool_delta = noopToolDelta,
-        .on_delta_end = noopVoid,
+/// Noop callbacks typed over any context — the fillers behind `noopObserver`
+/// (and `streamNoop`). Test fixtures with one or two real handlers build on
+/// `noopObserver` and override only the slots they observe.
+fn NoopFns(comptime Ctx: type) type {
+    return struct {
+        fn noopBytes(_: *Ctx, _: []const u8) anyerror!void {}
+        fn noopToolDelta(_: *Ctx, _: ToolDelta) anyerror!void {}
+        fn noopVoid(_: *Ctx) anyerror!void {}
     };
 }
 
-fn noopBytes(_: *NoopCtx, _: []const u8) anyerror!void {}
-fn noopToolDelta(_: *NoopCtx, _: ToolDelta) anyerror!void {}
-fn noopVoid(_: *NoopCtx) anyerror!void {}
+/// A `StreamObserver(Ctx)` whose four slots are noops. The production
+/// fire-and-forget path is `streamNoop()`; test fixtures with a real
+/// handler override individual slots on the returned value.
+pub fn noopObserver(comptime Ctx: type, ctx: *Ctx) StreamObserver(Ctx) {
+    const Fns = NoopFns(Ctx);
+    return .{
+        .ctx = ctx,
+        .on_content = Fns.noopBytes,
+        .on_reasoning = Fns.noopBytes,
+        .on_tool_delta = Fns.noopToolDelta,
+        .on_delta_end = Fns.noopVoid,
+    };
+}
+
+/// Noop stream observer for fire-and-forget prompts. Use `streamNoop()`.
+pub fn streamNoop() StreamObserver(NoopCtx) {
+    return noopObserver(NoopCtx, &noop_ctx);
+}
 
 pub const LanguageModel = union(enum) {
     none,
@@ -815,4 +830,23 @@ test "WireDialect capability gates" {
     try std.testing.expect(!WireDialect.openai.usesEnableThinking());
     try std.testing.expect(!WireDialect.openrouter.usesEnableThinking());
     try std.testing.expect(!WireDialect.minimal.usesEnableThinking());
+}
+
+test "noopObserver fills every slot and overrides compose" {
+    const Seen = struct {
+        content_count: u32 = 0,
+
+        fn onContent(ctx: *@This(), _: []const u8) anyerror!void {
+            ctx.content_count += 1;
+        }
+    };
+    var seen: Seen = .{};
+    var observer = noopObserver(Seen, &seen);
+    try observer.on_reasoning(observer.ctx, "ignored");
+    try observer.on_tool_delta(observer.ctx, .{ .index = 0, .name = "bash", .arguments = "{}" });
+    try observer.on_delta_end(observer.ctx);
+    try std.testing.expectEqual(@as(u32, 0), seen.content_count);
+    observer.on_content = Seen.onContent;
+    try observer.on_content(observer.ctx, "counted");
+    try std.testing.expectEqual(@as(u32, 1), seen.content_count);
 }

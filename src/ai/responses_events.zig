@@ -500,19 +500,11 @@ test "openresponses emits final item text when no delta arrived" {
         fn onContent(ctx: *@This(), delta: []const u8) anyerror!void {
             try ctx.text.appendSlice(std.testing.allocator, delta);
         }
-        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
-        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
-        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{};
     defer seen.deinit(gpa);
-    const observer: ai.StreamObserver(Seen) = .{
-        .ctx = &seen,
-        .on_content = Seen.onContent,
-        .on_reasoning = Seen.noopBytes,
-        .on_tool_delta = Seen.noopToolDelta,
-        .on_delta_end = Seen.noopVoid,
-    };
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_content = Seen.onContent;
 
     var call_seq: u64 = 0;
     try state.processJson(gpa, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}", observer, &call_seq);

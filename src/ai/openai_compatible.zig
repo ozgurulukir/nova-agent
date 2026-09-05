@@ -1353,17 +1353,10 @@ test "parse streaming tool deltas as they arrive" {
             ctx.name = delta.name;
             ctx.arguments = delta.arguments;
         }
-        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
-        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{};
-    const observer: ai.StreamObserver(Seen) = .{
-        .ctx = &seen,
-        .on_content = Seen.noopBytes,
-        .on_reasoning = Seen.noopBytes,
-        .on_tool_delta = Seen.onToolDelta,
-        .on_delta_end = Seen.noopVoid,
-    };
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_tool_delta = Seen.onToolDelta;
 
     try stream_parser.processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"zig"}}]}}]}
@@ -1416,16 +1409,11 @@ test "parse streaming tool deltas batches render notification per event" {
         fn onDeltaEnd(ctx: *@This()) anyerror!void {
             ctx.render_count += 1;
         }
-        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
     };
     var seen: Seen = .{};
-    const observer: ai.StreamObserver(Seen) = .{
-        .ctx = &seen,
-        .on_content = Seen.noopBytes,
-        .on_reasoning = Seen.noopBytes,
-        .on_tool_delta = Seen.onToolDelta,
-        .on_delta_end = Seen.onDeltaEnd,
-    };
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_tool_delta = Seen.onToolDelta;
+    observer.on_delta_end = Seen.onDeltaEnd;
 
     try stream_parser.processStreamChunk(gpa,
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}},{"index":1,"id":"call_2","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}
@@ -1455,19 +1443,11 @@ test "parse streaming reasoning deltas as they arrive" {
         fn onReasoning(ctx: *@This(), delta: []const u8) anyerror!void {
             try ctx.reasoning.appendSlice(ctx.gpa, delta);
         }
-        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
-        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
-        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
-    const observer: ai.StreamObserver(Seen) = .{
-        .ctx = &seen,
-        .on_content = Seen.noopBytes,
-        .on_reasoning = Seen.onReasoning,
-        .on_tool_delta = Seen.noopToolDelta,
-        .on_delta_end = Seen.noopVoid,
-    };
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_reasoning = Seen.onReasoning;
 
     try stream_parser.processStreamChunk(gpa,
         \\{"choices":[{"delta":{"reasoning_content":"checking output"}}]}
@@ -1497,19 +1477,11 @@ test "parse streaming content deltas as they arrive" {
         fn onContent(ctx: *@This(), delta: []const u8) anyerror!void {
             try ctx.content.appendSlice(ctx.gpa, delta);
         }
-        fn noopBytes(_: *@This(), _: []const u8) anyerror!void {}
-        fn noopToolDelta(_: *@This(), _: ai.ToolDelta) anyerror!void {}
-        fn noopVoid(_: *@This()) anyerror!void {}
     };
     var seen: Seen = .{ .gpa = gpa };
     defer seen.deinit();
-    const observer: ai.StreamObserver(Seen) = .{
-        .ctx = &seen,
-        .on_content = Seen.onContent,
-        .on_reasoning = Seen.noopBytes,
-        .on_tool_delta = Seen.noopToolDelta,
-        .on_delta_end = Seen.noopVoid,
-    };
+    var observer = ai.noopObserver(Seen, &seen);
+    observer.on_content = Seen.onContent;
 
     try stream_parser.processStreamChunk(gpa,
         \\{"choices":[{"delta":{"content":"hel"}}]}
