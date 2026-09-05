@@ -276,33 +276,29 @@ fn isDangerousClearRecycleBin(command: []const u8) bool {
 }
 
 /// Case-insensitive substring search over ASCII (command text is shell code,
-/// which never needs Unicode folding).
+/// which never needs Unicode folding). Deliberately a named wrapper at the
+/// classifier's call sites; `std.ascii.findIgnoreCase` folds ASCII-only, which
+/// is exactly the old hand-rolled loop's semantics (empty needle matches).
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (eqlIgnoreCaseAscii(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 /// Case-insensitive search returning the first match position, or null.
 fn findIgnoreCaseFrom(haystack: []const u8, needle: []const u8, from: usize) ?usize {
     if (from >= haystack.len) return null;
-    var i = from;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (eqlIgnoreCaseAscii(haystack[i .. i + needle.len], needle)) return i;
-    }
-    return null;
+    return std.ascii.findIgnoreCasePos(haystack, from, needle);
 }
 
-fn eqlIgnoreCaseAscii(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
+test "containsIgnoreCase: empty needle matches, case folded" {
+    try std.testing.expect(containsIgnoreCase("Remove-Item", ""));
+    try std.testing.expect(containsIgnoreCase("rm -RF /", "-rf"));
+    try std.testing.expect(!containsIgnoreCase("rm", "-rf"));
+}
+
+test "findIgnoreCaseFrom: past-end returns null, finds later occurrence" {
+    try std.testing.expectEqual(@as(?usize, null), findIgnoreCaseFrom("abc", "x", 10));
+    try std.testing.expectEqual(@as(?usize, 2), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 2));
+    try std.testing.expectEqual(@as(?usize, 16), findIgnoreCaseFrom("a REMOVE-ITEM b REMOVE-ITEM", "remove-item", 3));
 }
 
 /// Check for `rm -rf /`, `rm -rf /*`, `rm -rf --no-preserve-root /` etc.

@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const session_mod = @import("../../session.zig");
+const command_panel = @import("command_panel.zig");
 const message = @import("message.zig");
 const panel = @import("panel.zig");
 const tui_style = @import("../style.zig");
@@ -548,15 +549,9 @@ fn isCheckpointRecord(record: session_mod.EntryRecord) bool {
     return std.mem.eql(u8, record.kind, "checkpoint");
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
+// Shared case-insensitive filter match (command_panel is the widget-side SSOT);
+// empty needle matches, matching the previous hand-rolled loop.
+const containsIgnoreCase = command_panel.containsIgnoreCase;
 
 pub const Content = struct {
     state: *TreeState,
