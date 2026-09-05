@@ -193,6 +193,25 @@ test "input text rows track the line count" {
     try std.testing.expectEqual(@as(u16, 12), try app.inputTextRows(ctx, 4));
 }
 
+test "file picker selection replaces the active mention without corrupting input buffer" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("open @src/ag");
+    const query = try gpa.dupe(u8, "src/ag");
+    app.at_search = .{ .open = .{ .kind = .file, .query = query } };
+    try app.at_search.open.results.append(gpa, try gpa.dupe(u8, "src/search.zig"));
+
+    try app.acceptAtSelection();
+
+    const input = try app.peekInput();
+    defer gpa.free(input);
+    try std.testing.expectEqualStrings("open @src/search.zig ", input);
+}
+
 test "input wrapping uses word breaks" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

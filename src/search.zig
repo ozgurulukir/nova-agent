@@ -9,6 +9,7 @@
 //! "indexing…" state instead of blocking.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 
 const assert = std.debug.assert;
@@ -214,6 +215,13 @@ const Backend = struct {
     }
 };
 
+fn isAbsoluteSearchPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (path[0] == '/' or path[0] == '\\') return true;
+    return builtin.os.tag == .windows and path.len >= 3 and
+        path[1] == ':' and (path[2] == '/' or path[2] == '\\');
+}
+
 pub var backend: Backend = .{};
 
 fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.Value(bool)) InitOutcome {
@@ -226,7 +234,10 @@ fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.
     errdefer files.deinit(gpa);
     var count: usize = 0;
 
-    var dir = std.Io.Dir.openDir(.cwd(), io, cwd, .{ .iterate = true }) catch |err| {
+    var dir = (if (isAbsoluteSearchPath(cwd))
+        std.Io.Dir.openDirAbsolute(io, cwd, .{ .iterate = true })
+    else
+        std.Io.Dir.openDir(.cwd(), io, cwd, .{ .iterate = true })) catch |err| {
         return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
     };
     defer dir.close(io);
@@ -506,6 +517,17 @@ fn runReadyBackend(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Resul
     return try runFind(gpa, request, files, count);
 }
 
+fn scorePath(query: [*:0]const u8, path_ptr: [*]const u8) ?c.score_t {
+    const path: [*:0]const u8 = @ptrCast(path_ptr);
+    const path_slice = std.mem.span(path);
+    const basename_start = (std.mem.lastIndexOfAny(u8, path_slice, "/\\\\") orelse 0);
+    const basename: [*:0]const u8 = @ptrCast(path_ptr + basename_start);
+
+    const full_score: ?c.score_t = if (c.has_match(query, path) != 0) c.match(query, path) else null;
+    const basename_score: ?c.score_t = if (c.has_match(query, basename) != 0) c.match(query, basename) else null;
+    return if (full_score) |score| if (basename_score) |name_score| @max(score, name_score) else score else basename_score;
+}
+
 /// Score every indexed path against the query with fzy and return the top
 /// `page_size` matches, honoring the cursor for pagination.
 fn runFind(gpa: std.mem.Allocator, request: Request, files: []const u8, count: usize) !Result {
@@ -530,8 +552,8 @@ fn runFind(gpa: std.mem.Allocator, request: Request, files: []const u8, count: u
             // Empty query: include every file with a neutral score so results
             // stay in walk order (the sort below is stable for equal scores).
             try scored.append(gpa, .{ .score = 0, .index = i });
-        } else if (c.has_match(query_c.ptr, path_ptr) != 0) {
-            try scored.append(gpa, .{ .score = c.match(query_c.ptr, path_ptr), .index = i });
+        } else if (scorePath(query_c.ptr, path_ptr)) |score| {
+            try scored.append(gpa, .{ .score = score, .index = i });
         }
     }
 

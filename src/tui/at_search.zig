@@ -183,6 +183,8 @@ pub fn acceptAtSelection(app: *App) !void {
     const sigil: u8 = if (o.kind == .file) '@' else '$';
     const insert = try std.fmt.allocPrint(app.gpa, "{c}{s} ", .{ sigil, value });
     defer app.gpa.free(insert);
+    // `active_start` points at the sigil itself. Remove the sigil and typed
+    // query before inserting the selected value with its replacement sigil.
     app.inputs.input.buf.growGapLeft(before.len - active_start);
     try app.inputs.input.insertSliceAtCursor(insert);
     closeAtSearch(app);
