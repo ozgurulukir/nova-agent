@@ -2,7 +2,6 @@ const std = @import("std");
 const log = std.log.scoped(.ai);
 
 const ai = @import("../ai.zig");
-const os = @import("../os.zig");
 const http = @import("../http.zig");
 const model_catalog = @import("openai_compatible_models.zig");
 const openai_endpoint = @import("openai_endpoint.zig");
@@ -18,12 +17,6 @@ const body_buffer_bytes = http.body_buffer_bytes;
 /// Upper bound on an error body we will decompress + log (matches the models
 /// client's cap). Prevents a hostile/garbage body from allocating unboundedly.
 const response_bytes_max: u32 = 1 * 1024 * 1024;
-/// Upper bound on exponential retry backoff, in milliseconds. A server-sent
-/// `Retry-After` header is honored verbatim (not capped here).
-const retry_max_delay_ms: u64 = 8000;
-/// Raw-body fallback cap for `extractErrorMessage` when the error body is not
-/// JSON or carries none of the known message shapes.
-const error_detail_cap_bytes: usize = 600;
 
 pub const ModelEntry = model_catalog.ModelEntry;
 pub const listModels = model_catalog.listModels;
@@ -79,8 +72,8 @@ pub const Client = struct {
         io: std.Io,
         config: ai.Config,
     ) !void {
-        std.debug.assert(config.base_url.len > 0);
-        std.debug.assert(config.model.len > 0);
+        if (config.base_url.len == 0) return error.EmptyBaseUrl;
+        if (config.model.len == 0) return error.EmptyModelId;
 
         const v1_root = try openaiV1Root(gpa, config.base_url);
         defer gpa.free(v1_root);
@@ -176,7 +169,7 @@ pub const Client = struct {
     /// Record `HTTP <status>: <message>` from a failed response body for the UI.
     /// Best-effort: a failure to build the string just leaves the detail unset.
     fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
-        const message = extractErrorMessage(self.gpa, body) catch return;
+        const message = http.extractErrorMessage(self.gpa, body) catch return;
         defer self.gpa.free(message);
         log.warn("openai_compatible.recordErrorDetail status={d} body={s}", .{ status_code, message });
         const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
@@ -358,8 +351,8 @@ pub const Client = struct {
         if (status_code >= 400) {
             // Read `Retry-After` before initializing the body reader — the
             // head pointers are invalidated once the body stream starts.
-            if (isRetryableHeadStatus(status_code)) {
-                retry_after_secs.* = parseRetryAfterSeconds(http_response.head.bytes);
+            if (http.isRetryableHeadStatus(status_code)) {
+                retry_after_secs.* = http.parseRetryAfterSeconds(http_response.head.bytes);
             }
             // The error body (e.g. a 403 from a Cloudflare-fronted host) may be
             // gzip/deflate-compressed (the only encodings this client
@@ -390,23 +383,7 @@ pub const Client = struct {
         // Windows: `Io.Threaded` opens sockets through the AFD driver, so
         // socket handles are not ws2_32 SOCKETs and setsockopt always fails
         // (WSAENOTSOCK) — skip it rather than warn on every request.
-        if (!os.is_windows) {
-            if (req.connection) |conn| {
-                const tv: std.posix.timeval = .{
-                    .sec = @intCast(self.config.request_timeout_seconds),
-                    .usec = 0,
-                };
-                if (std.c.setsockopt(
-                    conn.stream_reader.stream.socket.handle,
-                    std.posix.SOL.SOCKET,
-                    std.posix.SO.RCVTIMEO,
-                    @ptrCast(std.mem.asBytes(&tv)),
-                    @intCast(@sizeOf(std.posix.timeval)),
-                ) != 0) {
-                    log.warn("openai_compatible.setsockopt.RCVTIMEO failed", .{});
-                }
-            }
-        }
+        if (req.connection) |conn| http.setSocketTimeout(conn, self.config.request_timeout_seconds);
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -446,19 +423,7 @@ pub const Client = struct {
     /// retry loop reconnects and re-sends, so the user sees nothing.
     fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
         _ = self;
-        return switch (err) {
-            error.ReadFailed,
-            error.WriteFailed,
-            error.EndOfStream,
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.BrokenPipe,
-            error.HttpConnectionClosing,
-            error.Unexpected,
-            => error.ConnectionFailed,
-            else => err,
-        };
+        return http.headPhaseFailure(err);
     }
 
     /// Record the underlying socket error from a dropped response read for
@@ -475,21 +440,10 @@ pub const Client = struct {
         self.last_error_detail = detail;
     }
 
-    /// Delay before a retry: the server's `Retry-After` (integer seconds)
-    /// when present, otherwise exponential backoff `base * 2^attempt` capped
-    /// at `retry_max_delay_ms`. Pure — tested directly.
+    /// Delay before a retry — the shared backoff policy in `http.zig` so the
+    /// chat-completions and Responses clients stay in lockstep.
     fn retryDelayMs(self: *const Client, attempt: u32, retry_after_secs: ?u64) u64 {
-        if (retry_after_secs) |secs| {
-            // Saturating: an absurd header value must not wrap and stall or
-            // skip the wait.
-            return secs *| std.time.ms_per_s;
-        }
-        // Exponential backoff `base * 2^attempt`, saturating so an absurd
-        // base can't wrap, then capped.
-        var backoff = self.config.retry_base_delay_ms;
-        var i: u32 = 0;
-        while (i < attempt) : (i += 1) backoff *|= 2;
-        return @min(backoff, retry_max_delay_ms);
+        return http.retryDelayMs(self.config.retry_base_delay_ms, attempt, retry_after_secs);
     }
 
     /// Block the worker for the backoff delay. Best-effort — a cancel error
@@ -500,29 +454,6 @@ pub const Client = struct {
         self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake) catch {};
     }
 };
-
-/// Head-phase statuses worth retrying: 429 (rate limit) and 5xx (server). The
-/// error returns keep 429 → HttpRateLimited and 5xx → HttpServerError as
-/// distinct errors; this predicate only gates the shared `Retry-After` read.
-fn isRetryableHeadStatus(status: u16) bool {
-    return status == 429 or status >= 500;
-}
-
-/// Extract an integer-seconds `Retry-After` value from a raw HTTP head.
-/// HTTP-date formatted values are out of scope and yield null (gateways
-/// practically send integer seconds). Pure — tested directly.
-fn parseRetryAfterSeconds(head_bytes: []const u8) ?u64 {
-    var it = std.mem.splitSequence(u8, head_bytes, "\r\n");
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        if (!std.ascii.eqlIgnoreCase(name, "retry-after")) continue;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        return std.fmt.parseInt(u64, value, 10) catch null;
-    }
-    return null;
-}
 
 /// Truncate a request/response body for logging. When the body exceeds
 /// `limit`, keep the head AND append a tail slice so the `tools` array
@@ -553,57 +484,6 @@ fn logBytes(gpa: std.mem.Allocator, bytes: []const u8) ![]const u8 {
         }
     }
     return std.fmt.allocPrint(gpa, "{s}\n   [...{d} more bytes]", .{ bytes[0..limit], bytes.len - limit });
-}
-
-/// Pull a human-readable message out of an error response body. Handles the
-/// common OpenAI-ish shapes — `{"error":{"message":...}}`, `{"error":"..."}`,
-/// `{"message":...}` — and falls back to the raw body (capped) when the body
-/// isn't JSON or has none of those. Returned slice is owned by `gpa`.
-fn extractErrorMessage(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
-    const trimmed = std.mem.trim(u8, body, " \t\r\n");
-    const fallback = trimmed[0..@min(trimmed.len, error_detail_cap_bytes)];
-
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch
-        return gpa.dupe(u8, if (fallback.len > 0) fallback else "(empty response body)");
-    defer parsed.deinit();
-
-    if (parsed.value == .object) {
-        const obj = parsed.value.object;
-        if (obj.get("error")) |err_val| switch (err_val) {
-            .string => |s| return gpa.dupe(u8, s),
-            .object => |eo| if (eo.get("message")) |m| {
-                if (m == .string) return gpa.dupe(u8, m.string);
-            },
-            else => {},
-        };
-        if (obj.get("message")) |m| {
-            if (m == .string) return gpa.dupe(u8, m.string);
-        }
-    }
-    return gpa.dupe(u8, if (fallback.len > 0) fallback else "(empty response body)");
-}
-
-test "extractErrorMessage pulls the nested message, plain error, or raw fallback" {
-    const gpa = std.testing.allocator;
-
-    // OpenCode Zen's shape: {"type":"error","error":{"type":...,"message":...}}
-    const zen = try extractErrorMessage(gpa,
-        \\{"type":"error","error":{"type":"ModelError","message":"Free promotion has ended."}}
-    );
-    defer gpa.free(zen);
-    try std.testing.expectEqualStrings("Free promotion has ended.", zen);
-
-    // `error` as a bare string.
-    const plain = try extractErrorMessage(gpa,
-        \\{"error":"invalid api key"}
-    );
-    defer gpa.free(plain);
-    try std.testing.expectEqualStrings("invalid api key", plain);
-
-    // Non-JSON body falls back to the raw text.
-    const raw = try extractErrorMessage(gpa, "  upstream timeout  ");
-    defer gpa.free(raw);
-    try std.testing.expectEqualStrings("upstream timeout", raw);
 }
 
 test "logBytes passes short bodies through untouched (no allocation)" {
@@ -692,6 +572,33 @@ test "errorDetailMentionsCache is case-insensitive and handles null" {
     try std.testing.expect(!client.errorDetailMentionsCache());
     gpa.free(client.last_error_detail.?);
     client.last_error_detail = null;
+}
+
+test "Client.init rejects an empty base_url with EmptyBaseUrl" {
+    // A missing base_url is a config error, not a programming precondition —
+    // the guard must be a real early return (it survives into ReleaseFast,
+    // where `std.debug.assert` would be UB).
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try std.testing.expectError(error.EmptyBaseUrl, client.init(gpa, std.testing.io, .{
+        .base_url = "",
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+    }));
+}
+
+test "Client.init rejects an empty model id with EmptyModelId" {
+    const gpa = std.testing.allocator;
+    var client: Client = undefined;
+    try std.testing.expectError(error.EmptyModelId, client.init(gpa, std.testing.io, .{
+        .base_url = "http://localhost:8080/v1",
+        .api_key = "test-key",
+        .model = "",
+        .tools = &.{},
+        .mcp_tools = &.{},
+    }));
 }
 
 test "buildToolsJson produces a valid JSON array for the registry" {
@@ -1674,16 +1581,6 @@ test "parse streaming duplicate ID across indices merges into one builder" {
 
 // ── Retry / backoff ───────────────────────────────────────────────────────
 
-test "parseRetryAfterSeconds extracts integer seconds from a head" {
-    try std.testing.expectEqual(@as(?u64, 5), parseRetryAfterSeconds("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n"));
-    // Header name is case-insensitive.
-    try std.testing.expectEqual(@as(?u64, 2), parseRetryAfterSeconds("HTTP/1.1 503 Service Unavailable\r\nretry-after: 2\r\n\r\n"));
-    // Missing header → null.
-    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("HTTP/1.1 200 OK\r\n\r\n"));
-    // HTTP-date value → null (integer seconds only, per scope).
-    try std.testing.expectEqual(@as(?u64, null), parseRetryAfterSeconds("HTTP/1.1 429 Too Many Requests\r\nRetry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n\r\n"));
-}
-
 test "retryDelayMs honors Retry-After over backoff and caps exponential growth" {
     const gpa = std.testing.allocator;
     var client: Client = undefined;
@@ -1835,43 +1732,6 @@ test "prompt retries a 429 and honors Retry-After" {
     defer turn.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
     try std.testing.expectEqualStrings("hi", turn.assistant.assistant.content[0].text.text);
-}
-
-test "headPhaseFailure maps transient connection drops to a retryable error" {
-    // The head phase is idempotent — the model has produced nothing and no
-    // tool has run — so connection/read drops must surface as the retryable
-    // `error.ConnectionFailed`, while protocol-level rejects pass through as
-    // permanent. (A TCP-level drop can't be simulated over `std.testing.io`,
-    // whose event loop never wakes a blocked head read on peer-close, so the
-    // mapping is tested directly.)
-    const gpa = std.testing.allocator;
-    var client: Client = undefined;
-    try client.init(gpa, std.testing.io, .{
-        .base_url = "http://127.0.0.1:1/v1",
-        .api_key = "test-key",
-        .model = "test-model",
-        .tools = &.{},
-        .mcp_tools = &.{},
-    });
-    defer client.deinit();
-
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ReadFailed));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.WriteFailed));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.EndOfStream));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionRefused));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionResetByPeer));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.ConnectionTimedOut));
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.BrokenPipe));
-    // Stale keep-alive: the server closed an idle connection and the 0-byte
-    // head read surfaces as error.HttpConnectionClosing (std.http), not one of
-    // the socket errors above — still a transient head-phase drop.
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.HttpConnectionClosing));
-    // Windows surfaces connection-refused as NTSTATUS 0xc0000236 (error.Unexpected),
-    // which is treated as a transient connect/read drop in the head phase.
-    try std.testing.expectEqual(error.ConnectionFailed, client.headPhaseFailure(error.Unexpected));
-    // Permanent failures are returned unchanged.
-    try std.testing.expectEqual(error.HttpClientError, client.headPhaseFailure(error.HttpClientError));
-    try std.testing.expectEqual(error.HttpHeadersInvalid, client.headPhaseFailure(error.HttpHeadersInvalid));
 }
 
 test "prompt does not retry a permanent 4xx" {

@@ -37,7 +37,7 @@ pub fn listModels(
     api_key: []const u8,
     options: Options,
 ) ![]ModelEntry {
-    std.debug.assert(base_url.len > 0);
+    if (base_url.len == 0) return error.EmptyBaseUrl;
 
     const v1_root = try openai_endpoint.v1Root(gpa, base_url);
     defer gpa.free(v1_root);
@@ -121,7 +121,7 @@ const ModelJson = struct {
 };
 
 fn parseResponse(gpa: std.mem.Allocator, bytes: []const u8) ![]ModelEntry {
-    std.debug.assert(bytes.len > 0);
+    if (bytes.len == 0) return error.EmptyModelsResponse;
     const parsed = std.json.parseFromSlice(ModelsResponse, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidModelsResponse;
     defer parsed.deinit();
     if (parsed.value.data.len > model_count_max) return error.TooManyModels;
@@ -137,4 +137,41 @@ fn parseResponse(gpa: std.mem.Allocator, bytes: []const u8) ![]ModelEntry {
         try out.append(gpa, .{ .id = try gpa.dupe(u8, id) });
     }
     return out.toOwnedSlice(gpa);
+}
+test "parseResponse rejects an empty body with EmptyModelsResponse" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.EmptyModelsResponse, parseResponse(gpa, ""));
+}
+
+test "parseResponse keeps non-empty ids and skips blanks" {
+    const gpa = std.testing.allocator;
+    const models = try parseResponse(gpa, "{\"data\":[{\"id\":\"gpt-5\"},{\"id\":\"\"},{},{\"id\":\"gpt-5-mini\"}]}");
+    defer {
+        for (models) |*m| m.deinit(gpa);
+        gpa.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("gpt-5", models[0].id);
+    try std.testing.expectEqualStrings("gpt-5-mini", models[1].id);
+}
+
+test "parseResponse returns an empty slice for an empty data array" {
+    const gpa = std.testing.allocator;
+    const models = try parseResponse(gpa, "{\"data\":[]}");
+    defer for (models) |*m| m.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+}
+
+test "parseResponse rejects a non-object payload with InvalidModelsResponse" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidModelsResponse, parseResponse(gpa, "hello"));
+    // `data` present but the wrong type.
+    try std.testing.expectError(error.InvalidModelsResponse, parseResponse(gpa, "{\"data\":42}"));
+}
+
+test "listModels rejects an empty base_url with EmptyBaseUrl" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // Returns before any I/O — the empty base_url is caught up front.
+    try std.testing.expectError(error.EmptyBaseUrl, listModels(gpa, io, "", "test-key", .{}));
 }

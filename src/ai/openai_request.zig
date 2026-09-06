@@ -119,12 +119,13 @@ fn writeUserContent(out: *std.Io.Writer, gpa: std.mem.Allocator, blocks: []const
             .image => |image| {
                 if (count > 0) try out.writeByte(',');
                 try out.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
-                try out.writeByte('"');
-                try out.writeAll("data:");
-                try out.writeAll(image.mime_type);
-                try out.writeAll(";base64,");
-                try out.writeAll(image.data_base64);
-                try out.writeByte('"');
+                var data_uri: std.Io.Writer.Allocating = .init(gpa);
+                defer data_uri.deinit();
+                try data_uri.writer.writeAll("data:");
+                try data_uri.writer.writeAll(image.mime_type);
+                try data_uri.writer.writeAll(";base64,");
+                try data_uri.writer.writeAll(image.data_base64);
+                try std.json.Stringify.value(data_uri.written(), .{}, out);
                 try out.writeAll("}}");
                 count += 1;
             },
@@ -757,4 +758,33 @@ test "writeRequestPayload serializes tool call ids as strings, not objects" {
     // Negative: must NOT serialize CallId as an object
     try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":{\"value\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":{\"value\":") == null);
+}
+
+test "writeRequestPayload escapes a user image data URI with special characters" {
+    // Regression: image.mime_type / image.data_base64 used to be written
+    // verbatim into a JSON string. A value containing a quote (or backslash,
+    // or control char) would terminate the string early and produce invalid
+    // JSON. The data URI is now built in a buffer and emitted through
+    // std.json.Stringify, so special characters are escaped.
+    const gpa = std.testing.allocator;
+    const blocks = try gpa.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .image = .{
+        .mime_type = try gpa.dupe(u8, "image/\"png"),
+        .data_base64 = try gpa.dupe(u8, "YWJj"),
+    } };
+    var user_msg: ai.ChatMessage = .{ .user = .{ .content = blocks } };
+    defer user_msg.deinit(gpa);
+    const views = [_]ai.MessageView{.{ .borrowed = &user_msg }};
+
+    var payload: std.Io.Writer.Allocating = .init(gpa);
+    defer payload.deinit();
+    try writeRequestPayload(gpa, &payload.writer, "vision-model", "", &views, "[]", null, null, .minimal, false, false);
+    const body = payload.written();
+
+    // The data URI prefix is present and well-formed.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"data:image/") != null);
+    // A raw (unescaped) quote right after image/ must be gone.
+    try std.testing.expect(std.mem.indexOf(u8, body, "image/\"") == null);
+    // The JSON-escaped quote (backslash-quote) must be present instead.
+    try std.testing.expect(std.mem.indexOf(u8, body, "image/\\\"") != null);
 }

@@ -33,6 +33,10 @@ pub const responseEventFromString = responses_events.responseEventFromString;
 const redirect_buffer_bytes = http.redirect_buffer_bytes;
 const transfer_buffer_bytes = http.transfer_buffer_bytes;
 const body_buffer_bytes = http.body_buffer_bytes;
+/// Upper bound on an error body we will decompress + log (matches the
+/// chat-completions client's cap). Prevents a hostile/garbage body from
+/// allocating unboundedly.
+const response_bytes_max: u32 = 1 * 1024 * 1024;
 
 pub const ResponsesConfig = struct {
     // Transport-protocol header specs, unified with the provider-header
@@ -87,8 +91,8 @@ pub const Client = struct {
     last_error_detail: ?[]u8 = null,
 
     pub fn init(target: *Client, gpa: std.mem.Allocator, io: std.Io, config: ai.Config, responses_config: ResponsesConfig) !void {
-        std.debug.assert(config.base_url.len > 0);
-        std.debug.assert(config.model.len > 0);
+        if (config.base_url.len == 0) return error.EmptyBaseUrl;
+        if (config.model.len == 0) return error.EmptyModelId;
         const url = try responsesUrl(gpa, config.base_url, responses_config);
         errdefer gpa.free(url);
         const authorization = try std.fmt.allocPrint(gpa, "{s}{s}", .{ http.bearer_prefix, config.api_key });
@@ -184,76 +188,129 @@ pub const Client = struct {
 
     fn headPhaseFailure(self: *Client, err: anyerror) anyerror {
         _ = self;
-        return switch (err) {
-            error.ReadFailed,
-            error.WriteFailed,
-            error.EndOfStream,
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.BrokenPipe,
-            error.HttpConnectionClosing,
-            error.HttpRequestTruncated,
-            error.Unexpected,
-            => error.ConnectionFailed,
-            else => err,
-        };
+        return http.headPhaseFailure(err);
+    }
+
+    /// Record `HTTP <status>: <message>` from a failed response body for the
+    /// UI. Best-effort: a failure to build the string just leaves the detail
+    /// unset.
+    fn recordErrorDetail(self: *Client, status_code: u16, body: []const u8) void {
+        const message = http.extractErrorMessage(self.gpa, body) catch return;
+        defer self.gpa.free(message);
+        log.warn("responses.recordErrorDetail status={d} body={s}", .{ status_code, message });
+        const detail = std.fmt.allocPrint(self.gpa, "HTTP {d}: {s}", .{ status_code, message }) catch return;
+        self.clearErrorDetail();
+        self.last_error_detail = detail;
     }
 
     pub fn prompt(self: *Client, messages: []const ai.MessageView, observer: anytype) !ai.Turn {
         self.clearErrorDetail();
+
+        // The payload is serialized ONCE; every retry attempt re-sends the
+        // same bytes. Retries happen only on head-phase 429/5xx and on
+        // connection drops before any response bytes — the model has not
+        // produced anything and no tool has run, so the request is
+        // idempotent. Stream-mid errors are never retried (partial deltas may
+        // already be visible to the observer).
+        var payload: std.Io.Writer.Allocating = .init(self.gpa);
+        defer payload.deinit();
+        try writeRequestPayload(&payload.writer, self.gpa, self.config, self.responses_config, messages, self.tools_json);
+        log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, http.logBytesHead(payload.written()) });
+
+        var attempt: u32 = 0;
+        while (attempt <= self.config.max_retries) : (attempt += 1) {
+            var retry_after_secs: ?u64 = null;
+            const turn = self.sendOnce(payload.written(), observer, &retry_after_secs) catch |err| {
+                if (attempt >= self.config.max_retries) return err;
+                switch (err) {
+                    error.HttpServerError, error.HttpRateLimited, error.ConnectionFailed => {},
+                    else => return err,
+                }
+                const delay_ms = http.retryDelayMs(self.config.retry_base_delay_ms, attempt, retry_after_secs);
+                log.warn("responses.retry attempt={d} err={s} delay_ms={d}", .{ attempt + 1, @errorName(err), delay_ms });
+                self.sleepMs(delay_ms);
+                continue;
+            };
+            return turn;
+        }
+        unreachable;
+    }
+
+    /// Perform one HTTP round-trip with the already-serialized payload.
+    /// Transient head-phase statuses (429, 5xx) and pre-response connection
+    /// drops surface as `error.HttpRateLimited` / `error.HttpServerError` /
+    /// `error.ConnectionFailed` so `prompt` can decide whether to retry;
+    /// every other failure propagates unchanged. When a retryable status is
+    /// hit, `retry_after_secs` receives the server's `Retry-After` value
+    /// (integer seconds) if one was sent.
+    fn sendOnce(self: *Client, payload: []const u8, observer: anytype, retry_after_secs: *?u64) !ai.Turn {
         var extra_headers_buffer: [provider_headers.max_outbound_headers]std.http.Header = undefined;
         const extra_headers = self.extraHeaders(&extra_headers_buffer);
-        var req = try self.http_client.request(.POST, try std.Uri.parse(self.url), .{
+        var req = self.http_client.request(.POST, try std.Uri.parse(self.url), .{
             .headers = .{
                 .authorization = .{ .override = self.authorization },
                 .content_type = .{ .override = http.content_type_json },
                 .user_agent = if (self.responses_config.user_agent) |value| .{ .override = value } else .default,
             },
             .extra_headers = extra_headers,
-        });
+        }) catch |err| return self.headPhaseFailure(err);
         defer req.deinit();
 
-        var payload: std.Io.Writer.Allocating = .init(self.gpa);
-        defer payload.deinit();
-        try writeRequestPayload(&payload.writer, self.gpa, self.config, self.responses_config, messages, self.tools_json);
-        log.info("responses.request POST {s} profile={s} body={s}", .{ self.url, self.responses_config.log_name, http.logBytesHead(payload.written()) });
         req.transfer_encoding = .chunked;
         var body_buffer: [body_buffer_bytes]u8 = undefined;
-        var body_writer = try req.sendBodyUnflushed(&body_buffer);
-        try body_writer.writer.writeAll(payload.written());
-        try body_writer.end();
-        try req.connection.?.flush();
+        var body_writer = req.sendBodyUnflushed(&body_buffer) catch |err| return self.headPhaseFailure(err);
+        body_writer.writer.writeAll(payload) catch |err| return self.headPhaseFailure(err);
+        body_writer.end() catch |err| return self.headPhaseFailure(err);
+        req.connection.?.flush() catch |err| return self.headPhaseFailure(err);
 
         var redirect_buffer: [redirect_buffer_bytes]u8 = undefined;
         var http_response = req.receiveHead(&redirect_buffer) catch |err| {
-            // Capture the underlying socket error so the UI shows what
-            // actually went wrong instead of the opaque error name. Read the
-            // stream error fields directly — `Connection.getReadError`
-            // unwraps `.?` internally and panics when std synthesized the
-            // ReadFailed without a socket error.
+            // `receiveHead` fails with `error.ReadFailed`/`error.WriteFailed`
+            // when the connection drops; capture the underlying socket error
+            // so the UI shows what actually went wrong instead of the opaque
+            // error name. Read the stream error fields directly —
+            // `Connection.getReadError` unwraps `.?` internally and panics
+            // when std synthesized the ReadFailed without a socket error.
             if (err == error.ReadFailed or err == error.WriteFailed or err == error.HttpRequestTruncated) {
-                const reason: anyerror = if (req.connection) |conn|
-                    if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err
-                else
-                    err;
-                self.recordReadFailure(reason);
+                if (req.connection) |conn| {
+                    const reason: anyerror = if (conn.stream_reader.err) |e| e else if (conn.stream_writer.err) |e| e else err;
+                    self.recordReadFailure(reason);
+                }
             }
             return self.headPhaseFailure(err);
         };
         const status_code: u16 = @intFromEnum(http_response.head.status);
         log.info("responses.response.head status={d} profile={s}", .{ status_code, self.responses_config.log_name });
         if (status_code >= 400) {
+            // Read `Retry-After` before initializing the body reader — the
+            // head pointers are invalidated once the body stream starts.
+            if (http.isRetryableHeadStatus(status_code)) {
+                retry_after_secs.* = http.parseRetryAfterSeconds(http_response.head.bytes);
+            }
+            // The error body may be gzip/deflate-compressed (the encodings
+            // this client advertises) — use the decompressing reader so the
+            // toaster logs real text instead of raw compressed bytes.
             var error_buffer: [transfer_buffer_bytes]u8 = undefined;
-            const error_reader = http_response.reader(&error_buffer);
-            var error_body: std.Io.Writer.Allocating = .init(self.gpa);
-            defer error_body.deinit();
-            _ = error_reader.streamRemaining(&error_body.writer) catch 0;
-            log.warn("responses.response.error status={d} body={s}", .{ status_code, http.logBytesHead(error_body.written()) });
+            var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+            var decompress: std.http.Decompress = undefined;
+            const error_reader = http_response.readerDecompressing(&error_buffer, &decompress, &decompress_buffer);
+            const error_body = error_reader.allocRemaining(self.gpa, .limited(response_bytes_max)) catch |err| switch (err) {
+                error.StreamTooLong => return error.ResponseTooLarge,
+                else => |e| return e,
+            };
+            defer self.gpa.free(error_body);
+            log.warn("responses.response.error status={d} body={s}", .{ status_code, http.logBytesHead(error_body) });
+            self.recordErrorDetail(status_code, error_body);
+            if (status_code == 429) return error.HttpRateLimited;
             if (status_code >= 500) return error.HttpServerError;
             return error.HttpClientError;
         }
         if (!http.isSuccess(status_code)) return error.HttpUnexpectedStatus;
+
+        // Socket-level read timeout: prevents indefinite hangs when the
+        // server stops mid-stream. Applied after the head is received so the
+        // (fast) head exchange is not affected.
+        if (req.connection) |conn| http.setSocketTimeout(conn, self.config.request_timeout_seconds);
 
         var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
         const reader = http_response.reader(&transfer_buffer);
@@ -271,6 +328,14 @@ pub const Client = struct {
             }
             return err;
         };
+    }
+
+    /// Block the worker for the backoff delay. Best-effort — a cancel error
+    /// just falls through (the turn is being torn down anyway).
+    fn sleepMs(self: *const Client, ms: u64) void {
+        if (ms == 0) return;
+        const clamped: i64 = @intCast(@min(ms, std.math.maxInt(i64)));
+        self.io.sleep(std.Io.Duration.fromMilliseconds(clamped), .awake) catch {};
     }
 
     fn extraHeaders(self: *const Client, buffer: []std.http.Header) []const std.http.Header {
@@ -416,6 +481,10 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
     const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
     defer gpa.free(base_url);
     var client: Client = undefined;
+    // `max_retries = 0`: this test verifies error-detail recording on a head
+    // phase drop, not the retry loop. The mock accepts a single connection, so
+    // leaving the default budget (2) would make attempt 2 block on a connection
+    // the server never accepts.
     try Client.init(&client, gpa, io, .{
         .base_url = base_url,
         .api_key = "test-key",
@@ -424,6 +493,7 @@ test "prompt records last_error_detail on head-phase ReadFailed" {
         .mcp_tools = &.{},
         .session_id = "test",
         .system_prompt = "",
+        .max_retries = 0,
     }, .{});
     defer client.deinit();
 
@@ -515,6 +585,169 @@ test "prompt records last_error_detail on stream-phase ReadFailed" {
     try std.testing.expectError(error.ReadFailed, client.prompt(&.{}, ai.streamNoop()));
     const detail = client.last_error_detail orelse @panic("expected a recorded error detail on stream-phase ReadFailed");
     try std.testing.expect(std.mem.startsWith(u8, detail, "Connection to the model provider was lost:"));
+}
+
+// A valid, completed Responses-API stream (empty output) the mock serves on
+// the final attempt. `response.completed` flips the completed flag so `finish`
+// succeeds; no output items are needed for a valid Turn.
+const ok_responses_sse_body =
+    "event: response.completed\n" ++
+    "data: {\"type\":\"response.completed\"}\n\n";
+
+/// Mock that serves one canned response per accepted connection (like the
+/// chat-completions client's retry tests). Each connection is `close`d after
+/// the response so the client reconnects for the next attempt.
+const MockResponsesRetryServer = struct {
+    const Response = struct {
+        status: std.http.Status,
+        retry_after: ?[]const u8 = null,
+        body: []const u8 = "",
+    };
+
+    io: std.Io,
+    server: std.Io.net.Server,
+    responses: []const Response,
+    connection_count: std.atomic.Value(u32) = .init(0),
+
+    fn init(io: std.Io, responses: []const Response) !@This() {
+        const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        const server = try addr.listen(io, .{ .reuse_address = true });
+        return .{ .io = io, .server = server, .responses = responses };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.server.deinit(self.io);
+    }
+
+    fn port(self: *const @This()) u16 {
+        return self.server.socket.address.ip4.port;
+    }
+
+    fn serve(self: *@This()) void {
+        var read_buf: [8192]u8 = undefined;
+        var write_buf: [8192]u8 = undefined;
+        for (self.responses) |resp| {
+            var stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            _ = self.connection_count.fetchAdd(1, .monotonic);
+            var reader = stream.reader(self.io, &read_buf);
+            var writer = stream.writer(self.io, &write_buf);
+            var http_server = std.http.Server.init(&reader.interface, &writer.interface);
+            // `request.respond` drains the (chunked) request body internally —
+            // the client blocks reading the response after sending, so nothing
+            // follows the terminal `0\r\n\r\n`.
+            var request = http_server.receiveHead() catch return;
+            var extra: [2]std.http.Header = undefined;
+            var extra_count: usize = 0;
+            if (resp.retry_after) |ra| {
+                extra[extra_count] = .{ .name = "Retry-After", .value = ra };
+                extra_count += 1;
+            }
+            request.respond(resp.body, .{
+                .status = resp.status,
+                .keep_alive = false,
+                .extra_headers = extra[0..extra_count],
+            }) catch return;
+        }
+    }
+};
+
+test "prompt retries a transient 503 and succeeds (Responses API)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockResponsesRetryServer.init(io, &.{
+        .{ .status = .service_unavailable },
+        .{ .status = .ok, .body = ok_responses_sse_body },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    defer thread.join();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+        // No sleeping between retries in tests.
+        .retry_base_delay_ms = 0,
+    }, .{});
+    defer client.deinit();
+
+    var turn = try client.prompt(&.{}, ai.streamNoop());
+    defer turn.deinit(gpa);
+    // Two connections: the failed 503 attempt plus the successful retry.
+    try std.testing.expectEqual(@as(u32, 2), server.connection_count.load(.monotonic));
+}
+
+test "prompt does not retry a permanent 4xx (Responses API)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockResponsesRetryServer.init(io, &.{
+        .{ .status = .bad_request },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    defer thread.join();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+        .retry_base_delay_ms = 0,
+    }, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
+    // Exactly one attempt — 4xx is permanent.
+    try std.testing.expectEqual(@as(u32, 1), server.connection_count.load(.monotonic));
+}
+
+test "prompt records last_error_detail on an HTTP error (Responses API)" {
+    // Regression: the Responses client previously dropped the error body and
+    // never populated `last_error_detail`, so the UI saw no provider message.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try MockResponsesRetryServer.init(io, &.{
+        .{ .status = .forbidden, .body = "{\"error\":{\"message\":\"invalid api key\"}}" },
+    });
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, MockResponsesRetryServer.serve, .{&server});
+    defer thread.join();
+
+    const base_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{server.port()});
+    defer gpa.free(base_url);
+    var client: Client = undefined;
+    try Client.init(&client, gpa, io, .{
+        .base_url = base_url,
+        .api_key = "test-key",
+        .model = "test-model",
+        .tools = &.{},
+        .mcp_tools = &.{},
+        .session_id = "test",
+        .system_prompt = "",
+        .retry_base_delay_ms = 0,
+    }, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.HttpClientError, client.prompt(&.{}, ai.streamNoop()));
+    const detail = client.last_error_detail orelse @panic("expected a recorded error detail");
+    try std.testing.expectEqualStrings("HTTP 403: invalid api key", detail);
 }
 
 test "extraHeaders materializes provider headers with zen routing and user precedence" {
