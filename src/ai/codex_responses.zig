@@ -25,6 +25,7 @@ const websocket_handshake_timeout_ms: u32 = 10_000;
 const websocket_message_bytes_max: usize = 8 * 1024 * 1024;
 const websocket_buffer_bytes: usize = 16 * 1024;
 const websocket_watchdog_poll_ms: u32 = 250;
+const websocket_event_limit: u32 = 100_000;
 
 const codex_responses_config: core.ResponsesConfig = .{
     .base_url_mode = .raw,
@@ -137,7 +138,7 @@ pub const Client = struct {
         defer state.deinit(gpa);
         errdefer state.deinitBlocks(gpa);
         var event_count: u32 = 0;
-        while (event_count < 100_000) : (event_count += 1) {
+        while (event_count < websocket_event_limit) : (event_count += 1) {
             const message = (client.read() catch |err| return watchdog.timeoutError(err)) orelse return error.WebSocketReadTimeout;
             defer client.done(message);
             watchdog.armSeconds(websocket_idle_timeout_seconds);
@@ -153,6 +154,7 @@ pub const Client = struct {
             }
             if (state.completed) break;
         }
+        if (!state.completed) return error.WebSocketEventLimitExceeded;
         return try state.finish(gpa, &self.core_client.call_seq);
     }
 };
@@ -368,6 +370,10 @@ test "codex websocket endpoint includes non-default port in host header" {
     try std.testing.expectEqualStrings("localhost:9224", endpoint.host_header);
     try std.testing.expectEqual(@as(u16, 9224), endpoint.port);
     try std.testing.expect(!endpoint.tls);
+}
+
+test "codex websocket event limit is bounded" {
+    try std.testing.expectEqual(@as(u32, 100_000), websocket_event_limit);
 }
 
 test "codex version header present on websocket handshake and sse request headers" {

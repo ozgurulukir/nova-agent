@@ -364,15 +364,28 @@ const TokenResponse = struct {
 };
 
 fn parseTokenResponse(gpa: std.mem.Allocator, io: std.Io, bytes: []const u8) !Credentials {
-    const parsed = std.json.parseFromSlice(TokenResponse, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
+    const parsed = std.json.parseFromSlice(TokenResponse, gpa, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCredentials,
+    };
     defer parsed.deinit();
+    if (parsed.value.access_token.len == 0 or parsed.value.refresh_token.len == 0 or parsed.value.expires_in < 0) {
+        return error.InvalidCredentials;
+    }
+
+    const expires_ms = std.math.mul(i64, parsed.value.expires_in, 1000) catch return error.InvalidCredentials;
+    const expires = std.math.add(i64, nowMs(io), expires_ms) catch return error.InvalidCredentials;
     const account_id = try accountIdFromAccessToken(gpa, parsed.value.access_token);
     errdefer gpa.free(account_id);
+    const access = try gpa.dupe(u8, parsed.value.access_token);
+    errdefer gpa.free(access);
+    const refresh_token_copy = try gpa.dupe(u8, parsed.value.refresh_token);
+    errdefer gpa.free(refresh_token_copy);
     return .{
-        .access = try gpa.dupe(u8, parsed.value.access_token),
-        .refresh = try gpa.dupe(u8, parsed.value.refresh_token),
+        .access = access,
+        .refresh = refresh_token_copy,
         .account_id = account_id,
-        .expires = nowMs(io) + parsed.value.expires_in * 1000,
+        .expires = expires,
     };
 }
 
@@ -389,13 +402,20 @@ fn accountIdFromAccessToken(gpa: std.mem.Allocator, access: []const u8) ![]u8 {
     _ = parts.next() orelse return error.InvalidCredentials;
     const payload = parts.next() orelse return error.InvalidCredentials;
     _ = parts.next() orelse return error.InvalidCredentials;
-    const size = try std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload);
+    if (parts.next() != null or payload.len == 0) return error.InvalidCredentials;
+
+    const size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch return error.InvalidCredentials;
     const decoded = try gpa.alloc(u8, size);
     defer gpa.free(decoded);
-    try std.base64.url_safe_no_pad.Decoder.decode(decoded, payload);
-    const parsed = std.json.parseFromSlice(AccessTokenClaims, gpa, decoded, .{ .ignore_unknown_fields = true }) catch return error.InvalidCredentials;
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch return error.InvalidCredentials;
+    const parsed = std.json.parseFromSlice(AccessTokenClaims, gpa, decoded, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCredentials,
+    };
     defer parsed.deinit();
-    return try gpa.dupe(u8, @field(parsed.value, jwt_claim_path).chatgpt_account_id);
+    const account_id = @field(parsed.value, jwt_claim_path).chatgpt_account_id;
+    if (account_id.len == 0) return error.InvalidCredentials;
+    return try gpa.dupe(u8, account_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +512,13 @@ test "invalid token json maps to domain error" {
     try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "not json"));
 }
 
+test "parseTokenResponse rejects empty tokens or negative expires_in" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "{\"access_token\":\"\",\"refresh_token\":\"r\",\"expires_in\":3600}"));
+    try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "{\"access_token\":\"a\",\"refresh_token\":\"\",\"expires_in\":3600}"));
+    try std.testing.expectError(error.InvalidCredentials, parseTokenResponse(gpa, std.testing.io, "{\"access_token\":\"a\",\"refresh_token\":\"r\",\"expires_in\":-1}"));
+}
+
 test "static models match openai codex catalog" {
     const gpa = std.testing.allocator;
     const loaded = try loadStaticModels(gpa);
@@ -585,6 +612,12 @@ test "accountIdFromAccessToken returns InvalidCredentials on missing claims or m
     // Act & Assert
     try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, missing_claims_jwt));
     try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, malformed_jwt));
+}
+
+test "accountIdFromAccessToken rejects JWTs with extra segments or empty payload" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, "e30.eyJmb28iOiJiYXIifQ.sig.extra"));
+    try std.testing.expectError(error.InvalidCredentials, accountIdFromAccessToken(gpa, "e30..sig"));
 }
 
 test "createAuthorizationFlow constructs valid PKCE authorization URL and state" {
