@@ -2,7 +2,7 @@
 
 # Nova
 
-**The fast, keyboard-first, native terminal AI agent for shipping code.**
+**The fast, single binary, native terminal AI agent for shipping code.**
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?style=flat-square&logo=zig&logoColor=white)](https://ziglang.org)
 [![Version](https://img.shields.io/github/v/release/ozgurulukir/nova-agent?style=flat-square)](https://github.com/ozgurulukir/nova-agent/releases)
@@ -30,11 +30,11 @@ Nova is an **oldschool, terminal-native AI agent** designed for pure speed and f
 
 ---
 
-## 🏎️ Philosophy & Execution Model: Autonomous by Default ("YOLO Mode")
+## 🏎️ Philosophy & Execution Model: Allow by Default ("YOLO mode")
 
-Unlike IDE plugins that interrupt you with modal dialogues for every file read or harmless directory scan, Nova operates under an **autonomous execution model** (similar to popular "YOLO" or "dangerously skip permissions" workflows):
+Unlike IDE plugins that interrupt you with modal dialogues for every file read or harmless directory scan, Nova operates under an **permissionless execution model** (similar to popular "YOLO" or "dangerously skip permissions" workflows):
 
-- **No tedious click-prompts:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
+- **No permission system:** Reads, edits, builds, and standard commands run immediately without micro-confirmations.
 - **Two-Tier Command Safety Net:**
   - **Tier 1 — Built-in Deterministic Safety Matcher (Active by default):** Zero-dependency, sub-microsecond pattern engine in Zig (`bash_safety.zig`). Automatically intercepts high-risk destructive commands (e.g. `rm -rf /`, drive root wipes, `mkfs`, `dd`, fork bombs) and gates them behind explicit approval prompts.
   - **Tier 2 — External AI Safety Classifier (Optional):** Plug in the standalone REST safety service (`tools/classifier/`) powered by Transformer models (ModernBERT) or an LLM safety proxy for deep contextual risk evaluation.
