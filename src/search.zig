@@ -16,6 +16,20 @@ const assert = std.debug.assert;
 
 const page_size: u32 = 50;
 
+/// Hard caps on the in-memory index. A pathological checkout (a huge unpruned
+/// `.git/objects` fan-out, a generated source dump, an unbounded build tree)
+/// must not turn the `@` popup into a multi-GB slab build. Real projects stay
+/// far below both limits; when either is hit the index is simply partial
+/// (first-N in walk order).
+const max_index_files: usize = 250_000;
+const max_index_path_bytes: usize = 32 * 1024 * 1024;
+/// Deepest tree level (1-based; root's direct children are at depth 1) that
+/// is still descended into. The predicate in `scanTree` is inclusive
+/// (`depth <= max_index_depth`), so files at this depth are reached; the
+/// next level down is skipped. 32 levels bounds the walk against absurdly
+/// deep nesting without affecting any real project.
+const max_index_depth: u32 = 32;
+
 /// Directory basenames that are always skipped while indexing. These are the
 /// usual build output / dependency cache / version-control directories across
 /// ecosystems, and they are ignored even when a project has no .gitignore.
@@ -215,6 +229,58 @@ const Backend = struct {
     }
 };
 
+/// Append `path` as a NUL-terminated record to the slab. Returns false
+/// (and appends nothing) when a hard index cap is exceeded OR when the
+/// backing allocation fails (mid-walk OOM). Callers fall through to a
+/// partial index in both cases.
+fn appendIndexEntry(gpa: std.mem.Allocator, files: *std.ArrayListUnmanaged(u8), count: *usize, path: []const u8) bool {
+    if (count.* >= max_index_files) return false;
+    if (files.items.len + path.len + 1 > max_index_path_bytes) return false;
+    const path_len = path.len;
+    const old_len = files.items.len;
+    files.ensureUnusedCapacity(gpa, path_len + 1) catch return false;
+    const slice = files.items.ptr[old_len..];
+    @memcpy(slice[0..path_len], path);
+    slice[path_len] = 0;
+    files.items.len = old_len + path_len + 1;
+    count.* += 1;
+    return true;
+}
+
+/// Drive the walker: record regular files, skip always-ignored basenames,
+/// and recurse into non-ignored directories up to and including
+/// `max_index_depth` (1-based; root's direct children are at depth 1).
+///
+/// Selector contract (std `SelectiveWalker`): a directory is descended into
+/// only when `enter` pushes its iterator on the walk stack; a directory that
+/// is never `enter`ed is simply never visited. `leave` pops the stack, so it
+/// must only follow an `enter` — never call it on an unentered entry (it
+/// would pop the *parent's* iterator and silently skip its remaining
+/// entries).
+fn scanTree(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    walker: *std.Io.Dir.SelectiveWalker,
+    files: *std.ArrayListUnmanaged(u8),
+    count: *usize,
+) !void {
+    while (walker.next(io) catch |err| return err) |entry| {
+        if (entry.kind == .directory) {
+            if (!isIgnoredDir(entry.basename)) {
+                // entry.depth() is 1-based and OS-correct (counts `path.sep`
+                // only, so backslashes in POSIX filenames aren't mistaken
+                // for separators).
+                const depth: u32 = @intCast(entry.depth());
+                if (depth <= max_index_depth) try walker.enter(io, entry);
+            }
+            // Ignored or over-depth: not entered, so the walk stays flat.
+            continue;
+        }
+        if (entry.kind != .file) continue; // symlinks, sockets, devices…
+        if (!appendIndexEntry(gpa, files, count, entry.path)) return error.IndexCapExceeded;
+    }
+}
+
 fn isAbsoluteSearchPath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (path[0] == '/' or path[0] == '\\') return true;
@@ -247,35 +313,18 @@ fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.
     };
     defer walker.deinit();
 
-    while (walker.next(io) catch |err| {
-        return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
-    }) |entry| {
-        // Skip directories that are typically build output / caches / version
-        // control internals across ecosystems. We only check the basename
-        // (not the full path) for O(1) lookup; this covers the common cases
-        // like .git, node_modules, .zig-cache, target, etc.
-        if (entry.kind == .directory) {
-            if (isIgnoredDir(entry.basename)) continue;
-            walker.enter(io, entry) catch |err| {
-                return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
-            };
-        }
-        // Index regular files only. Directories are skipped — the `@`
-        // at-search popup filters them out anyway, and the find operation
-        // targets files.
-        if (entry.kind != .file) continue;
-        const path = entry.path;
-        const path_len = path.len;
-        const old_len = files.items.len;
-        files.ensureUnusedCapacity(gpa, path_len + 1) catch |err| {
+    // Scan the tree: regular files only, always-ignored basenames and the
+    // depth cap pruned via the walker itself (no open+close for ignored dirs).
+    scanTree(gpa, io, &walker, &files, &count) catch |err| {
+        // A mid-walk cap or IO error still yields a usable, partial index —
+        // better than failing the whole popup over a pathological tree.
+        if (err != error.IndexCapExceeded) {
             return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
-        };
-        const slice = files.items.ptr[old_len..];
-        @memcpy(slice[0..path_len], path);
-        slice[path_len] = 0;
-        files.items.len = old_len + path_len + 1;
-        count += 1;
-    }
+        }
+        if (count == 0) {
+            return .{ .failed = gpa.dupe(u8, "index size limit") catch &.{} };
+        }
+    };
 
     return .{ .ready = .{ .files = files.toOwnedSlice(gpa) catch |err| {
         return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
@@ -713,20 +762,7 @@ test "empty query returns all indexed files" {
     defer files.deinit(gpa);
     var count: usize = 0;
 
-    while (walker.next(io) catch null) |entry| {
-        if (entry.kind == .directory) {
-            if (!isIgnoredDir(entry.basename)) walker.enter(io, entry) catch {};
-            continue;
-        }
-        if (entry.kind != .file) continue;
-        const path = entry.path;
-        try files.ensureUnusedCapacity(gpa, path.len + 1);
-        const slice = files.items.ptr[files.items.len..];
-        @memcpy(slice[0..path.len], path);
-        slice[path.len] = 0;
-        files.items.len += path.len + 1;
-        count += 1;
-    }
+    scanTree(gpa, io, &walker, &files, &count) catch {};
 
     try std.testing.expect(count >= 100);
 
@@ -911,20 +947,7 @@ test "async empty query returns results" {
     defer files.deinit(gpa);
     var count: usize = 0;
 
-    while (walker.next(io) catch null) |entry| {
-        if (entry.kind == .directory) {
-            if (!isIgnoredDir(entry.basename)) walker.enter(io, entry) catch {};
-            continue;
-        }
-        if (entry.kind != .file) continue;
-        const path = entry.path;
-        try files.ensureUnusedCapacity(gpa, path.len + 1);
-        const slice = files.items.ptr[files.items.len..];
-        @memcpy(slice[0..path.len], path);
-        slice[path.len] = 0;
-        files.items.len += path.len + 1;
-        count += 1;
-    }
+    scanTree(gpa, io, &walker, &files, &count) catch {};
 
     try std.testing.expect(count >= 100);
 
