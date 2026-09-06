@@ -69,6 +69,8 @@ pub const AtSearchState = union(enum) {
         /// Debounce deadline for the next async search. The render loop
         /// waits until `now >= deadline` before starting/polling a search.
         debounce_deadline: ?std.Io.Timestamp = null,
+        /// Hash of the query that was last submitted to `search_mod.queryAsync`.
+        last_query_hash: ?u64 = null,
     };
 
     /// Convenience: the kind of mention being searched, regardless of

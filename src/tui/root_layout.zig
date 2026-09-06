@@ -268,39 +268,24 @@ pub fn drawRoot(app: *App, root_widget: vxfw.Widget, ctx: vxfw.DrawContext) std.
         idx += 1;
     }
     if (at_visible) {
-        // Debounce: only start/poll searches once the deadline has expired.
-        // updateAtSearch resets the deadline on every keystroke, so rapid
-        // typing coalesces into a single query.
-        const deadline_expired = app.at_search.debounceExpired(app.io);
-        const pending_results = switch (app.at_search) {
-            .open => |o| o.searching,
-            else => false,
+        // Poll async search results before drawing, so the popup reflects
+        // any completed background fuzzy search immediately.
+        at_search_mod.pollAtSearch(app) catch |err| {
+            // Surface the failure in the popup footer so the user isn't
+            // staring at stale/empty results with no hint.
+            log.warn("at-search poll failed: {s}", .{@errorName(err)});
+
+            at_search_mod.setSearchNotice(app, @errorName(err));
         };
-
-        if (deadline_expired or pending_results) {
-            // Poll async search results before drawing, so the popup updates
-            // as soon as a background fuzzy search completes.
-            at_search_mod.pollAtSearch(app) catch |err| {
-                // Surface the failure in the popup footer so the user isn't
-                // staring at stale/empty results with no hint.
-                log.warn("at-search poll failed: {s}", .{@errorName(err)});
-
-                at_search_mod.setSearchNotice(app, @errorName(err));
-            };
-            // Display any backend failure message when the index is in the failed
-            // state but the popup is still open.
-            if (app.at_search == .open and app.at_search.open.kind == .file) {
-                if (search_mod.backend.lastFailure(app.gpa)) |msg| {
-                    defer app.gpa.free(msg);
-                    if (app.at_search.open.notice == null or app.at_search.open.notice.?.len == 0) {
-                        at_search_mod.setSearchNotice(app, msg);
-                    }
+        // Display any backend failure message when the index is in the failed
+        // state but the popup is still open.
+        if (app.at_search == .open and app.at_search.open.kind == .file) {
+            if (search_mod.backend.lastFailure(app.gpa)) |msg| {
+                defer app.gpa.free(msg);
+                if (app.at_search.open.notice == null or app.at_search.open.notice.?.len == 0) {
+                    at_search_mod.setSearchNotice(app, msg);
                 }
             }
-        }
-        // Kick the indexer forward when still scanning.
-        if (app.at_search == .indexing) {
-            at_search_mod.updateAtSearch(app) catch {};
         }
         var at_view: tui.AtSearchWidget = .{ .app = app };
         const panel_height = at_search.panelHeight(app.at_search.results().len);

@@ -22,6 +22,7 @@ const tui = @import("../tui.zig");
 
 const agent_mod = @import("../agent.zig");
 const ai = @import("../ai.zig");
+const at_search_mod = @import("at_search.zig");
 const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lifecycle = @import("lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
@@ -30,6 +31,7 @@ const openai_compatible_mod = @import("../ai/openai_compatible.zig");
 const codex = @import("../auth/codex.zig");
 const config_mod = @import("../config/config.zig");
 const runtime_mod = @import("../runtime.zig");
+const search_mod = @import("../search.zig");
 const session_mod = @import("../session.zig");
 const transcript_mod = @import("../transcript.zig");
 const tools_mod = @import("../tools.zig");
@@ -210,6 +212,146 @@ test "file picker selection replaces the active mention without corrupting input
     const input = try app.peekInput();
     defer gpa.free(input);
     try std.testing.expectEqualStrings("open @src/search.zig ", input);
+}
+
+test "skill picker selection replaces the active mention without corrupting input buffer" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("run $tig");
+    const query = try gpa.dupe(u8, "tig");
+    app.at_search = .{ .open = .{ .kind = .skill, .query = query } };
+    try app.at_search.open.results.append(gpa, try gpa.dupe(u8, "tigerstyle"));
+
+    try app.acceptAtSelection();
+
+    const input = try app.peekInput();
+    defer gpa.free(input);
+    try std.testing.expectEqualStrings("run $tigerstyle ", input);
+}
+
+test "file picker starts its deferred search after debounce expires" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("@search");
+    try app.updateAtSearch();
+
+    var indexing_polls: u32 = 0;
+    while (app.at_search == .indexing and indexing_polls < 100) : (indexing_polls += 1) {
+        try app.updateAtSearch();
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(app.at_search == .open);
+
+    // Wait for the 80ms debounce window to naturally expire.
+    var wait_ticks: u32 = 0;
+    while (!app.at_search.debounceExpired(app.io) and wait_ticks < 50) : (wait_ticks += 1) {
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(app.at_search.debounceExpired(app.io));
+
+    var result_polls: u32 = 0;
+    while (app.at_search.open.results.items.len == 0 and result_polls < 100) : (result_polls += 1) {
+        try at_search_mod.pollAtSearch(&app);
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(app.at_search.open.results.items.len > 0);
+}
+
+test "file picker in-place query updates preserve results while debouncing" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("@src");
+    try app.updateAtSearch();
+
+    var indexing_polls: u32 = 0;
+    while (app.at_search == .indexing and indexing_polls < 100) : (indexing_polls += 1) {
+        try app.updateAtSearch();
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(app.at_search == .open);
+
+    var wait_ticks: u32 = 0;
+    while (!app.at_search.debounceExpired(app.io) and wait_ticks < 50) : (wait_ticks += 1) {
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    while (app.at_search.open.results.items.len == 0 and wait_ticks < 100) : (wait_ticks += 1) {
+        try at_search_mod.pollAtSearch(&app);
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(app.at_search.open.results.items.len > 0);
+    const initial_count = app.at_search.open.results.items.len;
+
+    // Type another character: results must NOT be wiped during debounce.
+    try app.inputs.input.insertSliceAtCursor("/tui");
+    try app.updateAtSearch();
+    try std.testing.expectEqualStrings("src/tui", app.at_search.open.query);
+    try std.testing.expectEqual(initial_count, app.at_search.open.results.items.len);
+}
+
+test "file picker lifecycle handleTick drives indexing, search, and idle transition" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var root: RootWidget = .{ .app = &app };
+    var ctx: vxfw.EventContext = .{ .io = std.testing.io, .alloc = arena.allocator(), .cmds = .empty };
+
+    try app.inputs.input.insertSliceAtCursor("@src");
+    try app.updateAtSearch();
+
+    // While indexing or debouncing, the TUI tick must stay active.
+    var ticks: u32 = 0;
+    while (ticks < 150) : (ticks += 1) {
+        try lifecycle.handleTick(&root, &ctx);
+        if (app.at_search == .open and app.at_search.open.results.items.len > 0 and !app.at_search.open.searching and app.at_search.debounceExpired(app.io)) {
+            break;
+        }
+        std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+
+    try std.testing.expect(app.at_search == .open);
+    try std.testing.expect(app.at_search.open.results.items.len > 0);
+
+    // One more tick once idle should settle the loading tick to false.
+    try lifecycle.handleTick(&root, &ctx);
+    try std.testing.expect(!app.metrics.loading_tick_active);
+}
+
+test "file picker closes immediately when user backspaces trigger while indexing" {
+    const gpa = std.testing.allocator;
+    var agent = agent_mod.Agent.init(gpa, std.testing.io, ".", .none);
+    defer agent.deinit();
+    var app = try App.init(std.testing.io, gpa, &agent);
+    defer search_mod.deinit(gpa, std.testing.io);
+    defer app.deinit();
+
+    try app.inputs.input.insertSliceAtCursor("@");
+    try app.updateAtSearch();
+
+    // If still indexing, backspacing the @ must close immediately.
+    app.inputs.input.clearRetainingCapacity();
+    try app.updateAtSearch();
+    try std.testing.expect(app.at_search == .closed);
 }
 
 test "input wrapping uses word breaks" {

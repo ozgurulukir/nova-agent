@@ -23,6 +23,8 @@ const compaction_lifecycle = @import("compaction_lifecycle.zig");
 const lane_lifecycle = @import("lane_lifecycle.zig");
 const toast = @import("toast.zig");
 const vcs = @import("../vcs.zig");
+const at_search_mod = @import("at_search.zig");
+const search_mod = @import("../search.zig");
 
 const App = tui.App;
 const RootWidget = tui.RootWidget;
@@ -211,6 +213,7 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     visible_change = try drainModelsAndMcp(root) or visible_change;
     visible_change = try drainDiffAndCompactions(root) or visible_change;
     visible_change = try drainBackgroundAndLanes(root) or visible_change;
+    visible_change = try drainAtSearch(root) or visible_change;
 
     try advanceAnimations(root, &visible_change);
     try scheduleDiffRefreshIfPending(root, ctx);
@@ -227,6 +230,11 @@ pub fn handleTick(root: *RootWidget, ctx: *vxfw.EventContext) !void {
     } else {
         ctx.consumeEvent();
     }
+}
+
+/// Drain at-search async events (indexing completion, background fuzzy search).
+fn drainAtSearch(root: *RootWidget) !bool {
+    return at_search_mod.drainAtSearch(root.app);
 }
 
 /// Drain the toast bus (UI thread only). Returns true if any toast appeared or expired.
@@ -270,7 +278,8 @@ fn drainBackgroundAndLanes(root: *RootWidget) !bool {
 fn advanceAnimations(root: *RootWidget, visible_change: *bool) !void {
     const spinner_active = root.app.anyTurnActive() or
         compaction_lifecycle.manualCompactActive(root.app) or
-        lane_lifecycle.anyAsyncWorktreeActive(root.app);
+        lane_lifecycle.anyAsyncWorktreeActive(root.app) or
+        root.app.at_search == .indexing;
     if (spinner_active) {
         root.spinner_tick_accum += RootWidget.drain_tick_ms;
         if (root.spinner_tick_accum >= RootWidget.spinner_tick_threshold_ms) {
@@ -330,6 +339,8 @@ fn decideShouldTick(root: *RootWidget) bool {
     const worktree_async_active = lane_lifecycle.anyAsyncWorktreeActive(root.app);
     const registry_refresh_active = registry_job.active(root.app);
 
+    const at_search_active = atSearchActive(root.app);
+
     return turn_active or
         model_loading or
         diff_loading or
@@ -341,7 +352,26 @@ fn decideShouldTick(root: *RootWidget) bool {
         manual_compact_active or
         toasts_visible or
         worktree_async_active or
-        registry_refresh_active;
+        registry_refresh_active or
+        at_search_active;
+}
+
+fn atSearchActive(app: *App) bool {
+    return switch (app.at_search) {
+        .indexing => true,
+        .open => |o| blk: {
+            if (!app.at_search.debounceExpired(app.io)) break :blk true;
+            if (o.searching) break :blk true;
+            if (o.kind == .file) {
+                const current_hash = search_mod.hashQuery(o.query);
+                if (o.last_query_hash == null or o.last_query_hash.? != current_hash) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+        .closed => false,
+    };
 }
 
 /// Per-lane byte budget for drain-to-empty: events applied beyond this budget

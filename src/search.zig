@@ -131,6 +131,7 @@ pub const Result = struct {
     stderr: []u8,
     code: u8,
     status: ResultStatus = .ok,
+    query_hash: u64 = 0,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -297,7 +298,8 @@ fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.
     }
 
     var files: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer files.deinit(gpa);
+    var files_owned = false;
+    defer if (!files_owned) files.deinit(gpa);
     var count: usize = 0;
 
     var dir = (if (isAbsoluteSearchPath(cwd))
@@ -326,9 +328,11 @@ fn initBackend(gpa: std.mem.Allocator, io: std.Io, cwd: []u8, done: *std.atomic.
         }
     };
 
-    return .{ .ready = .{ .files = files.toOwnedSlice(gpa) catch |err| {
+    const owned_files = files.toOwnedSlice(gpa) catch |err| {
         return .{ .failed = gpa.dupe(u8, @errorName(err)) catch &.{} };
-    }, .count = count } };
+    };
+    files_owned = true;
+    return .{ .ready = .{ .files = owned_files, .count = count } };
 }
 
 pub fn start(gpa: std.mem.Allocator, io: std.Io, cwd: []const u8) void {
@@ -404,19 +408,16 @@ fn searchTask(gpa: std.mem.Allocator, files: []u8, count: usize, query: []u8, do
     // background worker.
     // `done` is owned by the caller (queryAsync/poll/cancel); the task only
     // writes to it and never frees it. `query` is task-owned.
+    defer done.store(true, .release);
     defer {
         gpa.free(files);
         gpa.free(query);
     }
-    const query_c = gpa.dupeZ(u8, query) catch return null;
-    defer gpa.free(query_c);
 
     const request: Request = .{ .op = .find, .query = query };
     const result = runFind(gpa, request, files, count) catch |err| {
-        done.store(true, .release);
         return failResult(gpa, @errorName(err)) catch null;
     };
-    done.store(true, .release);
     return result;
 }
 
@@ -513,9 +514,10 @@ pub fn pollSearchResult(gpa: std.mem.Allocator, io: std.Io) !?Result {
 
     const running = backend.search.running;
     var future = running.future;
-    const result = future.await(io);
+    var result = future.await(io);
     const done_ptr = running.done;
     const search_generation = running.generation;
+    const query_hash = running.query_hash;
     backend.search = .idle;
     gpa.destroy(done_ptr);
 
@@ -528,11 +530,18 @@ pub fn pollSearchResult(gpa: std.mem.Allocator, io: std.Io) !?Result {
         return null;
     }
 
+    if (result) |*r| {
+        r.query_hash = query_hash;
+    }
+
     // Result is task-owned; caller takes ownership.
     return result;
 }
 
 pub fn cancelSearch(gpa: std.mem.Allocator, io: std.Io) void {
+    backend.mutex.lock(io) catch return;
+    defer backend.mutex.unlock(io);
+
     if (backend.search == .running) {
         const old = backend.search.running;
         var future = old.future;
@@ -545,6 +554,12 @@ pub fn cancelSearch(gpa: std.mem.Allocator, io: std.Io) void {
 
 pub fn isIndexing() bool {
     return backend.state == .loading;
+}
+
+pub fn isSearching(io: std.Io) bool {
+    backend.mutex.lock(io) catch return false;
+    defer backend.mutex.unlock(io);
+    return backend.search == .running;
 }
 
 pub fn runIfReady(gpa: std.mem.Allocator, io: std.Io, request: Request) !?Result {
@@ -686,7 +701,7 @@ fn decodeCursor(raw: []const u8) ?Cursor {
     return .{ .op = op, .offset = offset, .query_hash = query_hash };
 }
 
-fn hashQuery(query: []const u8) u64 {
+pub fn hashQuery(query: []const u8) u64 {
     return std.hash.Wyhash.hash(0x6e6f76615f736561, query);
 }
 

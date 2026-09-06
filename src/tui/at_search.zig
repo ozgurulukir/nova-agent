@@ -18,23 +18,30 @@ fn isSearchFooter(line: []const u8) bool {
 }
 
 pub fn updateAtSearch(app: *App) !void {
-    // The indexing -> open transition is driven from here: this runs every
-    // frame while the popup is still indexing (see root_layout). The backend
-    // only leaves `.loading` (isIndexing -> false) when the loading future is
-    // drained, so we must do that here — refreshFileResults returns early
-    // while `.indexing` and never reaches queryAsync, which would leave the
-    // backend stuck in `.loading` and the popup stuck on the spinner.
+    const before = app.inputs.input.buf.firstHalf();
+    const active_file = at_mention.activeQuery(before);
+    const active_skill = if (active_file == null) skill_mod.activeQuery(before) else null;
+
+    // If neither mention nor skill trigger is active in the input, close immediately.
+    if (active_file == null and active_skill == null) {
+        closeAtSearch(app);
+        return;
+    }
+
+    // While indexing, only proceed to open once the background walk completes.
     if (app.at_search == .indexing) {
         if (search_mod.drainIndexing(app.io)) {
             try onSearchBackendReady(app);
+        } else {
+            return;
         }
     }
-    const before = app.inputs.input.buf.firstHalf();
-    if (at_mention.activeQuery(before)) |active| {
+
+    if (active_file) |active| {
         try setMentionSearch(app, .file, active.query);
         return;
     }
-    if (skill_mod.activeQuery(before)) |active| {
+    if (active_skill) |active| {
         try setMentionSearch(app, .skill, active.query);
         return;
     }
@@ -44,26 +51,33 @@ pub fn updateAtSearch(app: *App) !void {
 fn setMentionSearch(app: *App, kind: MentionSearchKind, query: []const u8) !void {
     if (kind == .file) startAtSearchBackend(app);
 
-    const was_closed = app.at_search == .closed;
+    if (app.at_search == .open and app.at_search.open.kind == kind) {
+        if (std.mem.eql(u8, query, app.at_search.open.query)) return;
 
-    const same_query = if (app.at_search == .open)
-        app.at_search.open.kind == kind and std.mem.eql(u8, query, app.at_search.open.query)
-    else
-        false;
-    if (same_query) return;
+        const owned = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
+        const o = &app.at_search.open;
+        if (o.query.len > 0) app.gpa.free(o.query);
+        o.query = owned;
+        o.selection = 0;
+        app.at_search.refreshDebounce(app.io, 80);
+        if (kind == .skill) {
+            try refreshSkillResults(app);
+        }
+        return;
+    }
 
-    app.at_search.close(app.gpa);
     const owned: []u8 = if (query.len > 0) try app.gpa.dupe(u8, query) else "";
+    errdefer if (owned.len > 0) app.gpa.free(owned);
+
+    if (app.at_search == .open and app.at_search.open.kind == .file and kind != .file) {
+        search_mod.cancelSearch(app.gpa, app.io);
+    }
+    app.at_search.close(app.gpa);
     app.at_search = .{ .open = .{ .kind = kind, .query = owned } };
 
-    // Schedule the first search via the debounce window — the render loop
-    // will fire it once the deadline expires. We only arm the debounce when
-    // the popup transitions from closed to open; rapid query changes inside
-    // an already-open popup must NOT keep resetting the deadline or the
-    // async search never fires (because every keystroke restarts the timer).
-    if (was_closed) {
-        app.at_search.refreshDebounce(app.io, 80);
-    }
+    // Coalesce rapid input changes. The render loop and lifecycle tick call
+    // `drainAtSearch`, which starts the latest query once this deadline expires.
+    app.at_search.refreshDebounce(app.io, 80);
     try refreshAtResults(app);
 }
 
@@ -81,38 +95,75 @@ fn refreshAtResults(app: *App) !void {
     }
 }
 
-/// Poll the async search backend and update the popup's results when a
-/// search completes. Also handles the still-indexing -> open transition.
-/// Poll any in-flight async search result and update the popup's file list.
-/// Safe to call every frame; no-op when no search is running.
-pub fn pollAtSearch(app: *App) !void {
-    if (app.at_search == .closed) return;
-    try pollFileResults(app);
+/// Drains pending at-search events on the UI tick. Returns true if results or
+/// presentation changed and a redraw is needed.
+pub fn drainAtSearch(app: *App) !bool {
+    if (app.at_search == .closed) return false;
+
+    if (app.at_search == .indexing) {
+        if (search_mod.drainIndexing(app.io)) {
+            try onSearchBackendReady(app);
+            return true;
+        }
+        return false;
+    }
+
+    if (app.at_search == .open and app.at_search.open.kind == .file) {
+        var changed = false;
+        if (try pollFileResults(app)) {
+            changed = true;
+        }
+        if (try startDeferredFileSearch(app)) {
+            // New async search in-flight
+        }
+        return changed;
+    }
+
+    return false;
 }
 
-fn pollFileResults(app: *App) !void {
-    if (app.at_search != .open) return;
+/// Poll the async search backend and update the popup's results when a
+/// search completes. Safe to call every frame; no-op when no search is running.
+pub fn pollAtSearch(app: *App) !void {
+    _ = try drainAtSearch(app);
+}
+
+fn pollFileResults(app: *App) !bool {
+    if (app.at_search != .open) return false;
     const o = &app.at_search.open;
-    if (o.kind != .file) return;
+    if (o.kind != .file) return false;
 
     // If a search completed, parse its stdout into the result list.
     if (try search_mod.pollSearchResult(app.gpa, app.io)) |result| {
         var res = result;
         defer res.deinit(app.gpa);
         o.searching = false;
+
+        // If the completed search was for an older query, ignore it so stale
+        // results do not replace the user's active query.
+        const current_hash = search_mod.hashQuery(o.query);
+        if (res.query_hash != 0 and res.query_hash != current_hash) {
+            return false;
+        }
+
         clearAtResults(app);
         if (res.status == .err) {
             setSearchNotice(app, res.stdout);
-            return;
+            return true;
         }
         setSearchNotice(app, "");
         try parseAtResults(app, res.stdout);
+        return true;
+    } else if (o.searching and !search_mod.isSearching(app.io)) {
+        o.searching = false;
     }
+    return false;
 }
 
-fn refreshFileResults(app: *App) !void {
-    if (app.at_search != .open) return;
+fn startDeferredFileSearch(app: *App) !bool {
+    if (app.at_search != .open) return false;
     const o = &app.at_search.open;
+    if (o.kind != .file) return false;
 
     // If the backend is still indexing, transition open -> indexing so the
     // UI shows the indexing spinner.
@@ -124,31 +175,41 @@ fn refreshFileResults(app: *App) !void {
         app.at_search = .{ .indexing = .{ .kind = kind, .results = results_list } };
         app.gpa.free(query);
         _ = selection;
-        return;
+        return true;
     }
 
     // Don't start a new search while the debounce window is open.
-    if (!app.at_search.debounceExpired(app.io)) return;
+    if (!app.at_search.debounceExpired(app.io)) return false;
 
-    // Start an async search if we don't have one in flight for the current query.
-    if (!o.searching) {
-        try search_mod.queryAsync(app.gpa, app.io, .{ .op = .find, .query = o.query });
-        o.searching = true;
+    const current_hash = search_mod.hashQuery(o.query);
+    if (o.last_query_hash != null and o.last_query_hash.? == current_hash) {
+        return false;
     }
 
-    try pollFileResults(app);
+    try search_mod.queryAsync(app.gpa, app.io, .{ .op = .find, .query = o.query });
+    o.searching = true;
+    o.last_query_hash = current_hash;
+    return true;
+}
+
+fn refreshFileResults(app: *App) !void {
+    _ = try pollFileResults(app);
+    _ = try startDeferredFileSearch(app);
 }
 
 fn refreshSkillResults(app: *App) !void {
     if (app.at_search != .open) return;
     const o = &app.at_search.open;
     const runtime = app.liveRuntime() orelse return;
+    clearAtResults(app);
     const names = try skill_mod.filterNames(app.gpa, runtime.skills, o.query);
-    errdefer {
-        for (names) |name| app.gpa.free(name);
-        app.gpa.free(names);
+    for (names, 0..) |name, idx| {
+        o.results.append(app.gpa, name) catch |err| {
+            for (names[idx..]) |unconsumed| app.gpa.free(unconsumed);
+            app.gpa.free(names);
+            return err;
+        };
     }
-    for (names) |name| try o.results.append(app.gpa, name);
     app.gpa.free(names);
     if (o.selection >= o.results.items.len) o.selection = 0;
 }
@@ -205,6 +266,9 @@ fn clearAtResults(app: *App) void {
 }
 
 pub fn closeAtSearch(app: *App) void {
+    if (app.at_search == .open and app.at_search.open.kind == .file) {
+        search_mod.cancelSearch(app.gpa, app.io);
+    }
     app.at_search.close(app.gpa);
 }
 
